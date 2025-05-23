@@ -9,6 +9,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio::task::{JoinError, JoinHandle};
 
 const MAX_HEADER_SIZE: usize = 100_000_000;
 
@@ -17,6 +18,18 @@ struct SafeTensorsLoader {
     url: Url,
     client: Arc<Client>,
     runtime: Arc<Runtime>,
+    metadata_future: Option<JoinHandle<Result<Metadata, SafeTensorError>>>,
+    metadata: Option<Metadata>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("The future didn't exist")]
+    NoFuture,
+    #[error(transparent)]
+    JoinError(#[from] JoinError),
+    #[error(transparent)]
+    Safetensor(#[from] SafeTensorError),
 }
 
 #[pymethods]
@@ -27,15 +40,36 @@ impl SafeTensorsLoader {
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid URL: {} ({})", e, url)))?;
         let client = Arc::new(Client::new());
         let runtime = Arc::new(Runtime::new().unwrap());
+
+        let fut_client = Arc::clone(&client);
+        let fut_url = url.clone();
+        let metadata_future = Some(runtime.spawn(async move {
+            let header_size = 10 * 1024 * 1024; // 10 MB
+            let response = fut_client
+                .get(fut_url)
+                .header("Range", format!("bytes=0-{}", header_size - 1))
+                .send()
+                .await
+                .map_err(|e| SafeTensorError::InvalidHeader)?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| SafeTensorError::InvalidHeader)?;
+            get_metadata(bytes.to_vec())
+        }));
+
         Ok(SafeTensorsLoader {
             url,
             client,
             runtime,
+            metadata_future,
+            metadata: None,
         })
     }
 
-    fn __enter__(&self) -> PyResult<Self> {
-        Ok(self.clone())
+    /// Start the context manager
+    pub fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
     }
 
     fn __exit__(
@@ -51,31 +85,23 @@ impl SafeTensorsLoader {
         Ok(Plan::new())
     }
 
-    fn get_metadata(&self) -> PyResult<()> {
-        let client = Arc::clone(&self.client);
-        let url = self.url.clone();
-        let runtime = Arc::clone(&self.runtime);
-
-        let buffer = runtime
-            .block_on(async move {
-                let header_size = 10 * 1024 * 1024; // 10 MB
-                let response = client
-                    .get(url)
-                    .header("Range", format!("bytes=0-{}", header_size - 1))
-                    .send()
-                    .await
+    pub fn metadata(&mut self) -> PyResult<PyObject> {
+        let metadata = self
+            .get_metadata()
+            .map_err(|e| SafetensorDistributedError::new_err(e.to_string()))?;
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            if let Some(user_metadata) = metadata.metadata() {
+                let json: serde_json::Value = serde_json::to_value(user_metadata)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok::<Vec<u8>, PyErr>(bytes.to_vec())
-            })
-            .map_err(|e| PyErr::from(e))?;
-
-        let metadata = get_metadata(buffer)
-            .map_err(|err| SafetensorDistributedError::new_err("Error loading header : {err:?}"))?;
-        Ok(())
+                if let Some(obj) = json.as_object() {
+                    for (k, v) in obj.iter() {
+                        dict.set_item(k, v.to_string())?;
+                    }
+                }
+            }
+            Ok(dict.into())
+        })
     }
 }
 
@@ -102,23 +128,9 @@ fn get_metadata(buffer: Vec<u8>) -> Result<Metadata, SafeTensorError> {
     }
     let string =
         core::str::from_utf8(&buffer[8..stop]).map_err(|_| SafeTensorError::InvalidHeader)?;
-    // Assert the string starts with {
-    // NOTE: Add when we move to 0.4.0
-    // if !string.starts_with('{') {
-    //     return Err(SafeTensorError::InvalidHeaderStart);
-    // }
     let metadata: Metadata =
         serde_json::from_str(string).map_err(|_| SafeTensorError::InvalidHeaderDeserialization)?;
     Ok(metadata)
-}
-impl Clone for SafeTensorsLoader {
-    fn clone(&self) -> Self {
-        SafeTensorsLoader {
-            url: self.url.clone(),
-            client: Arc::clone(&self.client),
-            runtime: Arc::clone(&self.runtime),
-        }
-    }
 }
 
 #[pyclass]
@@ -177,6 +189,18 @@ impl Plan {
         })
     }
 }
+impl SafeTensorsLoader {
+    fn get_metadata(&mut self) -> Result<&Metadata, Error> {
+        if self.metadata.is_none() {
+            let future = self.metadata_future.take().ok_or_else(|| Error::NoFuture)?;
+
+            let fut_result = self.runtime.block_on(future)?;
+            let metadata: Metadata = fut_result?;
+            self.metadata = Some(metadata);
+        }
+        Ok(self.metadata.as_ref().unwrap())
+    }
+}
 
 pyo3::create_exception!(
     safetensors_distributed,
@@ -194,8 +218,13 @@ fn safetensors_distributed(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::fs;
+
     #[test]
-    fn test_dummy() {
-        assert_eq!(2 + 2, 4);
+    fn test_open_safetensors_file() {
+        let buffer = fs::read("test.safetensors").expect("Failed to read test.safetensors");
+        let metadata = get_metadata(buffer).expect("Failed to parse metadata");
+        println!("Metadata: {:?}", metadata);
     }
 }
