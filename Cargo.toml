@@ -1,0 +1,11 @@
+[package]
+name = "safetensors_distributed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyo3 = { version = "0.25.0", features = ["extension-module"] }
+reqwest = { version = "0.12.15", features = ["json"] }
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros"] }
+safetensors = "0.4.0"
+serde_json = "1.0.140"
