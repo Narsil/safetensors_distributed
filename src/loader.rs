@@ -139,13 +139,13 @@ fn get_metadata(buffer: Vec<u8>) -> Result<Metadata, SafeTensorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-    use axum::{Router, routing::get, response::IntoResponse};
-    use std::sync::Arc;
-    use tokio::task;
-    use safetensors::tensor::{TensorView, Dtype};
+    use axum::{Router, response::IntoResponse, routing::get};
     use safetensors::serialize_to_file;
+    use safetensors::tensor::{Dtype, TensorView};
+    use std::io::Write;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+    use tokio::task;
 
     async fn serve_file(file_path: Arc<std::path::PathBuf>) -> impl IntoResponse {
         match tokio::fs::read(&*file_path).await {
@@ -156,10 +156,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_loader_metadata() {
+        // Create a temporary safetensors file using the library
+        let temp_file = NamedTempFile::new().unwrap();
         // Create a dummy tensor
-        let data = vec![0f32];
+        let data: Vec<u8> = 0f32.to_le_bytes().into_iter().collect();
+
         let shape = vec![1];
-        let tensor = TensorView::new(Dtype::F32, &shape, bytemuck::cast_slice(&data));
+        let tensor = TensorView::new(Dtype::F32, shape, &data).unwrap();
         let mut tensors = HashMap::new();
         tensors.insert("dummy".to_string(), tensor);
 
@@ -168,8 +171,6 @@ mod tests {
         user_metadata.insert("test_key".to_string(), "test_value".to_string());
         let user_metadata = Some(user_metadata);
 
-        // Create a temporary safetensors file using the library
-        let temp_file = NamedTempFile::new().unwrap();
         serialize_to_file(&tensors, &user_metadata, temp_file.path()).unwrap();
         let file_path = Arc::new(temp_file.path().to_path_buf());
 
@@ -179,7 +180,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         task::spawn(async move {
-            axum::serve(listener, app.into_make_service()).await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
         });
 
         // Create a loader for the test file
@@ -193,4 +196,5 @@ mod tests {
         let user_metadata = metadata.metadata().as_ref().unwrap();
         assert_eq!(user_metadata.get("test_key").unwrap(), "test_value");
     }
-} 
+}
+
