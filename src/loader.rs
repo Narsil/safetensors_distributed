@@ -21,6 +21,8 @@ pub enum Error {
     Safetensor(#[from] SafeTensorError),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+    #[error("Missing tensor {0:?}")]
+    MissingTensor(String),
     #[error("Tensor {0:?} is already in the plan")]
     AlreadyExists(String),
 }
