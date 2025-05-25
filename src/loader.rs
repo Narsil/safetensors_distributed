@@ -6,6 +6,7 @@ use safetensors::tensor::Metadata;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinError;
+use tokio::task::JoinHandle;
 
 use crate::Plan;
 
@@ -19,6 +20,10 @@ pub enum Error {
     Safetensor(#[from] SafeTensorError),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+    #[error("Missing tensor {0:?}")]
+    MissingTensor(String),
+    #[error("Tensor {0:?} is already in the plan")]
+    AlreadyExists(String),
 }
 
 const MAX_HEADER_SIZE: usize = 100_000_000;
@@ -27,21 +32,30 @@ pub struct Loader {
     url: Url,
     client: Arc<Client>,
     metadata: Option<Metadata>,
+    metadata_handle: Option<JoinHandle<Result<Metadata, Error>>>,
 }
 
 impl Loader {
     pub fn new(url: Url) -> Result<Self, Error> {
         let client = Arc::new(Client::new());
+        let client_clone = client.clone();
+        let url_clone = url.clone();
+
+        let metadata_handle =
+            tokio::spawn(async move { Self::fetch_metadata(client_clone, url_clone).await });
+
         Ok(Self {
             url,
             client,
             metadata: None,
+            metadata_handle: Some(metadata_handle),
         })
     }
 
     pub async fn metadata(&mut self) -> Result<&Metadata, Error> {
         if self.metadata.is_none() {
-            let metadata = Self::fetch_metadata(self.client.clone(), self.url.clone()).await?;
+            let handle = self.metadata_handle.take().ok_or(Error::NoFuture)?;
+            let metadata = handle.await??;
             self.metadata = Some(metadata);
         }
         Ok(self.metadata.as_ref().unwrap())
@@ -94,17 +108,7 @@ impl Loader {
     }
 
     pub async fn execute(&self, plan: &Plan) -> Result<HashMap<String, Vec<u8>>, Error> {
-        let client = Arc::clone(&self.client);
-        let url = self.url.clone();
-        let slices = plan.slices.clone();
-
-        let response = client.get(url).send().await?;
-        let bytes = response.bytes().await?;
-        let mut result = HashMap::new();
-        for (tensor_name, _) in slices {
-            result.insert(tensor_name, bytes.to_vec());
-        }
-        Ok(result)
+        todo!();
     }
 }
 
@@ -142,7 +146,7 @@ mod tests {
     use axum::{Router, response::IntoResponse, routing::get};
     use safetensors::serialize_to_file;
     use safetensors::tensor::{Dtype, TensorView};
-    use std::io::Write;
+
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::task;
@@ -197,4 +201,3 @@ mod tests {
         assert_eq!(user_metadata.get("test_key").unwrap(), "test_value");
     }
 }
-
