@@ -67,6 +67,7 @@ impl Plan {
 
     async fn execute(&self, loader: &mut Loader) -> Result<HashMap<String, Tensor>, Error> {
         let metadata = loader.metadata().await?;
+        let fetch_offsets = self.gather_fetch_offsets(metadata);
         let mut result = HashMap::new();
 
         for (tensor_name, slices) in &self.slices {
@@ -211,11 +212,11 @@ mod tests {
     use super::*;
     use axum::{Router, response::IntoResponse, routing::get};
     use safetensors::serialize_to_file;
-    use safetensors::tensor::{Dtype, TensorView, TensorInfo, Metadata};
+    use safetensors::tensor::{Dtype, TensorView};
+    
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::task;
-    use std::fs;
 
     async fn serve_file(file_path: Arc<std::path::PathBuf>) -> impl IntoResponse {
         match tokio::fs::read(&*file_path).await {
@@ -346,8 +347,10 @@ mod tests {
         // Slice: take the first row (row 0)
         plan.slices.insert(
             "tensor".to_string(),
-            vec![TensorIndexer::Narrow(std::ops::Bound::Included(0), std::ops::Bound::Excluded(1)),
-                 TensorIndexer::Narrow(std::ops::Bound::Included(0), std::ops::Bound::Excluded(2))],
+            vec![
+                TensorIndexer::Narrow(std::ops::Bound::Included(0), std::ops::Bound::Excluded(1)),
+                TensorIndexer::Narrow(std::ops::Bound::Included(0), std::ops::Bound::Excluded(2)),
+            ],
         );
         // Patch gather_fetch_offsets to accept TestMetadata for this test
         let fetches = {
@@ -421,19 +424,22 @@ mod tests {
             }
             requests
         };
-        assert_eq!(fetches, vec![
-            FetchRequest {
-                tensor_name: "tensor".to_string(),
-                file_offset: data_offsets.0, // (0,0)
-                length: 4,
-                output_offset: 0,
-            },
-            FetchRequest {
-                tensor_name: "tensor".to_string(),
-                file_offset: data_offsets.0 + 4, // (0,1)
-                length: 4,
-                output_offset: 4,
-            },
-        ]);
+        assert_eq!(
+            fetches,
+            vec![
+                FetchRequest {
+                    tensor_name: "tensor".to_string(),
+                    file_offset: data_offsets.0, // (0,0)
+                    length: 4,
+                    output_offset: 0,
+                },
+                FetchRequest {
+                    tensor_name: "tensor".to_string(),
+                    file_offset: data_offsets.0 + 4, // (0,1)
+                    length: 4,
+                    output_offset: 4,
+                },
+            ]
+        );
     }
 }
