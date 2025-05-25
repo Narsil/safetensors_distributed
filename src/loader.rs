@@ -5,9 +5,9 @@ use safetensors::SafeTensorError;
 use safetensors::tensor::Metadata;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
-use tokio::runtime::Handle;
 
 use crate::Plan;
 
@@ -21,8 +21,6 @@ pub enum Error {
     Safetensor(#[from] SafeTensorError),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-    #[error("Missing tensor {0:?}")]
-    MissingTensor(String),
     #[error("Tensor {0:?} is already in the plan")]
     AlreadyExists(String),
 }
@@ -42,9 +40,8 @@ impl Loader {
         let client_clone = client.clone();
         let url_clone = url.clone();
 
-        let metadata_handle = handle.spawn(async move {
-            Self::fetch_metadata(client_clone, url_clone).await
-        });
+        let metadata_handle =
+            handle.spawn(async move { Self::fetch_metadata(client_clone, url_clone).await });
 
         Ok(Self {
             url,
@@ -193,7 +190,8 @@ mod tests {
 
         // Create a loader for the test file
         let url = format!("http://{}:{}/file", addr.ip(), addr.port());
-        let mut loader = Loader::new(Url::parse(&url).unwrap(), tokio::runtime::Handle::current()).unwrap();
+        let mut loader =
+            Loader::new(Url::parse(&url).unwrap(), tokio::runtime::Handle::current()).unwrap();
 
         // Get the metadata
         let metadata = loader.metadata().await.unwrap();
