@@ -3,13 +3,9 @@ use reqwest::Client;
 use reqwest::Url;
 use safetensors::SafeTensorError;
 use safetensors::tensor::Metadata;
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
-
-use crate::Plan;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -31,23 +27,20 @@ const MAX_HEADER_SIZE: usize = 100_000_000;
 
 pub struct Loader {
     url: Url,
-    client: Arc<Client>,
     metadata: Option<Metadata>,
     metadata_handle: Option<JoinHandle<Result<Metadata, Error>>>,
 }
 
 impl Loader {
     pub fn new(url: Url, handle: Handle) -> Result<Self, Error> {
-        let client = Arc::new(Client::new());
-        let client_clone = client.clone();
+        let client = Client::new();
         let url_clone = url.clone();
 
         let metadata_handle =
-            handle.spawn(async move { Self::fetch_metadata(client_clone, url_clone).await });
+            handle.spawn(async move { Self::fetch_metadata(client, url_clone).await });
 
         Ok(Self {
             url,
-            client,
             metadata: None,
             metadata_handle: Some(metadata_handle),
         })
@@ -62,7 +55,7 @@ impl Loader {
         Ok(self.metadata.as_ref().unwrap())
     }
 
-    async fn fetch_metadata(client: Arc<Client>, url: Url) -> Result<Metadata, Error> {
+    async fn fetch_metadata(client: Client, url: Url) -> Result<Metadata, Error> {
         let response = client.get(url).send().await?;
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -108,8 +101,8 @@ impl Loader {
         Ok(get_metadata(buffer)?)
     }
 
-    pub async fn execute(&self, plan: &Plan) -> Result<HashMap<String, Vec<u8>>, Error> {
-        todo!();
+    pub fn url(&self) -> &Url {
+        &self.url
     }
 }
 
@@ -143,11 +136,13 @@ fn get_metadata(buffer: Vec<u8>) -> Result<Metadata, SafeTensorError> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use axum::{Router, response::IntoResponse, routing::get};
     use safetensors::serialize_to_file;
     use safetensors::tensor::{Dtype, TensorView};
 
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::task;

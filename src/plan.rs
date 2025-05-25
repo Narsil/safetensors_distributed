@@ -1,21 +1,24 @@
 use safetensors::{Dtype, slice::TensorIndexer};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Write;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::loader::{Error, Loader};
 
 #[derive(PartialEq, Debug)]
 pub struct Tensor {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    data: Vec<u8>,
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    pub data: Vec<u8>,
 }
 pub struct Plan {
     slices: HashMap<String, Vec<TensorIndexer>>,
 }
 
 // Helper struct for fetch requests
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 struct FetchRequest {
     tensor_name: String,
     file_offset: usize,
@@ -23,23 +26,12 @@ struct FetchRequest {
     output_offset: usize,
 }
 
-// Minimal public Metadata for testing
+// New struct to represent a downloaded chunk
 #[derive(Debug)]
-pub struct TestTensorInfo {
-    pub dtype: Dtype,
-    pub shape: Vec<usize>,
-    pub data_offsets: (usize, usize),
-}
-
-#[derive(Debug)]
-pub struct TestMetadata {
-    pub tensors: HashMap<String, TestTensorInfo>,
-}
-
-impl TestMetadata {
-    pub fn info(&self, name: &str) -> Option<&TestTensorInfo> {
-        self.tensors.get(name)
-    }
+struct DownloadedChunk {
+    tensor_name: String,
+    data: Vec<u8>,
+    output_offset: usize,
 }
 
 impl Plan {
@@ -65,11 +57,12 @@ impl Plan {
         Ok(())
     }
 
-    async fn execute(&self, loader: &mut Loader) -> Result<HashMap<String, Tensor>, Error> {
+    pub async fn execute(&self, loader: &mut Loader) -> Result<HashMap<String, Tensor>, Error> {
         let metadata = loader.metadata().await?;
         let fetch_offsets = self.gather_fetch_offsets(metadata);
         let mut result = HashMap::new();
 
+        // First create all the empty tensors
         for (tensor_name, slices) in &self.slices {
             // Get the tensor info from metadata
             let info = metadata
@@ -124,13 +117,217 @@ impl Plan {
             );
         }
 
+        // Create a channel for receiving downloaded chunks
+        let (tx, mut rx) = mpsc::channel(100);
+        let client = Arc::new(reqwest::Client::new());
+        let url = loader.url().clone();
+
+        // Group fetch requests by tensor and sort by offset
+        let mut tensor_requests: HashMap<String, Vec<FetchRequest>> = HashMap::new();
+        for request in &fetch_offsets {
+            tensor_requests
+                .entry(request.tensor_name.clone())
+                .or_default()
+                .push(request.clone());
+        }
+
+        // For each tensor, spawn download tasks
+        for (tensor_name, mut requests) in tensor_requests {
+            // Sort requests by file_offset to ensure correct chunking
+            requests.sort_by_key(|r| r.file_offset);
+            let mut current_chunk: Vec<FetchRequest> = Vec::new();
+            let mut current_size = 0;
+            const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+            let tx = tx.clone();
+            let client = client.clone();
+            let url = url.clone();
+
+            let mut prev_end: Option<usize> = None;
+            for request in requests {
+                let is_contiguous = match prev_end {
+                    Some(end) => end == request.file_offset,
+                    None => true,
+                };
+                if (!is_contiguous || current_size + request.length > CHUNK_SIZE)
+                    && !current_chunk.is_empty()
+                {
+                    // Spawn task for current chunk
+                    let chunk_requests = current_chunk.clone();
+                    let tx = tx.clone();
+                    let client = client.clone();
+                    let url = url.clone();
+                    let tensor_name = tensor_name.clone();
+
+                    tokio::spawn(async move {
+                        let start = chunk_requests.first().unwrap().file_offset;
+                        let end = chunk_requests.last().unwrap().file_offset
+                            + chunk_requests.last().unwrap().length;
+                        let range = format!("bytes={}-{}", start, end - 1);
+
+                        match client.get(url).header("Range", range).send().await {
+                            Ok(response) => {
+                                if let Ok(bytes) = response.bytes().await {
+                                    let data = bytes.to_vec();
+                                    eprintln!(
+                                        "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
+                                        start,
+                                        end,
+                                        data.len(),
+                                        chunk_requests
+                                            .iter()
+                                            .map(|r| format!(
+                                                "{{offset={}, len={}}}",
+                                                r.file_offset, r.length
+                                            ))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    );
+                                    let mut effective_start = start;
+                                    if data.len() > end - start {
+                                        effective_start = 0;
+                                    }
+                                    for request in chunk_requests {
+                                        let offset = request.file_offset - effective_start;
+                                        if offset + request.length > data.len() {
+                                            eprintln!(
+                                                "[BUG] Out of bounds: offset {} + length {} > data.len() {} (effective_start={}, start={}, end={})",
+                                                offset,
+                                                request.length,
+                                                data.len(),
+                                                effective_start,
+                                                start,
+                                                end
+                                            );
+                                            continue;
+                                        }
+                                        let chunk = DownloadedChunk {
+                                            tensor_name: tensor_name.clone(),
+                                            data: data[offset..offset + request.length].to_vec(),
+                                            output_offset: request.output_offset,
+                                        };
+                                        if tx.send(chunk).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Handle error appropriately
+                            }
+                        }
+                    });
+
+                    current_chunk.clear();
+                    current_size = 0;
+                    // Immediately start new chunk with current request
+                    current_chunk.push(request.clone());
+                    current_size += request.length;
+                    prev_end = Some(request.file_offset + request.length);
+                    continue;
+                }
+
+                current_chunk.push(request.clone());
+                current_size += request.length;
+                prev_end = Some(request.file_offset + request.length);
+            }
+
+            // Flush any remaining chunk
+            if !current_chunk.is_empty() {
+                let chunk_requests = current_chunk;
+                let tx = tx.clone();
+                let client = client.clone();
+                let url = url.clone();
+                let tensor_name = tensor_name.clone();
+
+                tokio::spawn(async move {
+                    let start = chunk_requests.first().unwrap().file_offset;
+                    let end = chunk_requests.last().unwrap().file_offset
+                        + chunk_requests.last().unwrap().length;
+                    let range = format!("bytes={}-{}", start, end - 1);
+
+                    match client.get(url).header("Range", range).send().await {
+                        Ok(response) => {
+                            if let Ok(bytes) = response.bytes().await {
+                                let data = bytes.to_vec();
+                                eprintln!(
+                                    "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
+                                    start,
+                                    end,
+                                    data.len(),
+                                    chunk_requests
+                                        .iter()
+                                        .map(|r| format!(
+                                            "{{offset={}, len={}}}",
+                                            r.file_offset, r.length
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                                let mut effective_start = start;
+                                if data.len() > end - start {
+                                    effective_start = 0;
+                                }
+                                for request in chunk_requests {
+                                    let offset = request.file_offset - effective_start;
+                                    if offset + request.length > data.len() {
+                                        eprintln!(
+                                            "[BUG] Out of bounds: offset {} + length {} > data.len() {} (effective_start={}, start={}, end={})",
+                                            offset,
+                                            request.length,
+                                            data.len(),
+                                            effective_start,
+                                            start,
+                                            end
+                                        );
+                                        continue;
+                                    }
+                                    let chunk = DownloadedChunk {
+                                        tensor_name: tensor_name.clone(),
+                                        data: data[offset..offset + request.length].to_vec(),
+                                        output_offset: request.output_offset,
+                                    };
+                                    if tx.send(chunk).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Handle error appropriately
+                        }
+                    }
+                });
+            }
+        }
+
+        // Drop the original sender so the channel closes when all tasks are done
+        drop(tx);
+
+        // Process received chunks
+        while let Some(chunk) = rx.recv().await {
+            if let Some(tensor) = result.get_mut(&chunk.tensor_name) {
+                let end = chunk.output_offset + chunk.data.len();
+                if end <= tensor.data.len() {
+                    tensor.data[chunk.output_offset..end].copy_from_slice(&chunk.data);
+                } else {
+                    eprintln!(
+                        "[ERROR] Chunk out of bounds: output_offset={}, data.len()={}, tensor.data.len()={}",
+                        chunk.output_offset,
+                        chunk.data.len(),
+                        tensor.data.len()
+                    );
+                    std::io::stderr().flush().unwrap();
+                }
+            }
+        }
+
         Ok(result)
     }
 
     // Gather all byte offsets to fetch, the tensor name, and output offset
     fn gather_fetch_offsets(&self, metadata: &safetensors::tensor::Metadata) -> Vec<FetchRequest> {
         let mut requests = Vec::new();
-        let mut output_offset = 0;
         for (tensor_name, slices) in &self.slices {
             if let Some(info) = metadata.info(tensor_name) {
                 let shape = &info.shape;
@@ -171,6 +368,7 @@ impl Plan {
                 // We'll use a multi-dimensional index
                 let mut idx = bounds.iter().map(|(s, _)| *s).collect::<Vec<_>>();
                 let mut done = false;
+                let mut output_offset = 0;
                 while !done {
                     // Compute the flat index in the original tensor
                     let mut flat_idx = 0;
@@ -181,6 +379,17 @@ impl Plan {
                     }
                     let file_offset = info.data_offsets.0 + flat_idx * dtype_size;
                     let output_offset_here = output_offset;
+                    eprintln!(
+                        "[DEBUG] FetchRequest: tensor={}, bounds={:?}, idx={:?}, flat_idx={}, file_offset={}, length={}, output_offset={}",
+                        tensor_name,
+                        bounds,
+                        idx,
+                        flat_idx,
+                        file_offset,
+                        dtype_size,
+                        output_offset_here
+                    );
+                    std::io::stderr().flush().unwrap();
                     requests.push(FetchRequest {
                         tensor_name: tensor_name.clone(),
                         file_offset,
@@ -210,18 +419,82 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, response::IntoResponse, routing::get};
+    use axum::{
+        Router, http::HeaderMap, http::StatusCode, response::IntoResponse, response::Response,
+        routing::get,
+    };
     use safetensors::serialize_to_file;
     use safetensors::tensor::{Dtype, TensorView};
-    
+
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::task;
 
-    async fn serve_file(file_path: Arc<std::path::PathBuf>) -> impl IntoResponse {
+    // Minimal public Metadata for testing
+    #[derive(Debug)]
+    pub struct TestTensorInfo {
+        pub dtype: Dtype,
+        pub shape: Vec<usize>,
+        pub data_offsets: (usize, usize),
+    }
+
+    #[derive(Debug)]
+    pub struct TestMetadata {
+        pub tensors: HashMap<String, TestTensorInfo>,
+    }
+
+    impl TestMetadata {
+        pub fn info(&self, name: &str) -> Option<&TestTensorInfo> {
+            self.tensors.get(name)
+        }
+    }
+
+    async fn serve_file(file_path: Arc<std::path::PathBuf>, headers: HeaderMap) -> Response {
+        eprintln!("[DEBUG] Received headers: {:?}", headers);
         match tokio::fs::read(&*file_path).await {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
+            Ok(bytes) => {
+                if let Some(range_header) = headers.get("range") {
+                    eprintln!("[DEBUG] Range header: {:?}", range_header);
+                    if let Ok(range_str) = range_header.to_str() {
+                        eprintln!("[DEBUG] Range string: {}", range_str);
+                        if let Some(range) = range_str.strip_prefix("bytes=") {
+                            eprintln!("[DEBUG] Range value: {}", range);
+                            let mut parts = range.split('-');
+                            if let (Some(start), Some(end)) = (parts.next(), parts.next()) {
+                                eprintln!("[DEBUG] Range parts: start={}, end={}", start, end);
+                                if let (Ok(start), Ok(end)) =
+                                    (start.parse::<usize>(), end.parse::<usize>())
+                                {
+                                    let end = end + 1; // end is inclusive in HTTP Range
+                                    let end = end.min(bytes.len());
+                                    let start = start.min(end);
+                                    let response = bytes[start..end].to_vec();
+                                    eprintln!(
+                                        "[DEBUG] Response range: {}-{} (len={})",
+                                        start,
+                                        end - 1,
+                                        response.len()
+                                    );
+                                    eprintln!("[DEBUG] Response data: {:?}", response);
+                                    let resp = Response::builder()
+                                        .status(StatusCode::PARTIAL_CONTENT)
+                                        .header(
+                                            "Content-Range",
+                                            format!("bytes {}-{}/{}", start, end - 1, bytes.len()),
+                                        )
+                                        .header("Accept-Ranges", "bytes")
+                                        .body(axum::body::Body::from(response))
+                                        .unwrap();
+                                    return resp;
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!("[DEBUG] Full file data: {:?}", bytes);
+                (StatusCode::OK, bytes).into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, Vec::new()).into_response(),
         }
     }
 
@@ -257,7 +530,10 @@ mod tests {
 
         // Set up axum server
         let file_path_clone = file_path.clone();
-        let app = Router::new().route("/file", get(move || serve_file(file_path_clone.clone())));
+        let app = Router::new().route(
+            "/file",
+            get(move |headers: HeaderMap| serve_file(file_path_clone.clone(), headers)),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         task::spawn(async move {
@@ -306,26 +582,59 @@ mod tests {
         plan.get_slice("tensor1", slice1).await.unwrap();
         plan.get_slice("tensor2", slice2).await.unwrap();
 
+        // Print all fetch requests for debugging
+        let metadata = loader.metadata().await.unwrap();
+        let fetches = plan.gather_fetch_offsets(metadata);
+        for (name, info) in metadata.tensors().iter() {
+            eprintln!("[DEBUG] {} data_offsets: {:?}", name, info.data_offsets);
+        }
+        eprintln!("[DEBUG] All fetch requests:");
+        for f in &fetches {
+            eprintln!(
+                "  tensor={}, file_offset={}, length={}, output_offset={}",
+                f.tensor_name, f.file_offset, f.length, f.output_offset
+            );
+        }
+
         let result = plan.execute(&mut loader).await;
         let result = result.expect("Plan execute should succeed");
         let t1 = result.get("tensor1").expect("tensor1 should be present");
         let t2 = result.get("tensor2").expect("tensor2 should be present");
-        assert_eq!(
-            t1,
-            &Tensor {
-                dtype: Dtype::F32,
-                shape: vec![2, 4],
-                data: vec![0; 2 * 4 * 4], // 2x4 tensor of f32 (4 bytes each)
+
+        // Verify tensor1 shape and data
+        assert_eq!(t1.shape, vec![2, 4]);
+        assert_eq!(t1.dtype, Dtype::F32);
+        // The expected data for tensor1 is the first 2 rows of the original 3x4 tensor
+        let metadata = loader.metadata().await.unwrap();
+        let t1_info = metadata.info("tensor1").unwrap();
+        let t1_offset = t1_info.data_offsets.0;
+        let expected_t1: Vec<u8> = {
+            let start = t1_offset;
+            let end = t1_offset + 2 * 4 * 4;
+            let file_bytes = std::fs::read(file_path.as_ref()).unwrap();
+            file_bytes[start..end].to_vec()
+        };
+        eprintln!("[DEBUG] t1.data (actual):   {:?}", t1.data);
+        eprintln!("[DEBUG] t1.data (expected): {:?}", expected_t1);
+        assert_eq!(t1.data, expected_t1);
+
+        // Verify tensor2 shape and data
+        assert_eq!(t2.shape, vec![4, 2]);
+        assert_eq!(t2.dtype, Dtype::F32);
+        // The expected data for tensor2 is the first 2 columns of the original 4x3 tensor
+        let t2_info = metadata.info("tensor2").unwrap();
+        let t2_offset = t2_info.data_offsets.0;
+        let file_bytes = std::fs::read(file_path.as_ref()).unwrap();
+        let mut expected_t2 = Vec::with_capacity(4 * 2 * 4);
+        for row in 0..4 {
+            for col in 0..2 {
+                let idx = row * 3 + col;
+                let start = t2_offset + idx * 4;
+                let end = start + 4;
+                expected_t2.extend_from_slice(&file_bytes[start..end]);
             }
-        );
-        assert_eq!(
-            t2,
-            &Tensor {
-                dtype: Dtype::F32,
-                shape: vec![4, 2],
-                data: vec![0; 4 * 2 * 4], // 4x2 tensor of f32 (4 bytes each)
-            }
-        );
+        }
+        assert_eq!(t2.data, expected_t2);
     }
 
     #[test]

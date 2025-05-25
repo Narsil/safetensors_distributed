@@ -1,3 +1,5 @@
 /target
 /.venv
 /.direnv
+**/*.pyc
+__pycache__/

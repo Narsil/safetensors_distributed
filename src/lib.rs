@@ -4,8 +4,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice};
 use pyo3::{PyErr, intern};
 use reqwest::Url;
-use safetensors::slice::TensorIndexer;
 use safetensors::tensor::Metadata;
+use safetensors::{Dtype, slice::TensorIndexer};
 use serde_json;
 use std::ops::Bound;
 use tokio::runtime::Runtime;
@@ -27,25 +27,25 @@ pub(crate) enum Slice<'a> {
     Slices(Vec<SliceIndex<'a>>),
 }
 
-use std::fmt;
+// use std::fmt;
 
-struct Disp(Vec<TensorIndexer>);
-
-/// Should be more readable that the standard
-/// `Debug`
-impl fmt::Display for Disp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[")?;
-        for (i, item) in self.0.iter().enumerate() {
-            if i != self.0.len() - 1 {
-                write!(f, "{item}, ")?;
-            } else {
-                write!(f, "{item}")?;
-            }
-        }
-        write!(f, "]")
-    }
-}
+// struct Disp(Vec<TensorIndexer>);
+//
+// /// Should be more readable that the standard
+// /// `Debug`
+// impl fmt::Display for Disp {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "[")?;
+//         for (i, item) in self.0.iter().enumerate() {
+//             if i != self.0.len() - 1 {
+//                 write!(f, "{item}, ")?;
+//             } else {
+//                 write!(f, "{item}")?;
+//             }
+//         }
+//         write!(f, "]")
+//     }
+// }
 
 #[pyclass]
 #[allow(non_camel_case_types)]
@@ -157,6 +157,40 @@ impl PyPlan {
         })?;
 
         Ok(())
+    }
+
+    pub fn execute(&self, loader: &mut dist_loader) -> PyResult<PyObject> {
+        let result = loader.runtime.block_on(async {
+            self.inner.execute(&mut loader.inner).await.map_err(|err| {
+                SafetensorDistributedError::new_err(format!("Failed to execute plan: {err}"))
+            })
+        })?;
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (name, tensor) in result {
+                let shape = tensor.shape;
+                let dtype = match tensor.dtype {
+                    Dtype::F32 => "float32",
+                    Dtype::F64 => "float64",
+                    Dtype::I64 => "int64",
+                    Dtype::I32 => "int32",
+                    Dtype::I16 => "int16",
+                    Dtype::I8 => "int8",
+                    Dtype::U8 => "uint8",
+                    Dtype::BF16 => "bfloat16",
+                    Dtype::F16 => "float16",
+                    _ => return Err(SafetensorDistributedError::new_err("Unsupported dtype")),
+                };
+                let numpy = py.import("numpy")?;
+                let array = numpy
+                    .getattr("frombuffer")?
+                    .call1((tensor.data, numpy.getattr(dtype)?))?;
+                let array = array.call_method1("reshape", (shape,))?;
+                dict.set_item(name, array)?;
+            }
+            Ok(dict.into())
+        })
     }
 }
 
