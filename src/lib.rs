@@ -8,6 +8,7 @@ use safetensors::slice::TensorIndexer;
 use safetensors::tensor::Metadata;
 use serde_json;
 use std::ops::Bound;
+use tokio::runtime::Runtime;
 
 mod loader;
 mod plan;
@@ -47,8 +48,10 @@ impl fmt::Display for Disp {
 }
 
 #[pyclass]
-struct PyLoader {
+#[allow(non_camel_case_types)]
+struct dist_loader {
     inner: Loader,
+    runtime: Runtime,
 }
 
 #[pyclass]
@@ -102,7 +105,7 @@ impl PyPlan {
 
     pub fn get_slice(
         &mut self,
-        loader: &mut PyLoader,
+        loader: &mut dist_loader,
         tensor_name: &str,
         py_slices: PyBound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -123,8 +126,7 @@ impl PyPlan {
                 }
             }
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        loader.runtime.block_on(async {
             let info = loader
                 .inner
                 .metadata()
@@ -159,15 +161,18 @@ impl PyPlan {
 }
 
 #[pymethods]
-impl PyLoader {
+impl dist_loader {
     #[new]
     fn new(url: String) -> PyResult<Self> {
         let url = Url::parse(&url)
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid URL: {} ({})", e, url)))?;
-        let inner = Loader::new(url).map_err(|err| {
+        let runtime = Runtime::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
+        let handle = runtime.handle().clone();
+        let inner = Loader::new(url, handle).map_err(|err| {
             SafetensorDistributedError::new_err(format!("Failed to get create loader: {err}"))
         })?;
-        Ok(Self { inner })
+        Ok(Self { inner, runtime })
     }
 
     /// Start the context manager
@@ -206,12 +211,14 @@ impl PyLoader {
     }
 }
 
-impl PyLoader {
+impl dist_loader {
     fn raw_metadata(&mut self) -> PyResult<&Metadata> {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let metadata = rt.block_on(self.inner.metadata()).map_err(|err| {
-            SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
-        })?;
+        let metadata = self
+            .runtime
+            .block_on(async { self.inner.metadata().await })
+            .map_err(|err| {
+                SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
+            })?;
         Ok(metadata)
     }
 }
@@ -224,11 +231,11 @@ pyo3::create_exception!(
 
 #[pymodule]
 fn safetensors_distributed(module: &PyBound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyLoader>()?;
+    module.add_class::<dist_loader>()?;
     module.add_class::<PyPlan>()?;
     module.add(
         "SafetensorDistributedError",
-        module.getattr("SafetensorDistributedError")?,
+        module.py().get_type::<SafetensorDistributedError>(),
     )?;
     Ok(())
 }
