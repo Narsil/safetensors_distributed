@@ -1308,6 +1308,21 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "reqwest",
+ "safetensors",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-test",
+]
+
+[[package]]
+name = "safetensors_distributed_pyo3"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
  "pyo3",
  "reqwest",
  "safetensors",
