@@ -3,10 +3,12 @@ use pyo3::prelude::*;
 use pyo3::types::PySlice;
 use pyo3::{PyErr, intern};
 use safetensors::slice::TensorIndexer;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Bound;
 
 use crate::SafetensorDistributedError;
-use crate::loader::PySliced;
+use crate::loader::PlanSliced;
 
 #[derive(FromPyObject)]
 pub(crate) enum SliceIndex<'a> {
@@ -43,10 +45,10 @@ pub(crate) enum Slice<'a> {
 #[pyclass]
 pub struct PyPlan {
     // inner: Plan,
-    // slices:
+    slices: HashMap<String, PlanSliced>,
 }
 
-fn slice_to_indexer(
+pub(crate) fn slice_to_indexer(
     (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
 ) -> Result<TensorIndexer, PyErr> {
     match slice_index {
@@ -88,54 +90,22 @@ impl PyPlan {
     #[new]
     pub fn new() -> Self {
         // PyPlan { inner: Plan::new() }
-        PyPlan {}
+        PyPlan {
+            slices: HashMap::new(),
+        }
     }
 
-    pub fn add_slice(&mut self, py_slices: PySliced) -> PyResult<()> {
-        todo!();
-        // let slices: Slice = py_slices.extract()?;
-        // let is_list = py_slices.is_instance_of::<PyList>();
-
-        // let slices: Vec<SliceIndex> = match slices {
-        //     Slice::Slice(slice) => vec![slice],
-        //     Slice::Slices(slices) => {
-        //         if slices.is_empty() && is_list {
-        //             vec![SliceIndex::Slice(PySlice::new(py_slices.py(), 0, 0, 0))]
-        //         } else if is_list {
-        //             return Err(SafetensorDistributedError::new_err(
-        //                 "Non empty lists are not implemented",
-        //             ));
-        //         } else {
-        //             slices
-        //         }
-        //     }
-        // };
-        // loader.runtime.block_on(async {
-        //     let (metadata, _offset) = loader.inner.metadata().await.map_err(|err| {
-        //         SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
-        //     })?;
-        //     let info = metadata.info(&tensor_name).ok_or_else(|| {
-        //         SafetensorDistributedError::new_err(format!(
-        //             "Missing tensor {}",
-        //             tensor_name.to_string()
-        //         ))
-        //     })?;
-        //     let shape = info.shape.clone();
-        //     let slices: Vec<TensorIndexer> = slices
-        //         .into_iter()
-        //         .zip(shape)
-        //         .enumerate()
-        //         .map(slice_to_indexer)
-        //         .collect::<Result<_, _>>()?;
-        //     self.inner
-        //         .get_slice(tensor_name, slices)
-        //         .await
-        //         .map_err(|err| {
-        //             SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
-        //         })
-        // })?;
-
-        // Ok(())
+    pub fn add_slice(&mut self, plan_slice: PlanSliced) -> PyResult<()> {
+        match self.slices.entry(plan_slice.name().to_string()) {
+            Entry::Vacant(entry) => entry.insert(plan_slice),
+            Entry::Occupied(_) => {
+                return Err(SafetensorDistributedError::new_err(format!(
+                    "slice for {} already exists",
+                    plan_slice.name()
+                )));
+            }
+        };
+        Ok(())
     }
 
     // pub fn execute(&self, loader: &mut dist_loader) -> PyResult<PyObject> {

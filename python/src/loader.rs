@@ -1,5 +1,7 @@
 use pyo3::Bound as PyBound;
 use pyo3::prelude::*;
+use pyo3::types::PyList;
+use pyo3::types::PySlice;
 use pyo3::types::{PyDict, PyDictMethods};
 use reqwest::Url;
 use safetensors::slice::TensorIndexer;
@@ -11,6 +13,9 @@ use safetensors_distributed::loader::Loader;
 
 use crate::SafetensorDistributedError;
 use crate::plan::PyPlan;
+use crate::plan::Slice;
+use crate::plan::SliceIndex;
+use crate::plan::slice_to_indexer;
 
 #[pyclass]
 #[allow(non_camel_case_types)]
@@ -54,12 +59,12 @@ impl dist_loader {
         Ok(PyPlan::new())
     }
 
-    fn get_slice(&mut self, tensor_name: String) -> PyResult<PySlice> {
+    fn get_slice(&mut self, tensor_name: String) -> PyResult<PlanSlice> {
         let (metadata, _) = self.raw_metadata()?;
         let info = metadata.info(&tensor_name).ok_or_else(|| {
             SafetensorDistributedError::new_err(format!("{tensor_name:?} does not exist"))
         })?;
-        Ok(PySlice::new(info.clone()))
+        Ok(PlanSlice::new(info.clone(), tensor_name))
     }
 
     pub fn metadata(&mut self) -> PyResult<PyObject> {
@@ -94,31 +99,70 @@ impl dist_loader {
 
 #[pyclass]
 #[allow(non_camel_case_types)]
-pub struct PySlice {
+pub struct PlanSlice {
     info: TensorInfo,
+    name: String,
 }
 
 #[pymethods]
-impl PySlice {
-    fn __getitem__(&self, pyslices: PyBound<'_, PyAny>) -> PySliced {
-        todo!()
+impl PlanSlice {
+    fn __getitem__(&self, pyslices: PyBound<'_, PyAny>) -> PyResult<PlanSliced> {
+        let slices: Slice = pyslices.extract()?;
+        let is_list = pyslices.is_instance_of::<PyList>();
+        let slices: Vec<SliceIndex> = match slices {
+            Slice::Slice(slice) => vec![slice],
+            Slice::Slices(slices) => {
+                if slices.is_empty() && is_list {
+                    vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
+                } else if is_list {
+                    return Err(SafetensorDistributedError::new_err(
+                        "Non empty lists are not implemented",
+                    ));
+                } else {
+                    slices
+                }
+            }
+        };
+
+        let shape = self.info.shape.clone();
+
+        let indexers: Vec<TensorIndexer> = slices
+            .into_iter()
+            .zip(shape)
+            .enumerate()
+            .map(slice_to_indexer)
+            .collect::<Result<_, _>>()?;
+        Ok(PlanSliced {
+            info: self.info.clone(),
+            name: self.name.clone(),
+            indexers,
+        })
     }
 }
-impl PySlice {
-    fn new(info: TensorInfo) -> Self {
-        Self { info }
+impl PlanSlice {
+    fn new(info: TensorInfo, name: String) -> Self {
+        Self { info, name }
     }
 }
 
 #[pyclass]
 #[derive(Clone)]
-pub struct PySliced {
+pub struct PlanSliced {
     info: TensorInfo,
     indexers: Vec<TensorIndexer>,
+    name: String,
 }
 
-impl PySliced {
-    fn new(info: TensorInfo, indexers: Vec<TensorIndexer>) -> Self {
-        Self { info, indexers }
+impl PlanSliced {
+    fn new(info: TensorInfo, indexers: Vec<TensorIndexer>, name: String) -> Self {
+        Self {
+            info,
+            indexers,
+            name,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
