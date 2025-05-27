@@ -20,8 +20,8 @@ use crate::plan::slice_to_indexer;
 #[pyclass]
 #[allow(non_camel_case_types)]
 pub struct dist_loader {
-    inner: Loader,
-    runtime: Runtime,
+    pub(crate) inner: Loader,
+    pub(crate) runtime: Runtime,
 }
 
 #[pymethods]
@@ -149,7 +149,7 @@ impl PlanSlice {
 #[derive(Clone)]
 pub struct PlanSliced {
     info: TensorInfo,
-    indexers: Vec<TensorIndexer>,
+    pub(crate) indexers: Vec<TensorIndexer>,
     name: String,
 }
 

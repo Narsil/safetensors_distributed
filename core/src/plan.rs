@@ -91,23 +91,30 @@ impl<'a> Plan<'a> {
                 .ok_or_else(|| Error::MissingTensor(tensor_name.clone()))?;
 
             // Calculate the new shape based on slices
-            let new_shape: Vec<usize> = slices
+            let new_shape: Vec<usize> = info
+                .shape
                 .iter()
-                .zip(info.shape.iter())
-                .map(|(slice, &dim)| match slice {
-                    TensorIndexer::Select(_) => 1,
-                    TensorIndexer::Narrow(start, end) => {
-                        let start = match start {
-                            Bound::Unbounded => 0,
-                            Bound::Included(i) => *i,
-                            Bound::Excluded(i) => *i + 1,
-                        };
-                        let end = match end {
-                            Bound::Unbounded => dim,
-                            Bound::Included(i) => *i + 1,
-                            Bound::Excluded(i) => *i,
-                        };
-                        end - start
+                .enumerate()
+                .flat_map(|(i, &dim)| {
+                    if let Some(slice) = slices.get(i) {
+                        match slice {
+                            TensorIndexer::Select(_) => None,
+                            TensorIndexer::Narrow(start, end) => {
+                                let start = match start {
+                                    Bound::Unbounded => 0,
+                                    Bound::Included(i) => *i,
+                                    Bound::Excluded(i) => *i + 1,
+                                };
+                                let end = match end {
+                                    Bound::Unbounded => dim,
+                                    Bound::Included(i) => *i + 1,
+                                    Bound::Excluded(i) => *i,
+                                };
+                                Some(end - start)
+                            }
+                        }
+                    } else {
+                        Some(dim)
                     }
                 })
                 .collect();
@@ -635,6 +642,77 @@ mod tests {
                     }
                 )
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_partial() {
+        let tensors = HashMap::from([
+            ("tensor1", create_2d_tensor(3, 4)),
+            ("tensor2", create_2d_tensor(4, 3)),
+        ]);
+        let (_temp_handle, url) = create_test_file(tensors).await;
+        let mut loader = Loader::new(url).unwrap();
+        let mut plan = loader.plan(); // Create a new plan for the second test
+
+        // Slice tensor1 along first dimension
+        let slice1 = vec![TensorIndexer::Narrow(
+            Bound::Included(0),
+            Bound::Excluded(2),
+        )];
+
+        // Slice tensor2 along second dimension
+        let slice2 = vec![
+            TensorIndexer::Select(1),
+            TensorIndexer::Narrow(Bound::Included(1), Bound::Excluded(3)),
+        ];
+
+        plan.get_slice("tensor1", slice1).unwrap();
+        plan.get_slice("tensor2", slice2).unwrap();
+
+        // Print all fetch requests for debugging
+        let (_, fetches) = plan.gather_fetch_offsets().await.unwrap();
+        eprintln!("[DEBUG] All fetch requests:");
+        for f in &fetches {
+            eprintln!(
+                "  tensor={}, file_offset={}, length={}, output_offset={}",
+                f.tensor_name, f.file_offset, f.length, f.output_offset
+            );
+        }
+
+        let result = plan.execute().await;
+        let result = result.expect("Plan execute should succeed");
+        assert_eq!(
+            result,
+            HashMap::from([
+                (
+                    "tensor1".to_string(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![2, 4],
+                        // arange(3*4).reshape(3, 4)[:2]
+                        // == [[0, 1, 2, 3], [4, 5, 6, 7]]
+                        data: vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+                            .into_iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    }
+                ),
+                (
+                    "tensor2".to_string(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![1, 2],
+                        // arange(3*4).reshape(4, 3)[1, 1:3]
+                        // == [4, 5]
+                        data: vec![4.0f32, 5.0]
+                            .into_iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    }
+                )
+            ]),
+            "{result:#?}"
         );
     }
 
