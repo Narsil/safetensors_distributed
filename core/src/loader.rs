@@ -7,7 +7,6 @@ use tokio::runtime::Handle;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 
-use crate::plan;
 use crate::plan::Plan;
 
 #[derive(Debug, thiserror::Error)]
@@ -30,26 +29,38 @@ const MAX_HEADER_SIZE: usize = 100_000_000;
 
 pub struct Loader {
     url: Url,
-    metadata: Option<Metadata>,
-    metadata_handle: Option<JoinHandle<Result<Metadata, Error>>>,
+    client: Client,
+    metadata: Option<(Metadata, usize)>,
+    metadata_handle: Option<JoinHandle<Result<(Metadata, usize), Error>>>,
 }
 
 impl Loader {
-    pub fn new(url: Url, handle: Handle) -> Result<Self, Error> {
+    pub fn new(url: Url) -> Result<Self, Error> {
+        let handle = tokio::runtime::Handle::current();
+        Self::new_py(url, handle)
+    }
+
+    pub fn new_py(url: Url, handle: Handle) -> Result<Self, Error> {
         let client = Client::new();
+        let client_clone = client.clone();
         let url_clone = url.clone();
 
         let metadata_handle =
-            handle.spawn(async move { Self::fetch_metadata(client, url_clone).await });
+            handle.spawn(async move { Self::fetch_metadata(client_clone, url_clone).await });
 
         Ok(Self {
             url,
+            client,
             metadata: None,
             metadata_handle: Some(metadata_handle),
         })
     }
 
-    pub async fn metadata(&mut self) -> Result<&Metadata, Error> {
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub async fn metadata(&mut self) -> Result<&(Metadata, usize), Error> {
         if self.metadata.is_none() {
             let handle = self.metadata_handle.take().ok_or(Error::NoFuture)?;
             let metadata = handle.await??;
@@ -58,7 +69,7 @@ impl Loader {
         Ok(self.metadata.as_ref().unwrap())
     }
 
-    async fn fetch_metadata(client: Client, url: Url) -> Result<Metadata, Error> {
+    async fn fetch_metadata(client: Client, url: Url) -> Result<(Metadata, usize), Error> {
         let response = client.get(url).send().await?;
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -113,7 +124,7 @@ impl Loader {
     }
 }
 
-fn get_metadata(buffer: Vec<u8>) -> Result<Metadata, SafeTensorError> {
+fn get_metadata(buffer: Vec<u8>) -> Result<(Metadata, usize), SafeTensorError> {
     let buffer_len = buffer.len();
     if buffer_len < 8 {
         return Err(SafeTensorError::HeaderTooSmall);
@@ -138,7 +149,7 @@ fn get_metadata(buffer: Vec<u8>) -> Result<Metadata, SafeTensorError> {
         core::str::from_utf8(&buffer[8..stop]).map_err(|_| SafeTensorError::InvalidHeader)?;
     let metadata: Metadata =
         serde_json::from_str(string).map_err(|_| SafeTensorError::InvalidHeaderDeserialization)?;
-    Ok(metadata)
+    Ok((metadata, stop))
 }
 
 #[cfg(test)]
@@ -194,11 +205,10 @@ mod tests {
 
         // Create a loader for the test file
         let url = format!("http://{}:{}/file", addr.ip(), addr.port());
-        let mut loader =
-            Loader::new(Url::parse(&url).unwrap(), tokio::runtime::Handle::current()).unwrap();
+        let mut loader = Loader::new(Url::parse(&url).unwrap()).unwrap();
 
         // Get the metadata
-        let metadata = loader.metadata().await.unwrap();
+        let (metadata, _offset) = loader.metadata().await.unwrap();
 
         // Verify the metadata matches
         let user_metadata = metadata.metadata().as_ref().unwrap();
