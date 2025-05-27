@@ -88,6 +88,12 @@ pub(crate) fn slice_to_indexer(
     }
 }
 
+impl Default for PyPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl PyPlan {
     #[new]
@@ -122,11 +128,6 @@ impl PyPlan {
             .map_err(|err| {
                 SafetensorDistributedError::new_err(format!("Error during execute {err}"))
             })?;
-        // let result = loader.runtime.block_on(async {
-        //     self.inner.execute(&mut loader.inner).await.map_err(|err| {
-        //         SafetensorDistributedError::new_err(format!("Failed to execute plan: {err}"))
-        //     })
-        // })?;
 
         Python::with_gil(|py| {
             let dict = PyDict::new(py);

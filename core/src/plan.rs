@@ -118,6 +118,7 @@ impl<'a> Plan<'a> {
                     }
                 })
                 .collect();
+            println!("Tensor {tensor_name} new shape {new_shape:?}");
 
             // Calculate total size in bytes
             let element_size = match info.dtype {
@@ -390,8 +391,8 @@ impl<'a> Plan<'a> {
                 }
             }
             // For remaining axes, take the full range
-            for i in slices.len()..shape.len() {
-                bounds.push((0, shape[i]));
+            for dim in shape.iter().skip(slices.len()) {
+                bounds.push((0, *dim));
             }
             // Now, enumerate all indices in the slice and compute file/output offsets
             // We'll use a multi-dimensional index
@@ -512,12 +513,12 @@ mod tests {
                 data.extend_from_slice(&value.to_le_bytes());
             }
         }
-        let tensor = Tensor {
+
+        Tensor {
             data,
             shape: vec![rows, cols],
             dtype: Dtype::F32,
-        };
-        tensor
+        }
     }
 
     fn save_tensors(tensors: HashMap<&str, Tensor>) -> NamedTempFile {

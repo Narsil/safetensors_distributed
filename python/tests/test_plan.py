@@ -84,12 +84,13 @@ class TestPlan(unittest.TestCase):
     def test_plan_execute_partial(self):
         tensor = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
         self.test_file_path = os.path.join(self.test_dir, "test.safetensors")
-        save_file({"a": tensor}, self.test_file_path)
+        save_file({"a": tensor, "b": tensor}, self.test_file_path)
         url = "http://127.0.0.1:8000/test.safetensors"
         with dist_loader(url) as loader:
             plan = loader.plan()
             # Use tensor 'a' with shape (2, 2)
             plan.add_slice(loader.get_slice("a")[:1])
+            plan.add_slice(loader.get_slice("b")[0])
             result = plan.execute(loader)
 
         self.assertIn("a", result)
@@ -106,6 +107,18 @@ class TestPlan(unittest.TestCase):
         )
         np.testing.assert_allclose(arr, expected)
         np.testing.assert_allclose(arr, tensor[:1])
+
+        arr = result["b"]
+        self.assertIsInstance(arr, np.ndarray)
+        self.assertEqual(arr.shape, (2,))
+
+        # Now we can check the actual values since we know what we put in
+        expected = np.array(
+            [1.0, 2.0],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(arr, expected)
+        np.testing.assert_allclose(arr, tensor[0])
 
 
 if __name__ == "__main__":

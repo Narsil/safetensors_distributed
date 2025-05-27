@@ -6,7 +6,6 @@ use pyo3::types::{PyDict, PyDictMethods};
 use reqwest::Url;
 use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Metadata, TensorInfo};
-use serde_json;
 use tokio::runtime::Runtime;
 
 use safetensors_distributed::loader::Loader;
@@ -133,7 +132,6 @@ impl PlanSlice {
             .map(slice_to_indexer)
             .collect::<Result<_, _>>()?;
         Ok(PlanSliced {
-            info: self.info.clone(),
             name: self.name.clone(),
             indexers,
         })
@@ -148,20 +146,11 @@ impl PlanSlice {
 #[pyclass]
 #[derive(Clone)]
 pub struct PlanSliced {
-    info: TensorInfo,
     pub(crate) indexers: Vec<TensorIndexer>,
     name: String,
 }
 
 impl PlanSliced {
-    fn new(info: TensorInfo, indexers: Vec<TensorIndexer>, name: String) -> Self {
-        Self {
-            info,
-            indexers,
-            name,
-        }
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
