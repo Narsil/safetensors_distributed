@@ -10,6 +10,7 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
+indicatif = "0.17.7"
 
 [dev-dependencies]
 axum = { workspace = true }

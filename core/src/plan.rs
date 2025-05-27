@@ -1,3 +1,4 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use safetensors::tensor::Metadata;
 use safetensors::{Dtype, View, slice::TensorIndexer};
 
@@ -83,6 +84,20 @@ impl<'a> Plan<'a> {
         let metadata = metadata.clone();
         let mut result = HashMap::new();
 
+        // Calculate total size to download
+        let total_size: usize = fetch_offsets.iter().map(|req| req.length).sum();
+
+        // Create progress bar
+        let pb = ProgressBar::new(total_size as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner} [{elapsed}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                )
+                .unwrap(),
+        );
+        // .progress_chars("#>-"));
+
         // First create all the empty tensors
         for (tensor_name, slices) in &self.slices {
             // Get the tensor info from metadata
@@ -90,35 +105,34 @@ impl<'a> Plan<'a> {
                 .info(tensor_name)
                 .ok_or_else(|| Error::MissingTensor(tensor_name.clone()))?;
 
-            // Calculate the new shape based on slices
-            let new_shape: Vec<usize> = info
-                .shape
-                .iter()
-                .enumerate()
-                .flat_map(|(i, &dim)| {
-                    if let Some(slice) = slices.get(i) {
-                        match slice {
-                            TensorIndexer::Select(_) => None,
-                            TensorIndexer::Narrow(start, end) => {
-                                let start = match start {
-                                    Bound::Unbounded => 0,
-                                    Bound::Included(i) => *i,
-                                    Bound::Excluded(i) => *i + 1,
-                                };
-                                let end = match end {
-                                    Bound::Unbounded => dim,
-                                    Bound::Included(i) => *i + 1,
-                                    Bound::Excluded(i) => *i,
-                                };
-                                Some(end - start)
-                            }
+            // If we have any Select indices, we need to adjust the shape
+            let mut final_shape = Vec::new();
+            for (i, &dim) in info.shape.iter().enumerate() {
+                if let Some(slice) = slices.get(i) {
+                    match slice {
+                        TensorIndexer::Select(_) => {
+                            // Skip this dimension as it's been selected
                         }
-                    } else {
-                        Some(dim)
+                        TensorIndexer::Narrow(start, end) => {
+                            let start = match start {
+                                Bound::Unbounded => 0,
+                                Bound::Included(i) => *i,
+                                Bound::Excluded(i) => *i + 1,
+                            };
+                            let end = match end {
+                                Bound::Unbounded => dim,
+                                Bound::Included(i) => *i + 1,
+                                Bound::Excluded(i) => *i,
+                            };
+                            final_shape.push(end - start);
+                        }
                     }
-                })
-                .collect();
-            println!("Tensor {tensor_name} new shape {new_shape:?}");
+                } else {
+                    final_shape.push(dim);
+                }
+            }
+
+            println!("Tensor {tensor_name} new shape {final_shape:?}");
 
             // Calculate total size in bytes
             let element_size = match info.dtype {
@@ -133,14 +147,14 @@ impl<'a> Plan<'a> {
                 Dtype::F16 => 2,
                 _ => todo!(),
             };
-            let total_size = new_shape.iter().product::<usize>() * element_size;
+            let total_size = final_shape.iter().product::<usize>() * element_size;
 
             // Create empty tensor with correct shape and dtype
             result.insert(
                 tensor_name.clone(),
                 Tensor {
                     dtype: info.dtype,
-                    shape: new_shape,
+                    shape: final_shape,
                     data: vec![0; total_size],
                 },
             );
@@ -171,6 +185,7 @@ impl<'a> Plan<'a> {
             let tx = tx.clone();
             let client = client.clone();
             let url = url.clone();
+            let pb = pb.clone();
 
             let mut prev_end: Option<usize> = None;
             for request in requests {
@@ -187,6 +202,7 @@ impl<'a> Plan<'a> {
                     let client = client.clone();
                     let url = url.clone();
                     let tensor_name = tensor_name.clone();
+                    let pb = pb.clone();
 
                     tokio::spawn(async move {
                         let start = chunk_requests.first().unwrap().file_offset;
@@ -198,6 +214,7 @@ impl<'a> Plan<'a> {
                             Ok(response) => {
                                 if let Ok(bytes) = response.bytes().await {
                                     let data = bytes.to_vec();
+                                    pb.inc(data.len() as u64);
                                     eprintln!(
                                         "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
                                         start,
@@ -268,6 +285,7 @@ impl<'a> Plan<'a> {
                 let client = client.clone();
                 let url = url.clone();
                 let tensor_name = tensor_name.clone();
+                let pb = pb.clone();
 
                 tokio::spawn(async move {
                     let start = chunk_requests.first().unwrap().file_offset;
@@ -279,6 +297,7 @@ impl<'a> Plan<'a> {
                         Ok(response) => {
                             if let Ok(bytes) = response.bytes().await {
                                 let data = bytes.to_vec();
+                                pb.inc(data.len() as u64);
                                 eprintln!(
                                     "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
                                     start,
@@ -350,6 +369,9 @@ impl<'a> Plan<'a> {
                 }
             }
         }
+
+        // Finish the progress bar
+        pb.finish_with_message("Download complete");
 
         Ok(result)
     }
@@ -703,7 +725,7 @@ mod tests {
                     "tensor2".to_string(),
                     Tensor {
                         dtype: Dtype::F32,
-                        shape: vec![1, 2],
+                        shape: vec![2],
                         // arange(3*4).reshape(4, 3)[1, 1:3]
                         // == [4, 5]
                         data: vec![4.0f32, 5.0]
