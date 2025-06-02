@@ -1106,6 +1106,7 @@ dependencies = [
  "indicatif",
  "reqwest",
  "safetensors",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
