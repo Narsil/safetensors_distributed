@@ -67,7 +67,7 @@ pub enum TopologyError {
 
 /// Checks if there are any overlapping chunks in a distributed tensor.
 /// Returns Ok(()) if there are no overlaps, or an error describing the overlap.
-fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError> {
+fn check_overlapping_chunks(info: &DistributedInfo, tensor_name: &str) -> Result<(), TopologyError> {
     let ndim = info.shape.len();
     let nelements: usize = info.shape.iter().product();
     let mut covered = Vec::new();
@@ -82,7 +82,7 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
         // Check chunk dimensions
         if chunk.offsets.len() != ndim || chunk.shape.len() != ndim {
             return Err(TopologyError::InvalidChunkDimensions(
-                "tensor".to_string(), // We don't have the tensor name here
+                tensor_name.to_string(),
                 ndim,
                 chunk.offsets.len(),
             ));
@@ -92,7 +92,7 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
         for d in 0..ndim {
             if chunk.offsets[d] + chunk.shape[d] > info.shape[d] {
                 return Err(TopologyError::ChunkOutOfBounds(
-                    "tensor".to_string(), // We don't have the tensor name here
+                    tensor_name.to_string(),
                     d,
                     info.shape[d],
                 ));
@@ -108,7 +108,6 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
             .rev()
             .zip(info.shape.iter().rev())
         {
-            println!("i {i} d {d}, total_d {total_d}");
             if d == total_d && span == 0 {
                 continue;
             } else if span == 0 {
@@ -116,7 +115,6 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
                 let off = chunk.offsets[i];
                 let start = off * strides[i];
                 let stop = start + span * d;
-                println!("Adding {start} {stop}");
                 intervals.push((start, stop));
             } else {
                 let stride = strides[i];
@@ -130,13 +128,10 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
                         intervals.push((new_start, new_stop));
                     }
                 }
-                println!("Covered {covered:?} : {:?} {strides:?}", info.shape);
-                //todo!();
             }
         }
         covered.extend(intervals);
     }
-    println!("Covered {covered:?} : {:?} {strides:?}", info.shape);
 
     // Sort intervals by start index
     covered.sort_by_key(|&(start, _)| start);
@@ -146,10 +141,10 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
     for &(start, end) in &covered {
         match start.cmp(&prev_end) {
             Ordering::Less => {
-                return Err(TopologyError::OverlappingChunks("tensor".to_string()));
+                return Err(TopologyError::OverlappingChunks(tensor_name.to_string()));
             }
             Ordering::Greater => {
-                return Err(TopologyError::NonCoveringChunks("tensor".to_string()));
+                return Err(TopologyError::NonCoveringChunks(tensor_name.to_string()));
             }
             Ordering::Equal => {}
         }
@@ -157,10 +152,10 @@ fn check_overlapping_chunks(info: &DistributedInfo) -> Result<(), TopologyError>
     }
     match nelements.cmp(&prev_end) {
         Ordering::Less => {
-            return Err(TopologyError::OverlappingChunks("tensor".to_string()));
+            return Err(TopologyError::OverlappingChunks(tensor_name.to_string()));
         }
         Ordering::Greater => {
-            return Err(TopologyError::NonCoveringChunks("tensor".to_string()));
+            return Err(TopologyError::NonCoveringChunks(tensor_name.to_string()));
         }
         Ordering::Equal => {}
     }
@@ -203,82 +198,8 @@ impl Topology {
                         }
                     }
 
-                    let ndim = info.shape.len();
-                    let total_elements: usize = info.shape.iter().product();
-                    let mut covered = Vec::with_capacity(total_elements);
-
                     // Check for overlaps
-                    check_overlapping_chunks(info).map_err(|e| match e {
-                        TopologyError::OverlappingChunks(_) => {
-                            TopologyError::OverlappingChunks(name.clone())
-                        }
-                        TopologyError::InvalidChunkDimensions(_, expected, got) => {
-                            TopologyError::InvalidChunkDimensions(name.clone(), expected, got)
-                        }
-                        TopologyError::ChunkOutOfBounds(_, dim, max) => {
-                            TopologyError::ChunkOutOfBounds(name.clone(), dim, max)
-                        }
-                        _ => e,
-                    })?;
-
-                    for chunk in &info.chunks {
-                        for d in 0..ndim {
-                            if chunk.offsets[d] + chunk.shape[d] > info.shape[d] {
-                                return Err(TopologyError::InvalidChunkCount(
-                                    name.clone(),
-                                    info.shape[d],
-                                    chunk.offsets[d] + chunk.shape[d],
-                                ));
-                            }
-                        }
-                        // Enumerate all indices covered by this chunk
-                        let mut idx = vec![0; ndim];
-                        loop {
-                            let global_idx: Vec<usize> = idx
-                                .iter()
-                                .enumerate()
-                                .map(|(d, &i)| chunk.offsets[d] + i)
-                                .collect();
-                            covered.push(global_idx.clone());
-                            // Increment idx
-                            let mut dim = ndim;
-                            while dim > 0 {
-                                dim -= 1;
-                                idx[dim] += 1;
-                                if idx[dim] < chunk.shape[dim] {
-                                    break;
-                                } else {
-                                    idx[dim] = 0;
-                                }
-                            }
-                            if dim == 0 && idx[0] == 0 {
-                                break;
-                            }
-                        }
-                    }
-                    covered.sort();
-                    // Check for complete coverage
-                    if covered.len() != total_elements {
-                        return Err(TopologyError::NonCoveringChunks(name.clone()));
-                    }
-                    // Check that all indices are present
-                    let mut expected = vec![0; ndim];
-                    for idx in &covered {
-                        if &expected != idx {
-                            return Err(TopologyError::NonCoveringChunks(name.clone()));
-                        }
-                        // Increment expected
-                        let mut dim = ndim;
-                        while dim > 0 {
-                            dim -= 1;
-                            expected[dim] += 1;
-                            if expected[dim] < info.shape[dim] {
-                                break;
-                            } else {
-                                expected[dim] = 0;
-                            }
-                        }
-                    }
+                    check_overlapping_chunks(info, name)?;
                 }
                 Tensor::Shared(info) => {
                     if info.filename_index >= self.filenames.len() {
@@ -774,7 +695,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(check_overlapping_chunks(&info1), Ok(()));
+        assert_eq!(check_overlapping_chunks(&info1, "test_tensor1"), Ok(()));
 
         // Test case 1: No overlapping chunks last dim
         let info1 = DistributedInfo {
@@ -793,7 +714,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(check_overlapping_chunks(&info1), Ok(()));
+        assert_eq!(check_overlapping_chunks(&info1, "test_tensor2"), Ok(()));
 
         // Test case 2: Overlapping chunks in first dimension
         let info2 = DistributedInfo {
@@ -812,10 +733,10 @@ mod tests {
                 },
             ],
         };
-        assert!(matches!(
-            check_overlapping_chunks(&info2),
-            Err(TopologyError::OverlappingChunks(_))
-        ));
+        assert_eq!(
+            check_overlapping_chunks(&info2, "overlapping_tensor"),
+            Err(TopologyError::OverlappingChunks("overlapping_tensor".to_string()))
+        );
 
         // Test case 3: Invalid chunk dimensions
         let info3 = DistributedInfo {
@@ -834,10 +755,14 @@ mod tests {
                 },
             ],
         };
-        assert!(matches!(
-            check_overlapping_chunks(&info3),
-            Err(TopologyError::InvalidChunkDimensions(_, 2, 1))
-        ));
+        assert_eq!(
+            check_overlapping_chunks(&info3, "invalid_dim_tensor"),
+            Err(TopologyError::InvalidChunkDimensions(
+                "invalid_dim_tensor".to_string(),
+                2,
+                1
+            ))
+        );
 
         // Test case 4: Chunk out of bounds
         let info4 = DistributedInfo {
@@ -856,10 +781,14 @@ mod tests {
                 },
             ],
         };
-        assert!(matches!(
-            check_overlapping_chunks(&info4),
-            Err(TopologyError::ChunkOutOfBounds(_, 0, 4))
-        ));
+        assert_eq!(
+            check_overlapping_chunks(&info4, "out_of_bounds_tensor"),
+            Err(TopologyError::ChunkOutOfBounds(
+                "out_of_bounds_tensor".to_string(),
+                0,
+                4
+            ))
+        );
     }
 
     #[tokio::test]

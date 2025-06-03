@@ -3,7 +3,6 @@ use safetensors::tensor::Metadata;
 use safetensors::{Dtype, View, slice::TensorIndexer};
 
 use std::collections::hash_map::Entry;
-use std::io::Write;
 use std::ops::Bound;
 use std::{borrow::Cow, collections::HashMap};
 use tokio::sync::mpsc;
@@ -132,8 +131,6 @@ impl<'a> Plan<'a> {
                 }
             }
 
-            println!("Tensor {tensor_name} new shape {final_shape:?}");
-
             // Calculate total size in bytes
             let element_size = match info.dtype {
                 Dtype::F32 => 4,
@@ -215,20 +212,6 @@ impl<'a> Plan<'a> {
                                 if let Ok(bytes) = response.bytes().await {
                                     let data = bytes.to_vec();
                                     pb.inc(data.len() as u64);
-                                    eprintln!(
-                                        "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
-                                        start,
-                                        end,
-                                        data.len(),
-                                        chunk_requests
-                                            .iter()
-                                            .map(|r| format!(
-                                                "{{offset={}, len={}}}",
-                                                r.file_offset, r.length
-                                            ))
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    );
                                     let mut effective_start = start;
                                     if data.len() > end - start {
                                         effective_start = 0;
@@ -236,15 +219,6 @@ impl<'a> Plan<'a> {
                                     for request in chunk_requests {
                                         let offset = request.file_offset - effective_start;
                                         if offset + request.length > data.len() {
-                                            eprintln!(
-                                                "[BUG] Out of bounds: offset {} + length {} > data.len() {} (effective_start={}, start={}, end={})",
-                                                offset,
-                                                request.length,
-                                                data.len(),
-                                                effective_start,
-                                                start,
-                                                end
-                                            );
                                             continue;
                                         }
                                         let chunk = DownloadedChunk {
@@ -298,20 +272,6 @@ impl<'a> Plan<'a> {
                             if let Ok(bytes) = response.bytes().await {
                                 let data = bytes.to_vec();
                                 pb.inc(data.len() as u64);
-                                eprintln!(
-                                    "[DEBUG] Downloaded chunk: start={}, end={}, data.len()={}, requests=[{}]",
-                                    start,
-                                    end,
-                                    data.len(),
-                                    chunk_requests
-                                        .iter()
-                                        .map(|r| format!(
-                                            "{{offset={}, len={}}}",
-                                            r.file_offset, r.length
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                );
                                 let mut effective_start = start;
                                 if data.len() > end - start {
                                     effective_start = 0;
@@ -319,15 +279,6 @@ impl<'a> Plan<'a> {
                                 for request in chunk_requests {
                                     let offset = request.file_offset - effective_start;
                                     if offset + request.length > data.len() {
-                                        eprintln!(
-                                            "[BUG] Out of bounds: offset {} + length {} > data.len() {} (effective_start={}, start={}, end={})",
-                                            offset,
-                                            request.length,
-                                            data.len(),
-                                            effective_start,
-                                            start,
-                                            end
-                                        );
                                         continue;
                                     }
                                     let chunk = DownloadedChunk {
@@ -358,14 +309,6 @@ impl<'a> Plan<'a> {
                 let end = chunk.output_offset + chunk.data.len();
                 if end <= tensor.data.len() {
                     tensor.data[chunk.output_offset..end].copy_from_slice(&chunk.data);
-                } else {
-                    eprintln!(
-                        "[ERROR] Chunk out of bounds: output_offset={}, data.len()={}, tensor.data.len()={}",
-                        chunk.output_offset,
-                        chunk.data.len(),
-                        tensor.data.len()
-                    );
-                    std::io::stderr().flush().unwrap();
                 }
             }
         }
@@ -431,11 +374,6 @@ impl<'a> Plan<'a> {
                 }
                 let file_offset = offset + info.data_offsets.0 + flat_idx * dtype_size;
                 let output_offset_here = output_offset;
-                eprintln!(
-                    "[DEBUG] FetchRequest: tensor={}, bounds={:?}, idx={:?}, flat_idx={}, file_offset={}, length={}, output_offset={}",
-                    tensor_name, bounds, idx, flat_idx, file_offset, dtype_size, output_offset_here
-                );
-                std::io::stderr().flush().unwrap();
                 requests.push(FetchRequest {
                     tensor_name: tensor_name.clone(),
                     file_offset,
@@ -478,18 +416,13 @@ mod tests {
     use tokio::task;
 
     async fn serve_file(file_path: std::path::PathBuf, headers: HeaderMap) -> Response {
-        eprintln!("[DEBUG] Received headers: {:?}", headers);
         match tokio::fs::read(&*file_path).await {
             Ok(bytes) => {
                 if let Some(range_header) = headers.get("range") {
-                    eprintln!("[DEBUG] Range header: {:?}", range_header);
                     if let Ok(range_str) = range_header.to_str() {
-                        eprintln!("[DEBUG] Range string: {}", range_str);
                         if let Some(range) = range_str.strip_prefix("bytes=") {
-                            eprintln!("[DEBUG] Range value: {}", range);
                             let mut parts = range.split('-');
                             if let (Some(start), Some(end)) = (parts.next(), parts.next()) {
-                                eprintln!("[DEBUG] Range parts: start={}, end={}", start, end);
                                 if let (Ok(start), Ok(end)) =
                                     (start.parse::<usize>(), end.parse::<usize>())
                                 {
@@ -497,13 +430,6 @@ mod tests {
                                     let end = end.min(bytes.len());
                                     let start = start.min(end);
                                     let response = bytes[start..end].to_vec();
-                                    eprintln!(
-                                        "[DEBUG] Response range: {}-{} (len={})",
-                                        start,
-                                        end - 1,
-                                        response.len()
-                                    );
-                                    eprintln!("[DEBUG] Response data: {:?}", response);
                                     let resp = Response::builder()
                                         .status(StatusCode::PARTIAL_CONTENT)
                                         .header(
@@ -519,7 +445,6 @@ mod tests {
                         }
                     }
                 }
-                eprintln!("[DEBUG] Full file data: {:?}", bytes);
                 (StatusCode::OK, bytes).into_response()
             }
             Err(_) => (StatusCode::NOT_FOUND, Vec::new()).into_response(),
@@ -606,7 +531,7 @@ mod tests {
         ]);
         let (_temp_handle, url) = create_test_file(tensors).await;
         let mut loader = Loader::new(url).unwrap();
-        let mut plan = loader.plan(); // Create a new plan for the second test
+        let mut plan = loader.plan();
 
         // Slice tensor1 along first dimension
         let slice1 = vec![
@@ -623,16 +548,6 @@ mod tests {
         plan.get_slice("tensor1", slice1).unwrap();
         plan.get_slice("tensor2", slice2).unwrap();
 
-        // Print all fetch requests for debugging
-        let (_, fetches) = plan.gather_fetch_offsets().await.unwrap();
-        eprintln!("[DEBUG] All fetch requests:");
-        for f in &fetches {
-            eprintln!(
-                "  tensor={}, file_offset={}, length={}, output_offset={}",
-                f.tensor_name, f.file_offset, f.length, f.output_offset
-            );
-        }
-
         let result = plan.execute().await;
         let result = result.expect("Plan execute should succeed");
         assert_eq!(
@@ -643,8 +558,6 @@ mod tests {
                     Tensor {
                         dtype: Dtype::F32,
                         shape: vec![2, 2],
-                        // arange(3*4).reshape(3, 4)[:2, 2:4]
-                        // == [[2, 3], [6, 7]]
                         data: vec![2.0f32, 3.0, 6.0, 7.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -656,8 +569,6 @@ mod tests {
                     Tensor {
                         dtype: Dtype::F32,
                         shape: vec![1, 2],
-                        // arange(3*4).reshape(3, 4)[2:3, 1:3]
-                        // == [[7, 8]]
                         data: vec![7.0f32, 8.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -693,16 +604,6 @@ mod tests {
         plan.get_slice("tensor1", slice1).unwrap();
         plan.get_slice("tensor2", slice2).unwrap();
 
-        // Print all fetch requests for debugging
-        let (_, fetches) = plan.gather_fetch_offsets().await.unwrap();
-        eprintln!("[DEBUG] All fetch requests:");
-        for f in &fetches {
-            eprintln!(
-                "  tensor={}, file_offset={}, length={}, output_offset={}",
-                f.tensor_name, f.file_offset, f.length, f.output_offset
-            );
-        }
-
         let result = plan.execute().await;
         let result = result.expect("Plan execute should succeed");
         assert_eq!(
@@ -713,8 +614,6 @@ mod tests {
                     Tensor {
                         dtype: Dtype::F32,
                         shape: vec![2, 4],
-                        // arange(3*4).reshape(3, 4)[:2]
-                        // == [[0, 1, 2, 3], [4, 5, 6, 7]]
                         data: vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -726,8 +625,6 @@ mod tests {
                     Tensor {
                         dtype: Dtype::F32,
                         shape: vec![2],
-                        // arange(3*4).reshape(4, 3)[1, 1:3]
-                        // == [4, 5]
                         data: vec![4.0f32, 5.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -764,7 +661,6 @@ mod tests {
         plan.get_slice("tensor1", slice1).unwrap();
         plan.get_slice("tensor2", slice2).unwrap();
         let (_, fetches) = plan.gather_fetch_offsets().await.unwrap();
-        println!("Fetches {fetches:#?}");
         assert_eq!(
             fetches,
             vec![
