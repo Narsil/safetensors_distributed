@@ -30,6 +30,14 @@ pub struct Chunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleTopo {
+    tensors: HashMap<String, Tensor>,
+    filenames: Vec<String>,
+    n_ranks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SimpleTopo")]
 pub struct Topology {
     tensors: HashMap<String, Tensor>,
     filenames: Vec<String>,
@@ -165,8 +173,21 @@ fn check_overlapping_chunks(
     Ok(())
 }
 
+impl TryFrom<SimpleTopo> for Topology {
+    type Error = TopologyError;
+    fn try_from(value: SimpleTopo) -> Result<Self, Self::Error> {
+        let topo = Topology {
+            filenames: value.filenames,
+            n_ranks: value.n_ranks,
+            tensors: value.tensors,
+        };
+        topo.validate()?;
+        Ok(topo)
+    }
+}
 impl Topology {
-    pub fn new(n_ranks: usize) -> Self {
+    #[cfg(test)]
+    fn new(n_ranks: usize) -> Self {
         Self {
             tensors: HashMap::new(),
             filenames: vec![],
@@ -177,7 +198,7 @@ impl Topology {
     /// Validates that all distributed tensors have the correct number of chunks
     /// matching the number of ranks and that all filename indices are valid.
     /// Also checks that chunks are non-overlapping and form a complete covering set.
-    pub fn validate(&self) -> Result<(), TopologyError> {
+    fn validate(&self) -> Result<(), TopologyError> {
         for (name, tensor) in &self.tensors {
             match tensor {
                 Tensor::Distributed(info) => {
