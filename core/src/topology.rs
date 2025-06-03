@@ -40,6 +40,15 @@ pub struct DistributedInfo {
 }
 
 impl DistributedInfo {
+    /// Creates a new distributed tensor info with the given shape, dtype, and chunks
+    pub fn new(shape: Vec<usize>, dtype: Dtype, chunks: Vec<Chunk>) -> Self {
+        Self {
+            shape,
+            dtype,
+            chunks,
+        }
+    }
+
     /// Returns the shape of the tensor
     pub fn shape(&self) -> &[usize] {
         &self.shape
@@ -64,6 +73,15 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// Creates a new chunk with the given offsets, shape, and filename index
+    pub fn new(offsets: Vec<usize>, shape: Vec<usize>, filename_index: usize) -> Self {
+        Self {
+            offsets,
+            shape,
+            filename_index,
+        }
+    }
+
     /// Returns the offsets of this chunk in the full tensor
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
@@ -85,6 +103,17 @@ pub struct SimpleTopo {
     tensors: HashMap<String, Tensor>,
     filenames: Vec<String>,
     n_ranks: usize,
+}
+
+impl SimpleTopo {
+    /// Creates a new simple topology with the given tensors, filenames, and number of ranks
+    pub fn new(tensors: HashMap<String, Tensor>, filenames: Vec<String>, n_ranks: usize) -> Self {
+        Self {
+            tensors,
+            filenames,
+            n_ranks,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +139,9 @@ pub enum TopologyError {
 
     #[error("Invalid filename index {1} for tensor {0}: index out of bounds (max: {2})")]
     InvalidFilenameIndex(String, usize, usize),
+
+    #[error("Missing filename indices {1:?} is missing for tensor {0}")]
+    FilenameIndexMissing(String, Vec<bool>),
 
     #[error("Overlapping chunks detected in tensor {0}")]
     OverlappingChunks(String),
@@ -161,37 +193,7 @@ fn check_overlapping_chunks(
             }
         }
 
-        let mut intervals = Vec::new();
-        let mut span = 0;
-        for ((i, d), total_d) in chunk
-            .shape
-            .iter()
-            .enumerate()
-            .rev()
-            .zip(info.shape.iter().rev())
-        {
-            if d == total_d && span == 0 {
-                continue;
-            } else if span == 0 {
-                span = strides[i];
-                let off = chunk.offsets[i];
-                let start = off * strides[i];
-                let stop = start + span * d;
-                intervals.push((start, stop));
-            } else {
-                let stride = strides[i];
-                let off = chunk.offsets[i];
-
-                let old: Vec<_> = intervals.drain(..).collect();
-                for dd in 0..*d {
-                    for (old_start, old_stop) in &old {
-                        let new_start = (off + dd) * stride + old_start;
-                        let new_stop = (off + dd) * stride + old_stop;
-                        intervals.push((new_start, new_stop));
-                    }
-                }
-            }
-        }
+        let intervals = get_intervals(chunk, &strides, info.shape());
         covered.extend(intervals);
     }
 
@@ -224,6 +226,39 @@ fn check_overlapping_chunks(
     Ok(())
 }
 
+pub(crate) fn get_intervals(
+    chunk: &Chunk,
+    strides: &[usize],
+    shape: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut intervals = Vec::new();
+    let mut span = 0;
+    for ((i, d), total_d) in chunk.shape.iter().enumerate().rev().zip(shape.iter().rev()) {
+        if d == total_d && span == 0 {
+            continue;
+        } else if span == 0 {
+            span = strides[i];
+            let off = chunk.offsets[i];
+            let start = off * strides[i];
+            let stop = start + span * d;
+            intervals.push((start, stop));
+        } else {
+            let stride = strides[i];
+            let off = chunk.offsets[i];
+
+            let old: Vec<_> = intervals.drain(..).collect();
+            for dd in 0..*d {
+                for (old_start, old_stop) in &old {
+                    let new_start = (off + dd) * stride + old_start;
+                    let new_stop = (off + dd) * stride + old_stop;
+                    intervals.push((new_start, new_stop));
+                }
+            }
+        }
+    }
+    intervals
+}
+
 impl TryFrom<SimpleTopo> for Topology {
     type Error = TopologyError;
     fn try_from(value: SimpleTopo) -> Result<Self, Self::Error> {
@@ -252,8 +287,8 @@ impl Topology {
     }
 
     /// Returns an iterator over the tensor names and their corresponding tensors
-    pub fn tensors(&self) -> impl Iterator<Item = (&String, &Tensor)> {
-        self.tensors.iter()
+    pub fn tensors(&self) -> &HashMap<String, Tensor> {
+        &self.tensors
     }
 
     /// Returns a reference to a specific tensor by name
@@ -282,6 +317,7 @@ impl Topology {
                         ));
                     }
 
+                    let mut set = vec![false; self.filenames.len()];
                     // Check filename indices
                     for chunk in &info.chunks {
                         if chunk.filename_index >= self.filenames.len() {
@@ -291,6 +327,14 @@ impl Topology {
                                 self.filenames.len(),
                             ));
                         }
+                        set[chunk.filename_index] = true;
+                    }
+                    let missing_indices: Vec<bool> = set.into_iter().filter(|f| !*f).collect();
+                    if !missing_indices.is_empty() {
+                        return Err(TopologyError::FilenameIndexMissing(
+                            name.clone(),
+                            missing_indices,
+                        ));
                     }
 
                     // Check for overlaps

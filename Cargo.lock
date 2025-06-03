@@ -1278,9 +1278,11 @@ name = "safetensors_distributed"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
  "futures-util",
  "hf-hub",
  "indicatif",
+ "log",
  "reqwest",
  "safetensors",
  "serde",
