@@ -67,7 +67,10 @@ pub enum TopologyError {
 
 /// Checks if there are any overlapping chunks in a distributed tensor.
 /// Returns Ok(()) if there are no overlaps, or an error describing the overlap.
-fn check_overlapping_chunks(info: &DistributedInfo, tensor_name: &str) -> Result<(), TopologyError> {
+fn check_overlapping_chunks(
+    info: &DistributedInfo,
+    tensor_name: &str,
+) -> Result<(), TopologyError> {
     let ndim = info.shape.len();
     let nelements: usize = info.shape.iter().product();
     let mut covered = Vec::new();
@@ -735,7 +738,9 @@ mod tests {
         };
         assert_eq!(
             check_overlapping_chunks(&info2, "overlapping_tensor"),
-            Err(TopologyError::OverlappingChunks("overlapping_tensor".to_string()))
+            Err(TopologyError::OverlappingChunks(
+                "overlapping_tensor".to_string()
+            ))
         );
 
         // Test case 3: Invalid chunk dimensions
@@ -789,6 +794,90 @@ mod tests {
                 4
             ))
         );
+    }
+
+    #[test]
+    fn test_check_overlapping_chunks_3d() {
+        // Create a 3D tensor with overlapping chunks in the middle dimension
+        let info = DistributedInfo {
+            shape: vec![2, 4, 2], // 2x4x2 tensor
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0, 0],
+                    shape: vec![2, 2, 2], // First chunk: full height, first half of width
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![0, 2, 0], // Overlaps in middle dimension
+                    shape: vec![2, 2, 2],   // Second chunk: full height, second half of width
+                    filename_index: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            check_overlapping_chunks(&info, "overlapping_3d_tensor"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_check_overlapping_chunks_3d_fail() {
+        // Create a 3D tensor with overlapping chunks in the middle dimension
+        let info = DistributedInfo {
+            shape: vec![2, 4, 2], // 2x4x2 tensor
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0, 0],
+                    shape: vec![2, 2, 2], // First chunk: full height, first half of width
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![0, 1, 0], // Overlaps in middle dimension
+                    shape: vec![2, 2, 2],   // Second chunk: full height, second half of width
+                    filename_index: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            check_overlapping_chunks(&info, "overlapping_3d_tensor"),
+            Err(TopologyError::OverlappingChunks(
+                "overlapping_3d_tensor".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_check_overlapping_chunks_quadrants() {
+        // Create a 4x4 tensor split into 4 quadrants
+        let info = DistributedInfo {
+            shape: vec![4, 4], // 4x4 tensor
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0],
+                    shape: vec![2, 2], // Top-left quadrant
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![0, 2],
+                    shape: vec![2, 2], // Top-right quadrant
+                    filename_index: 1,
+                },
+                Chunk {
+                    offsets: vec![2, 0],
+                    shape: vec![2, 2], // Bottom-left quadrant
+                    filename_index: 2,
+                },
+                Chunk {
+                    offsets: vec![2, 2],
+                    shape: vec![2, 2], // Bottom-right quadrant
+                    filename_index: 3,
+                },
+            ],
+        };
+        assert_eq!(check_overlapping_chunks(&info, "quadrant_tensor"), Ok(()));
     }
 
     #[tokio::test]
