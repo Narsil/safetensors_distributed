@@ -10,8 +10,9 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
-indicatif = "0.17.7"
-serde = { version = "1.0.219", features = ["serde_derive"] }
+indicatif = { workspace = true }
+serde = { workspace = true }
+hf-hub = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

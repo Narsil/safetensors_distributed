@@ -14,10 +14,13 @@ edition = "2024"
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3", "abi3-py38"] }
 reqwest = { version = "0.12.15", features = ["json", "stream"] }
 tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros"] }
-safetensors = "0.4.0"
+safetensors = "0.5"
 serde_json = "1.0.140"
 thiserror = "2.0.12"
 futures-util = "0.3.30"
-axum = "0.7"
+axum = "0.8"
 tempfile = "3.10.1"
 tokio-test = "0.4.3"
+hf-hub = { version = "0.4", features = ["tokio"] }
+indicatif = "0.17.7"
+serde = { version = "1.0", features = ["serde_derive"] }

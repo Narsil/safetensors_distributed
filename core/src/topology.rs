@@ -15,6 +15,23 @@ pub struct SharedInfo {
     filename_index: usize,
 }
 
+impl SharedInfo {
+    /// Returns the shape of the tensor
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the data type of the tensor
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// Returns the index of the file containing this tensor
+    pub fn filename_index(&self) -> usize {
+        self.filename_index
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedInfo {
     shape: Vec<usize>,
@@ -22,11 +39,45 @@ pub struct DistributedInfo {
     chunks: Vec<Chunk>,
 }
 
+impl DistributedInfo {
+    /// Returns the shape of the tensor
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the data type of the tensor
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// Returns the chunks that make up this distributed tensor
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chunk {
     offsets: Vec<usize>,
     shape: Vec<usize>,
     filename_index: usize,
+}
+
+impl Chunk {
+    /// Returns the offsets of this chunk in the full tensor
+    pub fn offsets(&self) -> &[usize] {
+        &self.offsets
+    }
+
+    /// Returns the shape of this chunk
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the index of the file containing this chunk
+    pub fn filename_index(&self) -> usize {
+        self.filename_index
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +244,26 @@ impl Topology {
             filenames: vec![],
             n_ranks,
         }
+    }
+
+    /// Returns the number of ranks in the topology
+    pub fn n_ranks(&self) -> usize {
+        self.n_ranks
+    }
+
+    /// Returns an iterator over the tensor names and their corresponding tensors
+    pub fn tensors(&self) -> impl Iterator<Item = (&String, &Tensor)> {
+        self.tensors.iter()
+    }
+
+    /// Returns a reference to a specific tensor by name
+    pub fn get_tensor(&self, name: &str) -> Option<&Tensor> {
+        self.tensors.get(name)
+    }
+
+    /// Returns the list of filenames
+    pub fn filenames(&self) -> &[String] {
+        &self.filenames
     }
 
     /// Validates that all distributed tensors have the correct number of chunks
@@ -1014,7 +1085,7 @@ mod tests {
                 let content = fs::read_to_string(path.join("topology.json")).unwrap();
                 content
             }))
-            .route("/:filename", get(move |State(path): State<Arc<PathBuf>>, axum::extract::Path(filename): axum::extract::Path<String>| async move {
+            .route("/{filename}", get(move |State(path): State<Arc<PathBuf>>, axum::extract::Path(filename): axum::extract::Path<String>| async move {
                 let content = fs::read(path.join(filename)).unwrap();
                 content
             }))
