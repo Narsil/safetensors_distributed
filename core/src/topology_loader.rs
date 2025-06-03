@@ -1,5 +1,7 @@
+use crate::loader::Loader;
 use crate::topology::{Tensor, Topology, TopologyError};
-use hf_hub::api::tokio::Api;
+use hf_hub::api::tokio::{Api, ApiRepo};
+use reqwest::Url;
 use std::ops::Deref;
 use std::path::Path;
 use thiserror::Error;
@@ -41,6 +43,12 @@ pub enum TopologyLoadError {
 
     #[error("HF Hub API error: {0}")]
     HfHub(#[from] hf_hub::api::tokio::ApiError),
+
+    #[error("Url parsing error: {0}")]
+    UrlError(#[from] url::ParseError),
+
+    #[error("Loader error: {0}")]
+    Loader(#[from] crate::loader::Error),
 
     #[error("Invalid rank: {0}")]
     InvalidRank(usize),
@@ -98,13 +106,44 @@ pub async fn create_local_rank_file<P: AsRef<Path>>(
     rank: usize,
     api: &Api,
 ) -> Result<(), TopologyLoadError> {
+    // Validate rank and fetch remote topology
+    let repo = api.model(model_id.as_str().to_string());
+    let remote_topology = validate_topologies(local_topology, rank, &repo).await?;
+
+    // Fetch all safetensors files reported in the remote topology
+    let loaders = fetch_remote_files(&remote_topology, &repo).await?;
+
+    // TODO: Implement the rest of the function
+    todo!()
+}
+
+/// Private helper function to fetch metadata for all safetensors files reported in the remote topology.
+async fn fetch_remote_files(
+    remote_topology: &Topology,
+    repo: &ApiRepo,
+) -> Result<Vec<Loader>, TopologyLoadError> {
+    remote_topology
+        .filenames()
+        .into_iter()
+        .map(|filename| -> Result<Loader, TopologyLoadError> {
+            let url = repo.url(filename);
+            Ok(Loader::new(Url::parse(&url)?)?)
+        })
+        .collect::<Result<Vec<Loader>, TopologyLoadError>>()
+}
+
+/// Private helper function to validate the rank and check that the tensors match between local and remote topologies.
+async fn validate_topologies(
+    local_topology: &Topology,
+    rank: usize,
+    repo: &ApiRepo,
+) -> Result<Topology, TopologyLoadError> {
     // Validate rank
     if rank >= local_topology.n_ranks() {
         return Err(TopologyLoadError::InvalidRank(rank));
     }
 
     // Fetch remote topology
-    let repo = api.model(model_id.as_str().to_string());
     let filename = repo.get("topology.json").await?;
     let content = tokio::fs::read_to_string(filename).await?;
     let remote_topology: Topology = serde_json::from_str(&content)?;
@@ -158,8 +197,7 @@ pub async fn create_local_rank_file<P: AsRef<Path>>(
         }
     }
 
-    // TODO: Implement the rest of the function
-    todo!()
+    Ok(remote_topology)
 }
 
 #[cfg(test)]
