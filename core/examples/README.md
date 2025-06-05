@@ -24,65 +24,59 @@ cargo run --example create_distributed
   - Projection weights split along dimension 0  
   - Layer norms and biases kept as shared tensors
 
-### 2. `redistribute_model.rs`
+### 2. `redistribute.rs`
 
 Redistributes an existing distributed model to a different number of ranks.
 
 **Usage:**
 ```bash
-cargo run --example redistribute_model <input_dir> <output_dir> <target_ranks>
+cargo run --example redistribute <input_dir> <output_dir> <target_ranks>
 ```
 
 **Examples:**
 ```bash
 # Convert 4-rank model to 2-rank model
-cargo run --example redistribute_model distributed_gpt2 redistributed_gpt2_2ranks 2
+cargo run --example redistribute distributed_gpt2 redistributed_gpt2_2ranks 2
 
 # Convert 2-rank model back to 4-rank model  
-cargo run --example redistribute_model redistributed_gpt2_2ranks redistributed_gpt2_4ranks 4
+cargo run --example redistribute redistributed_gpt2_2ranks redistributed_gpt2_4ranks 4
+
+# Convert to single rank (non-sharded checkpoint, no topology.json)
+cargo run --example redistribute distributed_gpt2 redistributed_gpt2_single 1
+
+# Convert from single model.safetensors to distributed model
+cargo run --example redistribute single_model_dir distributed_4ranks 4
+
+# Convert from single model.safetensors to single rank (creates model.safetensors)
+cargo run --example redistribute single_model_dir redistributed_single 1
+
+# Round-trip example: single → distributed → single
+cargo run --example redistribute original_model distributed_temp 4
+cargo run --example redistribute distributed_temp final_model 1
+# original_model/model.safetensors → final_model/model.safetensors
 ```
 
 **What it does:**
-- Reads an existing distributed model and its topology
-- Reconstructs full tensors from their distributed chunks
+- Reads distributed models (with `topology.json`) OR single model files (`model.safetensors`)
+- Reconstructs full tensors from their distributed chunks (or loads directly from single file)
 - Re-splits tensors according to the new target rank count
 - Preserves the original splitting strategy when possible
 - Falls back to shared tensors if dimensions aren't evenly divisible
+- **Special case:** When target rank count is 1, creates `model.safetensors` without `topology.json`
 
-### 3. `redistribute_model_streaming.rs`
-
-Memory-efficient streaming version of model redistribution that processes tensors one-by-one.
-
-**Usage:**
-```bash
-cargo run --example redistribute_model_streaming <input_dir> <output_dir> <target_ranks>
-```
-
-**Examples:**
-```bash
-# Convert 4-rank model to 2-rank model (streaming)
-cargo run --example redistribute_model_streaming distributed_gpt2 redistributed_gpt2_streaming 2
-
-# Convert to 8-rank model (streaming)
-cargo run --example redistribute_model_streaming distributed_gpt2 redistributed_gpt2_8ranks 8
-```
-
-**What it does:**
-- Processes tensors one at a time instead of loading all into memory
-- Streams tensor data directly to output files
-- Tracks offsets and metadata during processing  
-- Writes proper safetensors headers at the end
-- Much more memory efficient for large models
-- Inspired by the TopologyLoader's streaming approach
+**Additional notes:**
+- The redistribute example uses async streaming processing for efficiency
+- Processes tensors in parallel and streams data directly to output files
+- Memory-efficient approach inspired by the TopologyLoader's streaming design
+- Pre-calculates file layouts and offsets for optimal performance
 
 ## Key Features
 
 - **Intelligent Splitting:** Uses model-aware splitting strategies optimized for transformer architectures
+- **Flexible Input:** Reads both distributed models (with topology.json) and single model files (model.safetensors)
 - **Flexible Redistribution:** Can convert between any number of ranks (as long as tensor dimensions are divisible)
 - **Topology Preservation:** Maintains consistent tensor distribution patterns
-- **Memory Efficient:** Two approaches available:
-  - Standard: Processes tensors one at a time to avoid lifetime issues
-  - Streaming: Processes and writes tensors on-the-fly for maximum memory efficiency
+- **Memory Efficient:** Uses async streaming to process and write tensors on-the-fly for maximum memory efficiency
 - **Error Handling:** Gracefully handles edge cases like non-divisible dimensions
 
 ## File Structure
@@ -90,6 +84,9 @@ cargo run --example redistribute_model_streaming distributed_gpt2 redistributed_
 After running the examples, you'll have:
 
 ```
+single_model_dir/                    # Single model input (topology-unaware)
+└── model.safetensors (524MB)        # Standard safetensors file
+
 distributed_gpt2/                    # Original 4-rank model
 ├── rank0.safetensors (167MB)
 ├── rank1.safetensors (119MB) 
@@ -102,6 +99,16 @@ redistributed_gpt2_2ranks/           # 2-rank redistributed model
 ├── rank1.safetensors (237MB)
 └── topology.json (42KB)
 
+redistributed_gpt2_single/           # 1-rank non-sharded model
+└── model.safetensors (524MB)        # No topology.json needed
+
+distributed_4ranks/                  # Distributed from single model
+├── rank0.safetensors (131MB)
+├── rank1.safetensors (131MB)
+├── rank2.safetensors (131MB)
+├── rank3.safetensors (131MB)
+└── topology.json (60KB)
+
 redistributed_gpt2_4ranks/           # Back to 4-rank model
 ├── rank0.safetensors (167MB)
 ├── rank1.safetensors (119MB)
@@ -113,36 +120,36 @@ redistributed_gpt2_4ranks/           # Back to 4-rank model
 ## Architecture
 
 All examples use:
-- **LocalTensor**: A custom tensor type that owns its data, avoiding lifetime issues
+- **TensorData**: A custom tensor type that owns its data, avoiding lifetime issues
 - **Topology System**: Describes how tensors are distributed across ranks
 - **Interval-based Reconstruction**: Uses the existing `get_intervals` function for efficient data copying
 - **Model-specific Logic**: GPT-2 optimized splitting strategies 
 
-The streaming version additionally features:
-- **StreamingRedistributor**: Manages file handles and offset tracking across all ranks
+The redistribute example features:
+- **AsyncStreamingRedistributor**: Manages file handles and offset tracking across all ranks
+- **Pre-calculated Layout**: Determines all file structures and offsets before processing
+- **Parallel Tensor Processing**: Processes all tensors concurrently using async/await
 - **On-the-fly Processing**: Reconstructs, splits, and writes tensors without intermediate storage
 - **Header Management**: Reserves space for headers and writes them after data processing
 - **Offset Tracking**: Maintains proper safetensors format with accurate data offsets
-
-The async version additionally features:
-- **Parallel Tensor Processing**: Processes all tensors concurrently using async/await
-- **Parallel Write Operations**: Executes all file writes simultaneously with futures
-- **High CPU Utilization**: Leverages multiple cores for maximum throughput
 - **Tokio Runtime**: Uses async I/O for efficient resource management
+- **Non-sharded Support**: Creates model.safetensors when target rank count is 1 (no topology.json)
+- **Topology-unaware Input**: Auto-detects and handles single model.safetensors files
+- **Round-trip Compatible**: Single model → distributed → single model preserves filename consistency
 
-## Performance Comparison
+## Performance
 
-Benchmarked on GPT-2 (4→2 ranks redistribution) in release mode:
+The redistribute example uses async streaming processing for optimal performance:
 
-| Approach | Total Time | CPU Usage | Memory Usage | Best For |
-|----------|------------|-----------|--------------|----------|
-| **Standard** | 8.2s | 79% | High (all tensors loaded) | Small models, simple use cases |
-| **Streaming** | 7.5s | 88% | Low (one tensor at a time) | Large models, memory constraints |
-| **Async** | 5.2s | 474% | High (parallel processing) | High-performance scenarios, multi-core systems |
+- **High CPU Utilization**: Leverages multiple cores for parallel tensor processing (~4.7 cores)
+- **Memory Efficient**: Processes tensors on-the-fly without loading all data into memory
+- **Fast I/O**: Uses async file operations to maximize throughput
+- **Pre-calculated Layout**: Determines all file structures upfront to minimize overhead
+- **Parallel writes**: Executes all file writes simultaneously with futures
 
-**Key Findings:**
-- **Async is fastest** (37% faster than streaming, 37% faster than standard)  
-- **Streaming is most memory-efficient** while maintaining good performance
-- **Standard is simplest** but least efficient for large models
-- **Async has highest CPU utilization** (474% indicates ~4.7 cores utilized)
-- All approaches produce **identical output files** 
+**Key Features:**
+- Processes large models efficiently regardless of size
+- Maintains low memory footprint through streaming
+- Produces identical output to traditional approaches
+- Supports both sharded (multi-rank) and non-sharded (single-rank) outputs
+- Maintains filename consistency for round-trip compatibility 

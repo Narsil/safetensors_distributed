@@ -218,9 +218,13 @@ impl AsyncStreamingRedistributor {
             });
         }
         
-        let new_filenames: Vec<_> = (0..self.target_world_size)
-            .map(|rank| format!("rank{rank}.safetensors"))
-            .collect();
+        let new_filenames: Vec<_> = if self.target_world_size == 1 {
+            vec!["model.safetensors".to_string()]
+        } else {
+            (0..self.target_world_size)
+                .map(|rank| format!("rank{rank}.safetensors"))
+                .collect()
+        };
         
         let new_topology = Topology::new(new_topology_tensors, new_filenames, self.target_world_size)?;
         
@@ -241,8 +245,13 @@ impl AsyncStreamingRedistributor {
         let (new_topology, rank_file_infos) = self.pre_calculate_file_layout().await?;
         
         // Create initial files with headers
-        let file_creation_futures: Vec<_> = rank_file_infos.iter().map(|info| {
-            let file_path = output_dir.join(format!("rank{}.safetensors", info.rank));
+        let file_creation_futures: Vec<_> = rank_file_infos.iter().enumerate().map(|(_idx, info)| {
+            let filename = if self.target_world_size == 1 {
+                "model.safetensors".to_string()
+            } else {
+                format!("rank{}.safetensors", info.rank)
+            };
+            let file_path = output_dir.join(&filename);
             let header = info.header.clone();
             let total_size = info.total_size;
             
@@ -260,7 +269,7 @@ impl AsyncStreamingRedistributor {
                 file.set_len(total_size as u64).await?;
                 file.flush().await?;
                 
-                println!("Created rank{}.safetensors with size {} bytes", info.rank, total_size);
+                println!("Created {} with size {} bytes", filename, total_size);
                 anyhow::Ok(())
             }
         }).collect();
@@ -310,14 +319,24 @@ impl AsyncStreamingRedistributor {
         let _permit = self.file_semaphore.acquire().await?;
         
         // Open the file and write the tensor data at the correct offset
-        let file_path = output_dir.join(format!("rank{}.safetensors", task.rank));
+        let filename = if self.target_world_size == 1 {
+            "model.safetensors".to_string()
+        } else {
+            format!("rank{}.safetensors", task.rank)
+        };
+        let file_path = output_dir.join(&filename);
         let mut file = File::options().write(true).open(&file_path).await?;
         
         file.seek(SeekFrom::Start(task.file_offset as u64)).await?;
         file.write_all(&tensor_data).await?;
         file.flush().await?;
         
-        println!("  ✓ Wrote {} bytes for {} to rank{}", tensor_data.len(), task.tensor_name, task.rank);
+        let target_file = if self.target_world_size == 1 {
+            "model.safetensors".to_string()
+        } else {
+            format!("rank{}", task.rank)
+        };
+        println!("  ✓ Wrote {} bytes for {} to {}", tensor_data.len(), task.tensor_name, target_file);
         
         Ok(())
     }
@@ -572,6 +591,54 @@ fn determine_split_dimension(tensor_name: &str, tensor: &TensorData) -> usize {
     }
 }
 
+/// Load topology from directory, or create a single-rank topology if topology.json doesn't exist
+async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Topology> {
+    let input_dir = input_dir.as_ref();
+    let topology_path = input_dir.join("topology.json");
+    
+    if topology_path.exists() {
+        // Load existing distributed topology
+        println!("Loading distributed topology from {:?}", topology_path);
+        let topology_data = tokio::fs::read_to_string(&topology_path).await?;
+        let topology: Topology = serde_json::from_str(&topology_data)?;
+        Ok(topology)
+    } else {
+        // Create a single-rank topology from model.safetensors
+        let model_path = input_dir.join("model.safetensors");
+        if !model_path.exists() {
+            return Err(anyhow!("Neither topology.json nor model.safetensors found in {:?}", input_dir));
+        }
+        
+        println!("No topology.json found, creating single-rank topology from {:?}", model_path);
+        
+        // Read the safetensors file to get tensor information
+        let model_data = tokio::fs::read(&model_path).await?;
+        let safetensors = SafeTensors::deserialize(&model_data)?;
+        
+        // Create topology with all tensors as shared
+        let mut tensors = HashMap::new();
+        for tensor_name in safetensors.names() {
+            let tensor_info = safetensors.tensor(tensor_name)?;
+            tensors.insert(
+                tensor_name.to_string(),
+                Tensor::Shared(SharedInfo::new(
+                    tensor_info.shape().to_vec(),
+                    tensor_info.dtype(),
+                    0, // All tensors reference the single file
+                )),
+            );
+        }
+        
+        let topology = Topology::new(
+            tensors,
+            vec!["model.safetensors".to_string()],
+            1,
+        )?;
+        
+        Ok(topology)
+    }
+}
+
 /// Main redistribution function using async parallel approach
 async fn redistribute_model_async<P: AsRef<Path>>(
     input_dir: P,
@@ -581,12 +648,10 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     let input_dir = input_dir.as_ref();
     let output_dir = output_dir.as_ref();
     
-    println!("Reading existing distributed model from {:?}", input_dir);
+    println!("Reading model from {:?}", input_dir);
     
-    // Load the existing topology
-    let topology_path = input_dir.join("topology.json");
-    let topology_data = tokio::fs::read_to_string(&topology_path).await?;
-    let source_topology: Topology = serde_json::from_str(&topology_data)?;
+    // Load the existing topology (or create from model.safetensors)
+    let source_topology = load_or_create_topology(input_dir).await?;
     
     println!("Source topology has {} ranks", source_topology.n_ranks());
     println!("Target topology will have {} ranks", target_world_size);
@@ -600,18 +665,30 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     
     let new_topology = redistributor.redistribute_all_tensors(output_dir).await?;
     
-    // Save the new topology
-    let topology_json = serde_json::to_vec_pretty(&new_topology)?;
-    tokio::fs::write(output_dir.join("topology.json"), &topology_json).await?;
-    
-    // Print results
-    for rank in 0..target_world_size {
-        println!("Saved rank{}.safetensors", rank);
+    // Save the new topology (skip if target_world_size is 1, as it's a non-sharded checkpoint)
+    if target_world_size > 1 {
+        let topology_json = serde_json::to_vec_pretty(&new_topology)?;
+        tokio::fs::write(output_dir.join("topology.json"), &topology_json).await?;
     }
     
-    println!("Model successfully redistributed from {} to {} ranks", 
-             new_topology.n_ranks(), target_world_size);
-    println!("Output saved to {:?}", output_dir);
+    // Print results
+    if target_world_size == 1 {
+        println!("Saved model.safetensors");
+    } else {
+        for rank in 0..target_world_size {
+            println!("Saved rank{}.safetensors", rank);
+        }
+    }
+    
+    if target_world_size > 1 {
+        println!("Model successfully redistributed from {} to {} ranks", 
+                 new_topology.n_ranks(), target_world_size);
+        println!("Output saved to {:?} (with topology.json)", output_dir);
+    } else {
+        println!("Model successfully redistributed from {} ranks to {} rank (non-sharded)", 
+                 new_topology.n_ranks(), target_world_size);
+        println!("Output saved to {:?} as model.safetensors (no topology.json)", output_dir);
+    }
     
     Ok(())
 }
@@ -623,6 +700,9 @@ async fn main() -> Result<()> {
     if args.len() != 4 {
         eprintln!("Usage: {} <input_dir> <output_dir> <target_world_size>", args[0]);
         eprintln!("Example: {} distributed_gpt2 redistributed_gpt2_async 2", args[0]);
+        eprintln!("        {} single_model_dir redistributed_async 4", args[0]);
+        eprintln!("Input: topology.json + rank*.safetensors OR model.safetensors");
+        eprintln!("Note: target_world_size=1 creates model.safetensors (no topology.json)");
         std::process::exit(1);
     }
     
