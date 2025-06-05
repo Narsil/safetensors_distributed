@@ -450,7 +450,7 @@ mod tests {
     fn save_tensors(tensors: HashMap<&str, TensorData>) -> NamedTempFile {
         // Create a temporary safetensors file
         let temp_file = NamedTempFile::new().unwrap();
-        serialize_to_file(&tensors, &None, temp_file.path()).unwrap();
+        serialize_to_file(tensors, &None, temp_file.path()).unwrap();
         temp_file
     }
 
