@@ -3,8 +3,6 @@ import unittest
 import subprocess
 import time
 import os
-import signal
-import atexit
 import tempfile
 import shutil
 from safetensors.numpy import save_file

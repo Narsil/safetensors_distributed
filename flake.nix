@@ -16,16 +16,21 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs{
+          inherit system;
+          config.allowUnfree = true;
+          };
         in
-        with pkgs; {
+        with pkgs;
+        {
           default = mkShell {
-          nativeBuildInputs = [pkg-config];
+            nativeBuildInputs = [ pkg-config ];
             buildInputs = [
               rustup
               openssl
               python3Packages.python
               python3Packages.venvShellHook
+              cudaPackages.cudatoolkit
             ];
             venvDir = "./.venv";
             postVenvCreation = ''
@@ -34,6 +39,7 @@
             postShellHook = ''
               unset SOURCE_DATE_EPOCH
             '';
+            LD_LIBRARY_PATH = "${stdenv.cc.cc.lib}/lib:${cudaPackages.cudatoolkit}/lib:/run/opengl-driver/lib";
           };
 
         }

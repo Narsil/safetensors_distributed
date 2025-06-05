@@ -256,6 +256,10 @@ pub(crate) fn get_intervals(
             }
         }
     }
+    if intervals.is_empty() {
+        let n: usize = chunk.shape().iter().product();
+        intervals.push((0, n));
+    }
     intervals
 }
 

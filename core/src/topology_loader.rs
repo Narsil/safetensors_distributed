@@ -4,9 +4,8 @@ use futures_util::stream::FuturesUnordered;
 use hf_hub::api::tokio::ApiRepo;
 use reqwest::header::RANGE;
 use reqwest::{Client, Url};
-use safetensors::{Dtype, SafeTensorError};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
-use std::collections::HashMap;
+use safetensors::SafeTensorError;
+use safetensors::tensor::{Metadata, TensorInfo};
 use std::io::SeekFrom;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -75,6 +74,9 @@ pub enum TopologyLoadError {
 
     #[error("Tensor {0} has different shapes: local={1:?}, remote={2:?}")]
     DifferentTensorShapes(String, Vec<usize>, Vec<usize>),
+
+    #[error("Creating safetensors data : {0}")]
+    SafeTensorError(#[from] SafeTensorError),
 }
 
 /// Load a topology from a local JSON file
@@ -84,23 +86,12 @@ pub async fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Topology, Topolog
     Ok(topology)
 }
 
-/// Loads a tensor's data for a specific rank from a repository
-///
-/// # Arguments
-/// * `saved_topology` - The topology as saved in the repository
-/// * `loading_topology` - The topology of the current loading process
-/// * `rank` - The rank of the current process
-/// * `tensor_name` - The name of the tensor to load
-/// * `base_url` - The base URL of the repository
-pub async fn load_tensor_for_rank(
-    _saved_topology: &Topology,
-    _loading_topology: &Topology,
-    _rank: usize,
-    _tensor_name: &str,
-    _base_url: &str,
-) -> Result<Vec<u8>, TopologyLoadError> {
-    // TODO: Implement the loading logic
-    todo!()
+async fn get_remote_topology(repo: &ApiRepo) -> Result<Topology, TopologyLoadError> {
+    // Fetch remote topology
+    let filename = repo.get("topology.json").await?;
+    let content = tokio::fs::read_to_string(filename).await?;
+    let remote_topology: Topology = serde_json::from_str(&content)?;
+    Ok(remote_topology)
 }
 
 /// Creates a local safetensors file containing the tensors for the current rank
@@ -116,10 +107,11 @@ pub async fn create_local_rank_file<P: AsRef<Path>>(
     repo: &ApiRepo,
 ) -> Result<(), TopologyLoadError> {
     // Validate rank and fetch remote topology
-    let remote_topology = validate_topologies(local_topology, rank, &repo).await?;
+    let remote_topology = get_remote_topology(&repo).await?;
+    validate_topologies(local_topology, &remote_topology)?;
 
     // Fetch all safetensors files reported in the remote topology
-    let loaders = fetch_remote_files(&remote_topology, &repo)?;
+    let metadatas = fetch_remote_files(&remote_topology, &repo).await?;
 
     // Spawn a future to generate the header and send it to the writer loop
     let _filename_clone = filename.as_ref().to_path_buf();
@@ -143,7 +135,7 @@ pub async fn create_local_rank_file<P: AsRef<Path>>(
     let chunk_size = 10 * 1024 * 1024;
     let n_chunks = total_length / chunk_size;
     let mut handles = Vec::with_capacity(n_chunks);
-    for request in fetch_requests(&local_topology, rank, &remote_topology, &loaders) {
+    for request in fetch_requests(&local_topology, rank, &remote_topology, &metadatas) {
         handles.push(tokio::spawn(async move {
             if let Err(err) = request.run().await {
                 log::error!("Error fetching chunk {err}");
@@ -195,9 +187,10 @@ fn fetch_requests(
     local_topology: &Topology,
     rank: usize,
     remote_topology: &Topology,
-    loaders: &[Loader],
+    metadatas: &[(Metadata, usize)],
 ) -> Vec<FetchRequest> {
     let mut requests = vec![];
+    let mut local_offset = 0;
     for (name, info) in local_topology.tensors() {
         match info {
             Tensor::Distributed(info) => {
@@ -207,10 +200,51 @@ fn fetch_requests(
                     info.shape(),
                     chunk,
                     remote_topology,
-                    loaders,
+                    metadatas,
+                    &mut local_offset,
                 ));
             }
-            _ => todo!(),
+            Tensor::Shared(_info) => {
+                requests.extend(fetch_shared(
+                    name,
+                    remote_topology,
+                    metadatas,
+                    &mut local_offset,
+                ));
+            }
+        }
+    }
+    requests
+}
+
+fn fetch_shared(
+    name: &str,
+    remote_topology: &Topology,
+    metadatas: &[(Metadata, usize)],
+    local_offset: &mut usize,
+) -> Vec<FetchRequest> {
+    let mut requests = vec![];
+    let info = remote_topology.tensors().get(name).unwrap();
+    match info {
+        Tensor::Distributed(_) => unreachable!(),
+        Tensor::Shared(info) => {
+            let (metadata, remote_offset) = &metadatas[0];
+            let remote_tensor_info = (*metadata.tensors().get(name).unwrap()).clone();
+            let (remote_start, remote_stop) = remote_tensor_info.data_offsets;
+            // TODO
+            let length = remote_stop - remote_start;
+            let request = FetchRequest {
+                client: Client::new(),
+                // TODO we need the local filename
+                filename: remote_topology.filenames()[info.filename_index()]
+                    .clone()
+                    .into(),
+                range: (remote_start + remote_offset, remote_stop + remote_offset),
+                writes: vec![(*local_offset, length + *local_offset)],
+                url: Url::parse("http://localhost").unwrap(),
+            };
+            *local_offset += length;
+            requests.push(request);
         }
     }
     requests
@@ -221,7 +255,8 @@ fn fetch_requests_single(
     full_shape: &[usize],
     chunk: &Chunk,
     remote_topology: &Topology,
-    loaders: &[Loader],
+    metadatas: &[(Metadata, usize)],
+    local_offset: &mut usize,
 ) -> Vec<FetchRequest> {
     let mut requests = vec![];
 
@@ -234,167 +269,36 @@ fn fetch_requests_single(
     let remote_chunk = remote_topology.tensors().get(name).unwrap();
     match remote_chunk {
         Tensor::Distributed(info) => {
-            for remote_chunk in info.chunks() {
+            for (remote_rank, remote_chunk) in info.chunks().iter().enumerate() {
                 let remote_intervals = get_intervals(remote_chunk, &strides, full_shape);
 
+                if local_intervals == remote_intervals {
+                    for (start, stop) in local_intervals {
+                        let (_metadata, remote_offset) = &metadatas[remote_rank];
+                        let length = stop - start;
+                        let request = FetchRequest {
+                            client: Client::new(),
+                            // TODO we need the local filename
+                            filename: remote_topology.filenames()[remote_chunk.filename_index()]
+                                .clone()
+                                .into(),
+                            range: (start + remote_offset, stop + remote_offset),
+                            writes: vec![(start + *local_offset, stop + *local_offset)],
+                            url: Url::parse("http://localhost").unwrap(),
+                        };
+                        *local_offset += length;
+                        requests.push(request);
+                    }
+                    return requests;
+                }
                 todo!("local {local_intervals:?} - remote {remote_intervals:?}");
             }
             assert_eq!(info.shape(), full_shape);
         }
-        _ => todo!(),
+        Tensor::Shared(_info) => panic!("Topology of shared/distributed should be consistent"),
     }
 
     requests
-}
-
-/// A single tensor information.
-/// Endianness is assumed to be little endian
-/// Ordering is assumed to be 'C'.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct TensorInfo {
-    /// The type of each element of the tensor
-    pub dtype: Dtype,
-    /// The shape of the tensor
-    pub shape: Vec<usize>,
-    /// The offsets to find the data within the byte-buffer array.
-    pub data_offsets: (usize, usize),
-}
-
-/// The stuct representing the header of safetensor files which allow
-/// indexing into the raw byte-buffer array and how to interpret it.
-#[derive(Debug, Clone)]
-pub struct Metadata {
-    metadata: Option<HashMap<String, String>>,
-    tensors: Vec<TensorInfo>,
-    index_map: HashMap<String, usize>,
-}
-
-/// Helper struct used only for serialization deserialization
-#[derive(Serialize, Deserialize)]
-struct HashMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "__metadata__")]
-    metadata: Option<HashMap<String, String>>,
-    #[serde(flatten)]
-    tensors: HashMap<String, TensorInfo>,
-}
-
-impl<'de> Deserialize<'de> for Metadata {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let hashdata: HashMetadata = HashMetadata::deserialize(deserializer)?;
-        let (metadata, tensors) = (hashdata.metadata, hashdata.tensors);
-        let mut tensors: Vec<_> = tensors.into_iter().collect();
-        // We need to sort by offsets
-        // Previous versions might have a different ordering
-        // Than we expect (Not aligned ordered, but purely name ordered,
-        // or actually any order).
-        tensors.sort_by(|(_, left), (_, right)| left.data_offsets.cmp(&right.data_offsets));
-        Metadata::new(metadata, tensors).map_err(serde::de::Error::custom)
-    }
-}
-
-impl Serialize for Metadata {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut names = vec![""; self.index_map.len()];
-        for (name, index) in &self.index_map {
-            names[*index] = name;
-        }
-
-        let tensors: Vec<_> = names.iter().zip(self.tensors.iter()).collect();
-        let length = if let Some(metadata) = &self.metadata {
-            metadata.len()
-        } else {
-            0
-        };
-        let mut map = serializer.serialize_map(Some(tensors.len() + length))?;
-        if let Some(metadata) = &self.metadata {
-            map.serialize_entry("__metadata__", metadata)?;
-        }
-        for (name, info) in tensors {
-            map.serialize_entry(&name, &info)?;
-        }
-        map.end()
-    }
-}
-
-impl Metadata {
-    fn new(
-        metadata: Option<HashMap<String, String>>,
-        tensors: Vec<(String, TensorInfo)>,
-    ) -> Result<Self, SafeTensorError> {
-        let mut index_map = HashMap::with_capacity(tensors.len());
-
-        let tensors: Vec<_> = tensors
-            .into_iter()
-            .enumerate()
-            .map(|(index, (k, tensor))| {
-                index_map.insert(k, index);
-                tensor
-            })
-            .collect();
-
-        let metadata = Self {
-            metadata,
-            tensors,
-            index_map,
-        };
-        metadata.validate()?;
-        Ok(metadata)
-    }
-
-    fn validate(&self) -> Result<usize, SafeTensorError> {
-        let mut start = 0;
-        for (i, info) in self.tensors.iter().enumerate() {
-            let (s, e) = info.data_offsets;
-            if s != start || e < s {
-                let tensor_name = self
-                    .index_map
-                    .iter()
-                    .find_map(|(name, &index)| if index == i { Some(&name[..]) } else { None })
-                    .unwrap_or("no_tensor");
-                return Err(SafeTensorError::InvalidOffset(tensor_name.to_string()));
-            }
-            start = e;
-            let nelements: usize = info
-                .shape
-                .iter()
-                .cloned()
-                .try_fold(1usize, usize::checked_mul)
-                .ok_or(SafeTensorError::ValidationOverflow)?;
-            let nbytes = nelements
-                .checked_mul(info.dtype.size())
-                .ok_or(SafeTensorError::ValidationOverflow)?;
-            if (e - s) != nbytes {
-                return Err(SafeTensorError::TensorInvalidInfo);
-            }
-        }
-        Ok(start)
-    }
-
-    /// Gives back the tensor metadata
-    pub fn info(&self, name: &str) -> Option<&TensorInfo> {
-        let index = self.index_map.get(name)?;
-        self.tensors.get(*index)
-    }
-
-    /// Gives back the tensor metadata
-    pub fn tensors(&self) -> HashMap<String, &TensorInfo> {
-        self.index_map
-            .iter()
-            .map(|(tensor_name, index)| (tensor_name.clone(), &self.tensors[*index]))
-            .collect()
-    }
-
-    /// Gives back the tensor metadata
-    pub fn metadata(&self) -> &Option<HashMap<String, String>> {
-        &self.metadata
-    }
 }
 
 /// Private helper function to generate the local safetensors header using the local topology.
@@ -402,82 +306,77 @@ async fn generate_header(
     local_topology: &Topology,
     rank: usize,
 ) -> Result<(Metadata, usize), TopologyLoadError> {
-    let mut metadata = Metadata {
-        metadata: None,
-        tensors: Vec::with_capacity(local_topology.tensors().len()),
-        index_map: HashMap::new(),
-    };
-    let mut current_index = 0;
+    let mut tensors = Vec::with_capacity(local_topology.tensors().len());
     let mut current_offset = 0;
     for (name, tensor) in local_topology.tensors() {
         match tensor {
             Tensor::Distributed(info) => {
                 let chunk = &info.chunks()[rank];
-                metadata.index_map.insert(name.to_string(), current_index);
-                current_index += 1;
                 let dtype = info.dtype();
                 let shape = chunk.shape().to_vec();
 
                 let length = shape.iter().product::<usize>() * dtype.size();
                 let data_offsets = (current_offset, current_offset + length);
                 current_offset += length;
-                metadata.tensors.push(TensorInfo {
-                    dtype,
-                    shape,
-                    data_offsets,
-                });
+                tensors.push((
+                    name.to_string(),
+                    TensorInfo {
+                        dtype,
+                        shape,
+                        data_offsets,
+                    },
+                ));
             }
             Tensor::Shared(info) => {
-                metadata.index_map.insert(name.to_string(), current_index);
-                current_index += 1;
                 let dtype = info.dtype();
                 let shape = info.shape().to_vec();
                 let length = shape.iter().product::<usize>() * dtype.size();
                 let data_offsets = (current_offset, current_offset + length);
                 current_offset += length;
-                metadata.tensors.push(TensorInfo {
-                    dtype,
-                    shape,
-                    data_offsets,
-                });
+                tensors.push((
+                    name.to_string(),
+                    TensorInfo {
+                        dtype,
+                        shape,
+                        data_offsets,
+                    },
+                ));
             }
         }
     }
+    let metadata = Metadata::new(None, tensors)?;
 
     Ok((metadata, current_offset))
 }
 
 /// Private helper function to fetch metadata for all safetensors files reported in the remote topology.
-fn fetch_remote_files(
+async fn fetch_remote_files(
     remote_topology: &Topology,
     repo: &ApiRepo,
-) -> Result<Vec<Loader>, TopologyLoadError> {
-    remote_topology
-        .filenames()
-        .into_iter()
-        .map(|filename| -> Result<Loader, TopologyLoadError> {
-            let url = repo.url(filename);
-            Ok(Loader::new(Url::parse(&url)?)?)
-        })
-        .collect::<Result<Vec<Loader>, TopologyLoadError>>()
+) -> Result<Vec<(Metadata, usize)>, TopologyLoadError> {
+    let mut metadatas = Vec::with_capacity(remote_topology.filenames().len());
+    for filename in remote_topology.filenames() {
+        let url = match Url::parse(&repo.url(filename)) {
+            Ok(url) => url,
+            Err(err) => return Err(TopologyLoadError::from(err)), // Or whatever your error type is
+        };
+
+        let mut loader = match Loader::new(url) {
+            Ok(loader) => loader,
+            Err(err) => return Err(TopologyLoadError::from(err)),
+        };
+
+        // The result is a future, which we now wrap in `Ok`
+        metadatas.push(loader.metadata().await?.clone());
+    }
+    Ok(metadatas)
 }
 
 /// Private helper function to validate the rank and check that the tensors match between local and remote topologies.
-async fn validate_topologies(
+fn validate_topologies(
     local_topology: &Topology,
-    rank: usize,
-    repo: &ApiRepo,
-) -> Result<Topology, TopologyLoadError> {
-    // Validate rank
-    if rank >= local_topology.n_ranks() {
-        return Err(TopologyLoadError::InvalidRank(rank));
-    }
-
-    // Fetch remote topology
-    let filename = repo.get("topology.json").await?;
-    let content = tokio::fs::read_to_string(filename).await?;
-    let remote_topology: Topology = serde_json::from_str(&content)?;
-
+    remote_topology: &Topology,
+) -> Result<(), TopologyLoadError> {
     // Validate that tensors match between local and remote topologies
     let local_tensor_names: std::collections::HashSet<_> =
         local_topology.tensors().iter().map(|(k, _)| k).collect();
@@ -515,7 +414,7 @@ async fn validate_topologies(
                 (local.shape(), remote.shape())
             }
             (Tensor::Shared(local), Tensor::Shared(remote)) => (local.shape(), remote.shape()),
-            _ => return Err(TopologyLoadError::InvalidTensorType(rank)),
+            _ => todo!(),
         };
 
         if local_shape != remote_shape {
@@ -527,71 +426,91 @@ async fn validate_topologies(
         }
     }
 
-    Ok(remote_topology)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::topology::{Chunk, DistributedInfo, SimpleTopo, Tensor};
-    use hf_hub::api::tokio::ApiBuilder;
     use safetensors::Dtype;
     use std::collections::HashMap;
-    use tempfile::tempdir;
+    use std::sync::Arc;
+    use tokio::fs;
 
     #[tokio::test]
     async fn test_topology_merge() {
-        // Create a temporary directory for our test
-        let temp_dir = tempdir().unwrap();
-        let output_file = temp_dir.path().join("output.safetensors");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = Arc::new(temp_dir);
 
-        // Create a simple local topology with one distributed tensor
+        // Create a simple local topology
         let mut local_tensors = HashMap::new();
-        let local_chunk1 = Chunk::new(vec![0, 0], vec![2, 4], 0);
-        let local_chunk2 = Chunk::new(vec![2, 0], vec![2, 4], 1);
-        let local_info =
-            DistributedInfo::new(vec![4, 4], Dtype::F32, vec![local_chunk1, local_chunk2]);
-        local_tensors.insert("tensor1".to_string(), Tensor::Distributed(local_info));
+        let local_tensor = Tensor::Distributed(DistributedInfo::new(
+            vec![4, 4],
+            Dtype::F32,
+            vec![Chunk::new(vec![0, 0], vec![4, 4], 0)], // One chunk covering the entire tensor
+        ));
+        local_tensors.insert("test_tensor".to_string(), local_tensor);
         let local_topology = Topology::try_from(SimpleTopo::new(
             local_tensors,
-            vec![
-                "local1.safetensors".to_string(),
-                "local2.safetensors".to_string(),
-            ],
-            2,
+            vec!["local1.safetensors".to_string()],
+            1, // Only one rank
         ))
         .unwrap();
 
-        // Create a simple remote topology with the same tensor but different chunks
+        // Create a simple remote topology
         let mut remote_tensors = HashMap::new();
-        let remote_chunk1 = Chunk::new(vec![0, 0], vec![2, 4], 0);
-        let remote_chunk2 = Chunk::new(vec![2, 0], vec![2, 4], 1);
-        let remote_info =
-            DistributedInfo::new(vec![4, 4], Dtype::F32, vec![remote_chunk1, remote_chunk2]);
-        remote_tensors.insert("tensor1".to_string(), Tensor::Distributed(remote_info));
+        let remote_tensor = Tensor::Distributed(DistributedInfo::new(
+            vec![4, 4],
+            Dtype::F32,
+            vec![Chunk::new(vec![0, 0], vec![4, 4], 0)], // One chunk covering the entire tensor
+        ));
+        remote_tensors.insert("test_tensor".to_string(), remote_tensor);
         let remote_topology = Topology::try_from(SimpleTopo::new(
             remote_tensors,
-            vec![
-                "remote1.safetensors".to_string(),
-                "remote2.safetensors".to_string(),
-            ],
-            2,
+            vec!["remote1.safetensors".to_string()],
+            1, // Only one rank
         ))
         .unwrap();
 
-        let api = ApiBuilder::new()
-            .with_endpoint("http://localhost".to_string())
-            .build()
-            .unwrap();
-        // Create a mock repo that returns our remote topology
-        let repo = api.model("test/repo".to_string());
+        // Write the remote topology to a file
+        let topology_path = temp_dir.path().join("topology.json");
+        fs::write(
+            &topology_path,
+            serde_json::to_string(&remote_topology).unwrap(),
+        )
+        .await
+        .unwrap();
 
-        // Try to create the local rank file
-        let result = create_local_rank_file(&output_file, &local_topology, 0, &repo).await;
-        assert!(
-            result.is_ok(),
-            "Failed to create local rank file: {:?}",
-            result.err()
-        );
+        // Create dummy safetensors files
+        let dummy_data = vec![0u8; 1024]; // 1KB of zeros
+        fs::write(temp_dir.path().join("remote1.safetensors"), &dummy_data)
+            .await
+            .unwrap();
+        fs::write(temp_dir.path().join("remote2.safetensors"), &dummy_data)
+            .await
+            .unwrap();
+
+        // Wait for the server to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Merge the topologies
+        validate_topologies(&local_topology, &remote_topology).unwrap();
+
+        // Verify the merged topology
+        assert_eq!(remote_topology.tensors().len(), 1);
+        let tensor = remote_topology.get_tensor("test_tensor").unwrap();
+        match tensor {
+            Tensor::Distributed(info) => {
+                assert_eq!(info.shape(), &[4, 4]);
+                assert_eq!(info.dtype(), Dtype::F32);
+                assert_eq!(info.chunks().len(), 1);
+                let chunk = &info.chunks()[0];
+                assert_eq!(chunk.offsets(), &[0, 0]);
+                assert_eq!(chunk.shape(), &[4, 4]);
+                assert_eq!(chunk.filename_index(), 0);
+            }
+            _ => panic!("Expected distributed tensor"),
+        }
     }
 }
