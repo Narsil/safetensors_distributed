@@ -2,4 +2,6 @@
 /.venv
 /.direnv
 **/*.pyc
+**/*.safetensors
+**/*.json
 __pycache__/

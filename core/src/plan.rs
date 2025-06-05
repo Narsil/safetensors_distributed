@@ -1,35 +1,14 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use safetensors::tensor::Metadata;
-use safetensors::{Dtype, View, slice::TensorIndexer};
+use safetensors::{Dtype, slice::TensorIndexer};
 
 use std::collections::hash_map::Entry;
 use std::ops::Bound;
-use std::{borrow::Cow, collections::HashMap};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::loader::{Error, Loader};
-
-#[derive(PartialEq, Debug)]
-pub struct Tensor {
-    pub dtype: Dtype,
-    pub shape: Vec<usize>,
-    pub data: Vec<u8>,
-}
-
-impl View for &Tensor {
-    fn data(&self) -> std::borrow::Cow<[u8]> {
-        Cow::Borrowed(&self.data)
-    }
-    fn dtype(&self) -> Dtype {
-        self.dtype
-    }
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-    fn data_len(&self) -> usize {
-        self.data.len()
-    }
-}
+use crate::tensor::TensorData;
 
 pub struct Plan<'a> {
     slices: HashMap<String, Vec<TensorIndexer>>,
@@ -77,7 +56,7 @@ impl<'a> Plan<'a> {
         Ok(())
     }
 
-    pub async fn execute(&mut self) -> Result<HashMap<String, Tensor>, Error> {
+    pub async fn execute(&mut self) -> Result<HashMap<String, TensorData>, Error> {
         let (metadata, fetch_offsets) = self.gather_fetch_offsets().await?;
         // TODO Clean this clone up.
         let metadata = metadata.clone();
@@ -149,7 +128,7 @@ impl<'a> Plan<'a> {
             // Create empty tensor with correct shape and dtype
             result.insert(
                 tensor_name.clone(),
-                Tensor {
+                TensorData {
                     dtype: info.dtype,
                     shape: final_shape,
                     data: vec![0; total_size],
@@ -452,7 +431,7 @@ mod tests {
     }
 
     // Helper function to create a 2D tensor with sequential values
-    fn create_2d_tensor(rows: usize, cols: usize) -> Tensor {
+    fn create_2d_tensor(rows: usize, cols: usize) -> TensorData {
         let mut data = Vec::with_capacity(rows * cols * 4); // 4 bytes per f32
         for i in 0..rows {
             for j in 0..cols {
@@ -461,21 +440,21 @@ mod tests {
             }
         }
 
-        Tensor {
+        TensorData {
             data,
             shape: vec![rows, cols],
             dtype: Dtype::F32,
         }
     }
 
-    fn save_tensors(tensors: HashMap<&str, Tensor>) -> NamedTempFile {
+    fn save_tensors(tensors: HashMap<&str, TensorData>) -> NamedTempFile {
         // Create a temporary safetensors file
         let temp_file = NamedTempFile::new().unwrap();
         serialize_to_file(&tensors, &None, temp_file.path()).unwrap();
         temp_file
     }
 
-    async fn create_test_file(tensors: HashMap<&str, Tensor>) -> (NamedTempFile, Url) {
+    async fn create_test_file(tensors: HashMap<&str, TensorData>) -> (NamedTempFile, Url) {
         let named = save_tensors(tensors);
         let file_path = named.path();
 
@@ -555,25 +534,25 @@ mod tests {
             HashMap::from([
                 (
                     "tensor1".to_string(),
-                    Tensor {
+                    TensorData {
                         dtype: Dtype::F32,
                         shape: vec![2, 2],
                         data: vec![2.0f32, 3.0, 6.0, 7.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
                             .collect(),
-                    }
+                    },
                 ),
                 (
                     "tensor2".to_string(),
-                    Tensor {
+                    TensorData {
                         dtype: Dtype::F32,
                         shape: vec![1, 2],
                         data: vec![7.0f32, 8.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
                             .collect(),
-                    }
+                    },
                 )
             ])
         );
@@ -611,25 +590,25 @@ mod tests {
             HashMap::from([
                 (
                     "tensor1".to_string(),
-                    Tensor {
+                    TensorData {
                         dtype: Dtype::F32,
                         shape: vec![2, 4],
                         data: vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
                             .collect(),
-                    }
+                    },
                 ),
                 (
                     "tensor2".to_string(),
-                    Tensor {
+                    TensorData {
                         dtype: Dtype::F32,
                         shape: vec![2],
                         data: vec![4.0f32, 5.0]
                             .into_iter()
                             .flat_map(|v| v.to_le_bytes())
                             .collect(),
-                    }
+                    },
                 )
             ]),
             "{result:#?}"

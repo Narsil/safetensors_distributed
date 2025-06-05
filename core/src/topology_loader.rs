@@ -114,7 +114,6 @@ pub async fn create_local_rank_file<P: AsRef<Path>>(
     let metadatas = fetch_remote_files(&remote_topology, &repo).await?;
 
     // Spawn a future to generate the header and send it to the writer loop
-    let _filename_clone = filename.as_ref().to_path_buf();
     let local_topology_clone = local_topology.clone();
     let (metadata, final_offset) = generate_header(&local_topology_clone, rank).await?;
     let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();

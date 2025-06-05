@@ -16,8 +16,11 @@ hf-hub = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }

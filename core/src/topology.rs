@@ -16,6 +16,13 @@ pub struct SharedInfo {
 }
 
 impl SharedInfo {
+    pub fn new(shape: Vec<usize>, dtype: Dtype, filename_index: usize) -> Self {
+        Self {
+            shape,
+            dtype,
+            filename_index,
+        }
+    }
     /// Returns the shape of the tensor
     pub fn shape(&self) -> &[usize] {
         &self.shape
@@ -226,11 +233,7 @@ fn check_overlapping_chunks(
     Ok(())
 }
 
-pub(crate) fn get_intervals(
-    chunk: &Chunk,
-    strides: &[usize],
-    shape: &[usize],
-) -> Vec<(usize, usize)> {
+pub fn get_intervals(chunk: &Chunk, strides: &[usize], shape: &[usize]) -> Vec<(usize, usize)> {
     let mut intervals = Vec::new();
     let mut span = 0;
     for ((i, d), total_d) in chunk.shape.iter().enumerate().rev().zip(shape.iter().rev()) {
@@ -276,8 +279,21 @@ impl TryFrom<SimpleTopo> for Topology {
     }
 }
 impl Topology {
+    pub fn new(
+        tensors: HashMap<String, Tensor>,
+        filenames: Vec<String>,
+        n_ranks: usize,
+    ) -> Result<Self, TopologyError> {
+        let topo = Self {
+            tensors,
+            filenames,
+            n_ranks,
+        };
+        topo.validate()?;
+        Ok(topo)
+    }
     #[cfg(test)]
-    fn new(n_ranks: usize) -> Self {
+    fn empty(n_ranks: usize) -> Self {
         Self {
             tensors: HashMap::new(),
             filenames: vec![],
@@ -488,7 +504,7 @@ mod tests {
         fs::write(&rank1_path, bytes1).unwrap();
 
         // Create the topology
-        let mut topology = Topology::new(2);
+        let mut topology = Topology::empty(2);
         topology.filenames = vec![
             rank0_path.to_str().unwrap().to_string(),
             rank1_path.to_str().unwrap().to_string(),
@@ -550,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_topology_serialization() {
-        let topology = Topology::new(4);
+        let topology = Topology::empty(4);
         assert_eq!(
             serde_json::to_string(&topology).unwrap(),
             r#"{"tensors":{},"filenames":[],"n_ranks":4}"#
@@ -559,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_validate() {
-        let mut topology = Topology::new(4);
+        let mut topology = Topology::empty(4);
 
         // Add some filenames
         topology.filenames = vec![
@@ -715,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_validate_chunk_coverage() {
-        let mut topology = Topology::new(2);
+        let mut topology = Topology::empty(2);
         topology.filenames = vec![
             "file1.safetensors".to_string(),
             "file2.safetensors".to_string(),
@@ -1072,7 +1088,7 @@ mod tests {
         fs::write(&rank1_path, bytes1).unwrap();
 
         // Create the topology
-        let mut topology = Topology::new(2);
+        let mut topology = Topology::empty(2);
         topology.filenames = vec![
             "rank0.safetensors".to_string(),
             "rank1.safetensors".to_string(),
