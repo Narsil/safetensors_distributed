@@ -57,7 +57,7 @@ pub enum RedistributorError {
     },
 
     #[error(
-        "No valid input found in directory {path:?} (expected topology.json + rank*.safetensors OR model.safetensors)"
+        "No valid input found in directory {path:?} (expected topology.json + rank*.safetensors OR model.safetensors OR model.safetensors.index.json + chunked files)"
     )]
     NoValidInput { path: PathBuf },
 
@@ -807,6 +807,7 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
     let input_dir = input_dir.as_ref();
     let topology_path = input_dir.join("topology.json");
     let model_path = input_dir.join("model.safetensors");
+    let index_path = input_dir.join("model.safetensors.index.json");
 
     // Check if we have a distributed setup (topology.json + rank*.safetensors)
     if topology_path.exists() {
@@ -814,6 +815,72 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
         let topology_data = tokio::fs::read_to_string(&topology_path).await?;
         let topology: Topology = serde_json::from_str(&topology_data)?;
         Ok(topology)
+    } else if index_path.exists() {
+        // Chunked safetensors case - read the index file to get tensor information
+        let index_data = tokio::fs::read_to_string(&index_path).await?;
+        let index: serde_json::Value = serde_json::from_str(&index_data)?;
+        
+        // Create a topology with a single rank
+        let mut tensors = HashMap::new();
+        
+        // Get the weight map from the index
+        if let Some(weight_map) = index.get("weight_map") {
+            if let Some(weight_map) = weight_map.as_object() {
+                // First, collect all unique chunk files
+                let mut chunk_files: Vec<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                chunk_files.sort();
+                chunk_files.dedup();
+
+                // Group tensors by their chunk file
+                let mut file_tensors: HashMap<String, Vec<String>> = HashMap::new();
+                for (tensor_name, file_name) in weight_map {
+                    file_tensors
+                        .entry(file_name.as_str().unwrap().to_string())
+                        .or_default()
+                        .push(tensor_name.clone());
+                }
+
+                // Read each chunk file to get tensor information
+                for (file_name, tensor_names) in file_tensors {
+                    let file_path = input_dir.join(&file_name);
+                    let file_data = tokio::fs::read(&file_path).await?;
+                    let safetensors = SafeTensors::deserialize(&file_data)?;
+
+                    // Find the index of this file in our chunk_files list
+                    let file_index = chunk_files
+                        .iter()
+                        .position(|f| f == &file_name)
+                        .expect("File should be in chunk_files list");
+
+                    for tensor_name in tensor_names {
+                        let tensor_info = safetensors.tensor(&tensor_name)?;
+                        tensors.insert(
+                            tensor_name,
+                            Tensor::Shared(SharedInfo::new(
+                                tensor_info.shape().to_vec(),
+                                tensor_info.dtype(),
+                                file_index, // Use the correct file index
+                            )),
+                        );
+                    }
+                }
+
+                // Create topology with all chunk files
+                let topology = Topology::new(tensors, chunk_files, 1)?;
+                Ok(topology)
+            } else {
+                Err(RedistributorError::NoValidInput {
+                    path: input_dir.to_path_buf(),
+                })
+            }
+        } else {
+            Err(RedistributorError::NoValidInput {
+                path: input_dir.to_path_buf(),
+            })
+        }
     } else if model_path.exists() {
         // Single file case - read the safetensors file to get tensor information
         let model_data = tokio::fs::read(&model_path).await?;
