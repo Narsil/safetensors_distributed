@@ -1,18 +1,22 @@
-use safetensors::{Dtype, SafeTensors};
-use safetensors::tensor::{TensorInfo, Metadata};
+use crate::tensor::TensorData;
 use crate::topology::{
     Chunk, DistributedInfo, SharedInfo, Tensor, Topology, TopologyError, get_intervals,
 };
-use crate::tensor::TensorData;
+use futures::future::join_all;
+use memmap2::Mmap;
+use safetensors::tensor::{Metadata, TensorInfo};
+use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom};
-use tokio::fs::File;
-use tokio::sync::Semaphore;
-use futures::future::join_all;
-use memmap2::Mmap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
+use tokio::fs::File;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::Semaphore;
+
+// Global counter to track concurrent file operations
+static CONCURRENT_FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Error type for redistributor operations
 #[derive(Debug, Error)]
@@ -45,9 +49,16 @@ pub enum RedistributorError {
     InvalidDimension { dim: usize, shape: Vec<usize> },
 
     #[error("Invalid slice range [{start}, {end}) for dimension {dim} with size {size}")]
-    InvalidSliceRange { start: usize, end: usize, dim: usize, size: usize },
+    InvalidSliceRange {
+        start: usize,
+        end: usize,
+        dim: usize,
+        size: usize,
+    },
 
-    #[error("No valid input found in directory {path:?} (expected topology.json + rank*.safetensors OR model.safetensors)")]
+    #[error(
+        "No valid input found in directory {path:?} (expected topology.json + rank*.safetensors OR model.safetensors)"
+    )]
     NoValidInput { path: PathBuf },
 
     #[error("Failed to parse target world size: {input}")]
@@ -122,7 +133,7 @@ impl AsyncTensorRedistributor {
         config: RedistributorConfig,
     ) -> Self {
         let input_dir = input_dir.as_ref().to_path_buf();
-        
+
         Self {
             data_source: TensorDataSource::Reconstruct {
                 source_topology,
@@ -133,7 +144,7 @@ impl AsyncTensorRedistributor {
             config,
         }
     }
-    
+
     /// Create a new redistributor for loaded tensor data
     pub fn new_from_loaded_tensors(
         tensors: HashMap<String, TensorData>,
@@ -147,98 +158,93 @@ impl AsyncTensorRedistributor {
             config,
         }
     }
-    
+
     /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute<P: AsRef<Path>>(&self, output_dir: P) -> Result<Vec<String>> {
         let output_dir = output_dir.as_ref();
         tokio::fs::create_dir_all(output_dir).await?;
-        
-        println!("Starting async parallel redistribution with pre-calculated layout...");
-        
+
         // Pre-calculate all file layouts and offsets
         let (new_topology, rank_file_infos) = self.pre_calculate_file_layout().await?;
-        
+
         // Create initial files with headers
-        self.create_files_with_headers(output_dir, &rank_file_infos).await?;
-        
+        self.create_files_with_headers(output_dir, &rank_file_infos)
+            .await?;
+
         // Process and write all tensors in parallel
-        self.process_all_tensors(output_dir, &rank_file_infos).await?;
-        
+        self.process_all_tensors(output_dir, &rank_file_infos)
+            .await?;
+
         // Collect created safetensors files
         let mut created_files = Vec::new();
         for filename in new_topology.filenames() {
             created_files.push(filename.clone());
         }
-        
+
         // Write topology.json if needed (for multi-rank outputs)
         if self.target_world_size > 1 {
             let topology_json = serde_json::to_vec_pretty(&new_topology)?;
             tokio::fs::write(output_dir.join("topology.json"), &topology_json).await?;
             created_files.push("topology.json".to_string());
         }
-        
-        println!("Async parallel redistribution completed successfully");
+
         Ok(created_files)
     }
-    
+
     /// Pre-calculate all headers, offsets, and file structures
     async fn pre_calculate_file_layout(&self) -> Result<(Topology, Vec<RankFileInfo>)> {
-        println!("Pre-calculating file layout and offsets...");
-        
         // First pass: determine tensor distribution and calculate sizes
         let mut new_topology_tensors = HashMap::new();
-        let mut rank_tensor_info: Vec<Vec<(String, TensorInfo)>> = (0..self.target_world_size).map(|_| Vec::new()).collect();
+        let mut rank_tensor_info: Vec<Vec<(String, TensorInfo)>> =
+            (0..self.target_world_size).map(|_| Vec::new()).collect();
         let mut rank_offsets = vec![0usize; self.target_world_size];
         let mut tensor_tasks = Vec::new();
-        
+
         // Get tensor metadata and process each tensor
         let tensor_names = self.get_tensor_names().await?;
         for tensor_name in tensor_names {
             let tensor_metadata = self.get_tensor_metadata(&tensor_name).await?;
-            
+
             // Determine how to redistribute this tensor
             let split_dim = self.determine_split_dimension(&tensor_name, &tensor_metadata);
-            
+
             if tensor_metadata.shape[split_dim] % self.target_world_size == 0 {
                 // Will be distributed - calculate chunk info
                 let chunk_size_per_rank = tensor_metadata.shape[split_dim] / self.target_world_size;
                 let mut chunks = Vec::new();
-                
+
                 for rank in 0..self.target_world_size {
                     let start = rank * chunk_size_per_rank;
                     let end = (rank + 1) * chunk_size_per_rank;
                     let mut chunk_shape = tensor_metadata.shape.clone();
                     chunk_shape[split_dim] = end - start;
-                    let chunk_size = chunk_shape.iter().product::<usize>() * tensor_metadata.dtype.size();
-                    
+                    let chunk_size =
+                        chunk_shape.iter().product::<usize>() * tensor_metadata.dtype.size();
+
                     // Create offsets array for this chunk within the tensor
                     let mut chunk_offsets = vec![0; chunk_shape.len()];
                     chunk_offsets[split_dim] = start;
-                    
-                    let chunk = Chunk::new(
-                        chunk_offsets,
-                        chunk_shape.clone(),
-                        rank,
-                    );
+
+                    let chunk = Chunk::new(chunk_offsets, chunk_shape.clone(), rank);
                     chunks.push(chunk);
-                    
+
                     let tensor_info = TensorInfo {
                         dtype: tensor_metadata.dtype,
                         shape: chunk_shape,
                         data_offsets: (rank_offsets[rank], rank_offsets[rank] + chunk_size),
                     };
-                    
+
                     rank_tensor_info[rank].push((tensor_name.clone(), tensor_info));
-                    
+
                     tensor_tasks.push(TensorTask {
                         tensor_name: tensor_name.clone(),
                         rank,
                         file_offset: rank_offsets[rank],
                     });
-                    
+
                     rank_offsets[rank] += chunk_size;
                 }
-                
+
                 new_topology_tensors.insert(
                     tensor_name.clone(),
                     Tensor::Distributed(DistributedInfo::new(
@@ -249,26 +255,27 @@ impl AsyncTensorRedistributor {
                 );
             } else {
                 // Keep as shared - add to ALL ranks
-                let tensor_size = tensor_metadata.shape.iter().product::<usize>() * tensor_metadata.dtype.size();
-                
+                let tensor_size =
+                    tensor_metadata.shape.iter().product::<usize>() * tensor_metadata.dtype.size();
+
                 for rank in 0..self.target_world_size {
                     let tensor_info = TensorInfo {
                         dtype: tensor_metadata.dtype,
                         shape: tensor_metadata.shape.clone(),
                         data_offsets: (rank_offsets[rank], rank_offsets[rank] + tensor_size),
                     };
-                    
+
                     rank_tensor_info[rank].push((tensor_name.clone(), tensor_info));
-                    
+
                     tensor_tasks.push(TensorTask {
                         tensor_name: tensor_name.clone(),
                         rank,
                         file_offset: rank_offsets[rank],
                     });
-                    
+
                     rank_offsets[rank] += tensor_size;
                 }
-                
+
                 new_topology_tensors.insert(
                     tensor_name.clone(),
                     Tensor::Shared(SharedInfo::new(
@@ -279,7 +286,7 @@ impl AsyncTensorRedistributor {
                 );
             }
         }
-        
+
         // Create headers and final file info
         let mut rank_file_infos = Vec::new();
         for rank in 0..self.target_world_size {
@@ -289,167 +296,171 @@ impl AsyncTensorRedistributor {
             )?;
             let header = serde_json::to_vec(&metadata)?;
             let header_size = header.len();
-            
+
             // Update file_offset in tensor tasks for this rank to account for header
-            let rank_tensor_tasks: Vec<_> = tensor_tasks.iter().map(|task| {
-                if task.rank == rank {
-                    TensorTask {
-                        tensor_name: task.tensor_name.clone(),
-                        rank: task.rank,
-                        file_offset: task.file_offset + header_size + 8, // +8 for header size prefix
+            let rank_tensor_tasks: Vec<_> = tensor_tasks
+                .iter()
+                .map(|task| {
+                    if task.rank == rank {
+                        TensorTask {
+                            tensor_name: task.tensor_name.clone(),
+                            rank: task.rank,
+                            file_offset: task.file_offset + header_size + 8, // +8 for header size prefix
+                        }
+                    } else {
+                        task.clone()
                     }
-                } else {
-                    task.clone()
-                }
-            }).collect();
-            
+                })
+                .collect();
+
             rank_file_infos.push(RankFileInfo {
                 rank,
                 header,
                 total_size: rank_offsets[rank] + header_size + 8,
-                tensor_tasks: rank_tensor_tasks.into_iter().filter(|t| t.rank == rank).collect(),
+                tensor_tasks: rank_tensor_tasks
+                    .into_iter()
+                    .filter(|t| t.rank == rank)
+                    .collect(),
             });
         }
-        
-        let new_filenames: Vec<_> = if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
-            vec!["model.safetensors".to_string()]
-        } else {
-            (0..self.target_world_size)
-                .map(|rank| format!("rank{rank}.safetensors"))
-                .collect()
-        };
-        
-        let new_topology = Topology::new(new_topology_tensors, new_filenames, self.target_world_size)?;
-        
-        println!("Pre-calculation complete. File sizes: {:?}", 
-                rank_file_infos.iter().map(|info| info.total_size).collect::<Vec<_>>());
-        
+
+        let new_filenames: Vec<_> =
+            if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
+                vec!["model.safetensors".to_string()]
+            } else {
+                (0..self.target_world_size)
+                    .map(|rank| format!("rank{rank}.safetensors"))
+                    .collect()
+            };
+
+        let new_topology =
+            Topology::new(new_topology_tensors, new_filenames, self.target_world_size)?;
+
         Ok((new_topology, rank_file_infos))
     }
-    
+
     /// Create all files with headers
-    async fn create_files_with_headers<P: AsRef<Path>>(&self, output_dir: P, rank_file_infos: &[RankFileInfo]) -> Result<()> {
+    async fn create_files_with_headers<P: AsRef<Path>>(
+        &self,
+        output_dir: P,
+        rank_file_infos: &[RankFileInfo],
+    ) -> Result<()> {
         let output_dir = output_dir.as_ref();
-        
-        let file_creation_futures: Vec<_> = rank_file_infos.iter().enumerate().map(|(_idx, info)| {
-            let filename = if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
-                "model.safetensors".to_string()
-            } else {
-                format!("rank{}.safetensors", info.rank)
-            };
-            let file_path = output_dir.join(&filename);
-            let header = info.header.clone();
-            let total_size = info.total_size;
-            
-            async move {
-                let mut file = File::create(&file_path).await?;
-                
-                // Write header size (8 bytes)
-                let header_size_bytes = (header.len() as u64).to_le_bytes();
-                file.write_all(&header_size_bytes).await?;
-                
-                // Write header
-                file.write_all(&header).await?;
-                
-                // Pre-allocate file to total size
-                file.set_len(total_size as u64).await?;
-                file.flush().await?;
-                
-                println!("Created {} with size {} bytes", filename, total_size);
-                Ok(())
-            }
-        }).collect();
-        
+
+        let file_creation_futures: Vec<_> = rank_file_infos
+            .iter()
+            .enumerate()
+            .map(|(_idx, info)| {
+                let filename = if self.target_world_size == 1
+                    && self.config.use_model_filename_for_single_rank
+                {
+                    "model.safetensors".to_string()
+                } else {
+                    format!("rank{}.safetensors", info.rank)
+                };
+                let file_path = output_dir.join(&filename);
+                let header = info.header.clone();
+                async move {
+                    let _current_count = CONCURRENT_FILE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut file = File::create(&file_path).await?;
+
+                    file.write_all(&header).await?;
+                    file.flush().await?;
+
+                    let _remaining_count = CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+                    Ok(())
+                }
+            })
+            .collect();
+
         // Wait for all files to be created
         let creation_results: Vec<Result<()>> = join_all(file_creation_futures).await;
         for result in creation_results {
             result?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Process and write all tensors in parallel
-    async fn process_all_tensors<P: AsRef<Path>>(&self, output_dir: P, rank_file_infos: &[RankFileInfo]) -> Result<()> {
+    async fn process_all_tensors<P: AsRef<Path>>(
+        &self,
+        output_dir: P,
+        rank_file_infos: &[RankFileInfo],
+    ) -> Result<()> {
         let output_dir = output_dir.as_ref();
-        
+
         // Create futures for processing and writing each tensor
         let mut all_tensor_tasks = Vec::new();
         for rank_info in rank_file_infos {
             all_tensor_tasks.extend(rank_info.tensor_tasks.clone());
         }
-        
-        println!("Starting parallel tensor processing and writing for {} tensors...", all_tensor_tasks.len());
-        
-        let tensor_futures: Vec<_> = all_tensor_tasks.into_iter().map(|task| {
-            let output_dir = output_dir.to_path_buf();
-            
-            async move {
-                self.process_and_write_tensor(task, &output_dir).await
-            }
-        }).collect();
-        
+
+        let tensor_futures: Vec<_> = all_tensor_tasks
+            .into_iter()
+            .map(|task| {
+                let output_dir = output_dir.to_path_buf();
+
+                async move { self.process_and_write_tensor(task, &output_dir).await }
+            })
+            .collect();
+
         // Wait for all tensor processing and writing to complete
         let tensor_results: Vec<Result<()>> = join_all(tensor_futures).await;
         for result in tensor_results {
             result?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Process a single tensor and write it directly to the file
     async fn process_and_write_tensor(&self, task: TensorTask, output_dir: &Path) -> Result<()> {
-        println!("Processing and writing tensor: {} to rank {} at offset {}", 
-                task.tensor_name, task.rank, task.file_offset);
-        
         // Get the tensor data for this rank
-        let tensor_data = self.get_tensor_data_for_rank(&task.tensor_name, task.rank).await?;
-        
-        // Acquire semaphore before file operations to limit concurrent writes
         let _permit = self.file_semaphore.acquire().await?;
-        
+        let tensor_data = self
+            .get_tensor_data_for_rank(&task.tensor_name, task.rank)
+            .await?;
+
         // Open the file and write the tensor data at the correct offset
-        let filename = if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
-            "model.safetensors".to_string()
-        } else {
-            format!("rank{}.safetensors", task.rank)
-        };
+        let filename =
+            if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
+                "model.safetensors".to_string()
+            } else {
+                format!("rank{}.safetensors", task.rank)
+            };
         let file_path = output_dir.join(&filename);
-        let mut file = File::options().write(true).open(&file_path).await?;
-        
+        let _current_count = CONCURRENT_FILE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut file = File::options().write(true).open(&file_path).await.unwrap();
+
         file.seek(SeekFrom::Start(task.file_offset as u64)).await?;
         file.write_all(&tensor_data).await?;
         file.flush().await?;
-        
-        let target_file = if self.target_world_size == 1 && self.config.use_model_filename_for_single_rank {
-            "model.safetensors".to_string()
-        } else {
-            format!("rank{}", task.rank)
-        };
-        println!("  ✓ Wrote {} bytes for {} to {}", tensor_data.len(), task.tensor_name, target_file);
-        
+
+        let _remaining_count = CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+
         Ok(())
     }
-    
+
     /// Get tensor names from the data source
     async fn get_tensor_names(&self) -> Result<Vec<String>> {
         match &self.data_source {
-            TensorDataSource::Reconstruct { source_topology, .. } => {
-                Ok(source_topology.tensors().keys().cloned().collect())
-            }
-            TensorDataSource::Loaded { tensors } => {
-                Ok(tensors.keys().cloned().collect())
-            }
+            TensorDataSource::Reconstruct {
+                source_topology, ..
+            } => Ok(source_topology.tensors().keys().cloned().collect()),
+            TensorDataSource::Loaded { tensors } => Ok(tensors.keys().cloned().collect()),
         }
     }
-    
+
     /// Get tensor metadata without loading full tensor data
     async fn get_tensor_metadata(&self, tensor_name: &str) -> Result<TensorData> {
         match &self.data_source {
-            TensorDataSource::Reconstruct { source_topology, input_dir } => {
+            TensorDataSource::Reconstruct {
+                source_topology,
+                input_dir,
+            } => {
                 let source_tensor = source_topology.get_tensor(tensor_name).unwrap();
-                
+
                 match source_tensor {
                     Tensor::Distributed(dist_info) => {
                         // For distributed tensors, get the full shape from topology
@@ -465,19 +476,25 @@ impl AsyncTensorRedistributor {
                         let source_filename = &source_topology.filenames()[file_idx];
                         let source_path = input_dir.join(source_filename);
                         let tensor_name = tensor_name.to_string();
-                        
+
                         tokio::task::spawn_blocking(move || {
+                            let _current_count =
+                                CONCURRENT_FILE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
                             let file = std::fs::File::open(&source_path)?;
                             let mmap = unsafe { Mmap::map(&file)? };
                             let safetensors = SafeTensors::deserialize(&mmap)?;
                             let tensor_view = safetensors.tensor(&tensor_name)?;
-                            
-                            Ok(TensorData {
+
+                            let result = Ok(TensorData {
                                 dtype: tensor_view.dtype(),
                                 shape: tensor_view.shape().to_vec(),
                                 data: Vec::new(), // We only need metadata here
-                            })
-                        }).await?
+                            });
+                            let _remaining_count =
+                                CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+                            result
+                        })
+                        .await?
                     }
                 }
             }
@@ -491,25 +508,34 @@ impl AsyncTensorRedistributor {
             }
         }
     }
-    
+
     /// Get tensor data for a specific rank
-    async fn get_tensor_data_for_rank(&self, tensor_name: &str, target_rank: usize) -> Result<Vec<u8>> {
+    async fn get_tensor_data_for_rank(
+        &self,
+        tensor_name: &str,
+        target_rank: usize,
+    ) -> Result<Vec<u8>> {
         match &self.data_source {
-            TensorDataSource::Reconstruct { source_topology, .. } => {
+            TensorDataSource::Reconstruct {
+                source_topology, ..
+            } => {
                 let source_tensor = source_topology.get_tensor(tensor_name).unwrap();
-                
+
                 match source_tensor {
                     Tensor::Distributed(_) => {
                         // Need to reconstruct full tensor and then extract the chunk for target_rank
                         let full_tensor_data = self.reconstruct_tensor_async(tensor_name).await?;
-                        let split_dim = self.determine_split_dimension(tensor_name, &full_tensor_data);
-                        
+                        let split_dim =
+                            self.determine_split_dimension(tensor_name, &full_tensor_data);
+
                         if full_tensor_data.shape[split_dim] % self.target_world_size == 0 {
-                            let chunk_size_per_rank = full_tensor_data.shape[split_dim] / self.target_world_size;
+                            let chunk_size_per_rank =
+                                full_tensor_data.shape[split_dim] / self.target_world_size;
                             let start = target_rank * chunk_size_per_rank;
                             let end = (target_rank + 1) * chunk_size_per_rank;
-                            
-                            let chunk_data = extract_tensor_slice(&full_tensor_data, split_dim, start, end)?;
+
+                            let chunk_data =
+                                extract_tensor_slice(&full_tensor_data, split_dim, start, end)?;
                             Ok(chunk_data)
                         } else {
                             // If not evenly divisible, keep as shared tensor (all ranks get full tensor)
@@ -521,37 +547,47 @@ impl AsyncTensorRedistributor {
                         let file_idx = info.filename_index();
                         let filename = &source_topology.filenames()[file_idx];
                         let file_path = match &self.data_source {
-                            TensorDataSource::Reconstruct { input_dir, .. } => input_dir.join(filename),
-                            TensorDataSource::Loaded { .. } => return Err(RedistributorError::InvalidDataSource { 
-                message: "Cannot access files from loaded tensor data source".to_string() 
-            }),
+                            TensorDataSource::Reconstruct { input_dir, .. } => {
+                                input_dir.join(filename)
+                            }
+                            TensorDataSource::Loaded { .. } => {
+                                return Err(RedistributorError::InvalidDataSource {
+                                    message: "Cannot access files from loaded tensor data source"
+                                        .to_string(),
+                                });
+                            }
                         };
                         let tensor_name = tensor_name.to_string();
-                        
+
                         tokio::task::spawn_blocking(move || {
+                            let _current_count =
+                                CONCURRENT_FILE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
                             let file = std::fs::File::open(&file_path)?;
                             let mmap = unsafe { Mmap::map(&file)? };
                             let safetensors = SafeTensors::deserialize(&mmap)?;
                             let tensor = safetensors.tensor(&tensor_name)?;
                             let tensor_data = tensor.data().to_vec();
-                            
+
+                            let _remaining_count =
+                                CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
                             Ok(tensor_data)
-                        }).await?
+                        })
+                        .await?
                     }
                 }
             }
             TensorDataSource::Loaded { tensors } => {
                 let tensor = tensors.get(tensor_name).unwrap();
-                
+
                 // Determine split strategy
                 let split_dim = self.determine_split_dimension(tensor_name, tensor);
-                
+
                 if tensor.shape[split_dim] % self.target_world_size == 0 {
                     // Split the tensor
                     let chunk_size_per_rank = tensor.shape[split_dim] / self.target_world_size;
                     let start = target_rank * chunk_size_per_rank;
                     let end = (target_rank + 1) * chunk_size_per_rank;
-                    
+
                     let chunk_data = extract_tensor_slice(tensor, split_dim, start, end)?;
                     Ok(chunk_data)
                 } else {
@@ -561,13 +597,15 @@ impl AsyncTensorRedistributor {
             }
         }
     }
-    
+
     /// Determine the best dimension to split a tensor based on its name and shape
     fn determine_split_dimension(&self, tensor_name: &str, tensor: &TensorData) -> usize {
         let shape = &tensor.shape;
-        
+
         // Use the same logic as the original GPT-2 splitting
-        if ["c_fc", "c_attn", "wpe", "wte"].iter().any(|f| tensor_name.contains(f))
+        if ["c_fc", "c_attn", "wpe", "wte"]
+            .iter()
+            .any(|f| tensor_name.contains(f))
             && !tensor_name.contains("bias")
         {
             1 // Split along dimension 1
@@ -577,78 +615,95 @@ impl AsyncTensorRedistributor {
             0 // Split along dimension 0
         } else {
             // Default: split along the largest dimension
-            shape.iter()
+            shape
+                .iter()
                 .enumerate()
                 .max_by_key(|(_, size)| *size)
                 .map(|(idx, _)| idx)
                 .unwrap_or(0)
         }
     }
-    
+
     /// Reconstruct a tensor by reading from source files asynchronously
     async fn reconstruct_tensor_async(&self, tensor_name: &str) -> Result<TensorData> {
         match &self.data_source {
-            TensorDataSource::Reconstruct { source_topology, input_dir } => {
+            TensorDataSource::Reconstruct {
+                source_topology,
+                input_dir,
+            } => {
                 match source_topology.get_tensor(tensor_name).unwrap() {
                     Tensor::Distributed(info) => {
                         let shape = info.shape();
                         let dtype = info.dtype();
                         let total_elements: usize = shape.iter().product();
                         let mut result = vec![0u8; total_elements * dtype.size()];
-                        
+
                         let ndim = shape.len();
                         // Compute strides for the full tensor
                         let mut full_strides = vec![1; ndim];
                         for i in (0..ndim - 1).rev() {
                             full_strides[i] = full_strides[i + 1] * shape[i + 1];
                         }
-                        
+
                         // Read all chunks in parallel
-                        let chunk_futures: Vec<_> = info.chunks().iter().map(|chunk| {
-                            let file_idx = chunk.filename_index();
-                            let filename = &source_topology.filenames()[file_idx];
-                            let file_path = input_dir.join(filename);
-                            let tensor_name = tensor_name.to_string();
-                            let chunk = chunk.clone();
-                            let full_strides = full_strides.clone();
-                            let shape = shape.to_vec();
-                            let dtype = dtype;
-                            
-                            async move {
-                                // Use spawn_blocking for mmap operations
-                                tokio::task::spawn_blocking(move || {
-                                    let file = std::fs::File::open(&file_path)?;
-                                    let mmap = unsafe { Mmap::map(&file)? };
-                                    let safetensors = SafeTensors::deserialize(&mmap)?;
-                                    let tensor = safetensors.tensor(&tensor_name)?;
-                                    let chunk_data = tensor.data().to_vec();
-                                    
-                                    // Calculate intervals for this chunk
-                                    let intervals = get_intervals(&chunk, &full_strides, &shape);
-                                    
-                                    Ok::<_, RedistributorError>((intervals, chunk_data, dtype))
-                                }).await?
-                            }
-                        }).collect();
-                        
-                        let chunk_results: Vec<Result<(Vec<(usize, usize)>, Vec<u8>, Dtype)>> = join_all(chunk_futures).await;
-                        
+                        let chunk_futures: Vec<_> = info
+                            .chunks()
+                            .iter()
+                            .map(|chunk| {
+                                let file_idx = chunk.filename_index();
+                                let filename = &source_topology.filenames()[file_idx];
+                                let file_path = input_dir.join(filename);
+                                let tensor_name = tensor_name.to_string();
+                                let chunk = chunk.clone();
+                                let full_strides = full_strides.clone();
+                                let shape = shape.to_vec();
+                                let dtype = dtype;
+
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        let _current_count = CONCURRENT_FILE_COUNT
+                                            .fetch_add(1, Ordering::SeqCst)
+                                            + 1;
+                                        let file = std::fs::File::open(&file_path)?;
+                                        let mmap = unsafe { Mmap::map(&file)? };
+                                        let safetensors = SafeTensors::deserialize(&mmap)?;
+                                        let tensor = safetensors.tensor(&tensor_name)?;
+                                        let chunk_data = tensor.data().to_vec();
+
+                                        // Calculate intervals for this chunk
+                                        let intervals =
+                                            get_intervals(&chunk, &full_strides, &shape);
+
+                                        let _remaining_count = CONCURRENT_FILE_COUNT
+                                            .fetch_sub(1, Ordering::SeqCst)
+                                            - 1;
+                                        Ok::<_, RedistributorError>((intervals, chunk_data, dtype))
+                                    })
+                                    .await?
+                                }
+                            })
+                            .collect();
+
+                        let chunk_results: Vec<Result<(Vec<(usize, usize)>, Vec<u8>, Dtype)>> =
+                            join_all(chunk_futures).await;
+
                         // Assemble the full tensor from chunks
                         for chunk_result in chunk_results {
                             let (intervals, chunk_data, _dtype) = chunk_result?;
                             let mut chunk_offset = 0;
-                            
+
                             for (start, stop) in intervals {
                                 let start_byte = start * dtype.size();
                                 let stop_byte = stop * dtype.size();
                                 let chunk_size = stop_byte - start_byte;
-                                
-                                result[start_byte..stop_byte]
-                                    .copy_from_slice(&chunk_data[chunk_offset..chunk_offset + chunk_size]);
+
+                                result[start_byte..stop_byte].copy_from_slice(
+                                    &chunk_data[chunk_offset..chunk_offset + chunk_size],
+                                );
                                 chunk_offset += chunk_size;
                             }
                         }
-                        
+
                         Ok(TensorData {
                             dtype,
                             shape: shape.to_vec(),
@@ -660,20 +715,25 @@ impl AsyncTensorRedistributor {
                         let filename = &source_topology.filenames()[file_idx];
                         let file_path = input_dir.join(filename);
                         let tensor_name = tensor_name.to_string();
-                        
+                        let shape = info.shape().to_vec();
+                        let dtype = info.dtype();
                         tokio::task::spawn_blocking(move || {
+                            let _current_count =
+                                CONCURRENT_FILE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
                             let file = std::fs::File::open(&file_path)?;
                             let mmap = unsafe { Mmap::map(&file)? };
                             let safetensors = SafeTensors::deserialize(&mmap)?;
                             let tensor = safetensors.tensor(&tensor_name)?;
                             let tensor_data = tensor.data().to_vec();
-                            
+                            let _remaining_count =
+                                CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
                             Ok(TensorData {
-                                dtype: tensor.dtype(),
-                                shape: tensor.shape().to_vec(),
+                                dtype,
+                                shape,
                                 data: tensor_data,
                             })
-                        }).await?
+                        })
+                        .await?
                     }
                 }
             }
@@ -695,44 +755,50 @@ fn extract_tensor_slice(
     let shape = &tensor.shape;
     let dtype = tensor.dtype;
     let dtype_size = dtype.size();
-    
+
     if dim >= shape.len() {
-        return Err(RedistributorError::InvalidDimension { dim, shape: shape.to_vec() });
-    }
-    
-    if start >= end || end > shape[dim] {
-                return Err(RedistributorError::InvalidSliceRange { 
-            start, end, dim, size: shape[dim] 
+        return Err(RedistributorError::InvalidDimension {
+            dim,
+            shape: shape.to_vec(),
         });
     }
-    
+
+    if start >= end || end > shape[dim] {
+        return Err(RedistributorError::InvalidSliceRange {
+            start,
+            end,
+            dim,
+            size: shape[dim],
+        });
+    }
+
     // Calculate strides
     let mut strides = vec![1; shape.len()];
     for i in (0..shape.len() - 1).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
-    
+
     // Calculate the size of the extracted slice
     let mut slice_shape = shape.clone();
     slice_shape[dim] = end - start;
     let slice_elements: usize = slice_shape.iter().product();
     let mut result = vec![0u8; slice_elements * dtype_size];
-    
+
     // Calculate how many complete "blocks" we have before the split dimension
     let outer_size: usize = shape[0..dim].iter().product();
     let inner_size: usize = shape[dim + 1..].iter().product();
     let slice_inner_size = (end - start) * inner_size;
-    
+
     // Copy data block by block
     for outer_idx in 0..outer_size {
         let src_offset = (outer_idx * shape[dim] * inner_size + start * inner_size) * dtype_size;
         let dst_offset = (outer_idx * slice_inner_size) * dtype_size;
         let copy_size = slice_inner_size * dtype_size;
-        
+
         result[dst_offset..dst_offset + copy_size]
             .copy_from_slice(&tensor.data[src_offset..src_offset + copy_size]);
     }
-    
+
     Ok(result)
 }
 
@@ -740,27 +806,20 @@ fn extract_tensor_slice(
 pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Topology> {
     let input_dir = input_dir.as_ref();
     let topology_path = input_dir.join("topology.json");
-    
+    let model_path = input_dir.join("model.safetensors");
+
+    // Check if we have a distributed setup (topology.json + rank*.safetensors)
     if topology_path.exists() {
         // Load existing distributed topology
-        println!("Loading distributed topology from {:?}", topology_path);
         let topology_data = tokio::fs::read_to_string(&topology_path).await?;
         let topology: Topology = serde_json::from_str(&topology_data)?;
         Ok(topology)
-    } else {
-        // Create a single-rank topology from model.safetensors
-        let model_path = input_dir.join("model.safetensors");
-        if !model_path.exists() {
-            return Err(RedistributorError::NoValidInput { path: input_dir.to_path_buf() });
-        }
-        
-        println!("No topology.json found, creating single-rank topology from {:?}", model_path);
-        
-        // Read the safetensors file to get tensor information
+    } else if model_path.exists() {
+        // Single file case - read the safetensors file to get tensor information
         let model_data = tokio::fs::read(&model_path).await?;
         let safetensors = SafeTensors::deserialize(&model_data)?;
-        
-        // Create topology with all tensors as shared
+
+        // Create a topology with a single rank
         let mut tensors = HashMap::new();
         for tensor_name in safetensors.names() {
             let tensor_info = safetensors.tensor(tensor_name)?;
@@ -773,13 +832,12 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
                 )),
             );
         }
-        
-        let topology = Topology::new(
-            tensors,
-            vec!["model.safetensors".to_string()],
-            1,
-        )?;
-        
+
+        let topology = Topology::new(tensors, vec!["model.safetensors".to_string()], 1)?;
         Ok(topology)
+    } else {
+        Err(RedistributorError::NoValidInput {
+            path: input_dir.to_path_buf(),
+        })
     }
-} 
+}
