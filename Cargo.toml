@@ -30,3 +30,4 @@ log = { version = "0.4" }
 anyhow = { version = "1.0" }
 env_logger = { version = "0.10" }
 memmap2 = "0.9"
+clap = { version = "4.5", features = ["derive"] }
