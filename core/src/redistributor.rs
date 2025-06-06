@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Semaphore;
+use indicatif::{ProgressBar, ProgressStyle};
 
 // Global counter to track concurrent file operations
 static CONCURRENT_FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -834,6 +835,13 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
                 chunk_files.sort();
                 chunk_files.dedup();
 
+                // Create progress bar for chunk files
+                let pb = ProgressBar::new(chunk_files.len() as u64);
+                pb.set_style(ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                    .unwrap()
+                    .progress_chars("#>-"));
+
                 // Group tensors by their chunk file
                 let mut file_tensors: HashMap<String, Vec<String>> = HashMap::new();
                 for (tensor_name, file_name) in weight_map {
@@ -866,7 +874,9 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
                             )),
                         );
                     }
+                    pb.inc(1);
                 }
+                pb.finish_with_message("Finished reading chunk files");
 
                 // Create topology with all chunk files
                 let topology = Topology::new(tensors, chunk_files, 1)?;
