@@ -116,7 +116,6 @@ async fn redistribute_model_async<P: AsRef<Path>>(
         "Target topology will have {} ranks",
         target_topology.world_size()
     );
-    println!("Target topology {target_topology:#?}",);
 
     // Create and run the async redistributor
     let redistributor = AsyncTensorRedistributor::new(input_dir, output_dir, target_topology)?;

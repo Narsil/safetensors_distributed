@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -38,18 +39,18 @@ impl WriteTask {
         f.seek(SeekFrom::Start(self.target_start)).await?;
         f.write(&buf).await?;
         f.flush().await?;
-        println!(
-            "Writing from {:?} to {:?}",
-            self.source_filename, self.target_filename
-        );
-        println!("  Source: {}", self.source_start);
-        println!("  Target: {}", self.target_start);
-        println!("  Size: {}", self.length);
-        println!(
-            "  Buf: {:?} - {}",
-            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) },
-            self.length
-        );
+        // println!(
+        //     "Writing from {:?} to {:?}",
+        //     self.source_filename, self.target_filename
+        // );
+        // println!("  Source: {}", self.source_start);
+        // println!("  Target: {}", self.target_start);
+        // println!("  Size: {}", self.length);
+        // println!(
+        //     "  Buf: {:?} - {}",
+        //     unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) },
+        //     self.length
+        // );
         Ok(())
     }
 }
@@ -171,17 +172,22 @@ impl AsyncTensorRedistributor {
 
     /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute(&self) -> Result<Vec<String>> {
+        println!("Start");
+        let start = Instant::now();
         tokio::fs::create_dir_all(&self.target.dir).await?;
 
         self.create_files_with_headers().await?;
+        println!("Created headers {:?}", start.elapsed());
 
         let write_tasks = self.create_tasks()?;
+        println!("Created tasks {:?}", start.elapsed());
         let futures: Vec<_> = write_tasks
             .into_iter()
             .map(|t| async move { t.run().await })
             .collect();
 
         join_all(futures).await;
+        println!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
         let mut created_files = Vec::new();
@@ -265,109 +271,75 @@ impl AsyncTensorRedistributor {
 
     fn create_tasks(&self) -> Result<Vec<WriteTask>> {
         let mut tasks = vec![];
-        for (target_name, target_tensor) in self.target.topology.tensors() {
-            match target_tensor {
-                Tensor::Distributed(info) => {
-                    let ndim = info.shape().len();
-                    let full_shape = info.shape();
+        for (name, target_tensor) in self.target.topology.tensors() {
+            let source_tensor = self
+                .source
+                .topology
+                .tensors()
+                .get(name)
+                .expect("Both topology should contain the same tensors");
+
+            match (source_tensor, target_tensor) {
+                (Tensor::Distributed(sinfo), Tensor::Distributed(tinfo)) => {
+                    assert_eq!(sinfo.shape(), tinfo.shape());
+                    assert_eq!(sinfo.dtype(), tinfo.dtype());
+                    let dtype_size = sinfo.dtype().size();
+                    let ndim = sinfo.shape().len();
+                    let full_shape = sinfo.shape();
                     let mut full_strides = vec![1; ndim];
                     for i in (0..ndim - 1).rev() {
                         full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
                     }
-                    for chunk in info.chunks() {
-                        tasks.extend(self.distributed_task(
-                            target_name,
-                            chunk,
-                            &full_strides,
-                            full_shape,
-                        ));
+                    for schunk in sinfo.chunks() {
+                        for tchunk in tinfo.chunks() {
+                            let source_intervals = get_intervals(schunk, &full_strides, full_shape);
+                            let target_intervals = get_intervals(tchunk, &full_strides, full_shape);
+                            let sindex = schunk.filename_index();
+                            let tindex = tchunk.filename_index();
+                            let sheader_size = self.source.metadatas[tindex].0;
+                            let theader_size = self.target.metadatas[tindex].0;
+                            let sdata_offset = self.source.metadatas[tindex]
+                                .1
+                                .tensors()
+                                .get(name)
+                                .expect("Tensor missing from metadata")
+                                .data_offsets
+                                .0;
+                            let tdata_offset = self.target.metadatas[tindex]
+                                .1
+                                .tensors()
+                                .get(name)
+                                .expect("Tensor missing from metadata")
+                                .data_offsets
+                                .0;
+                            self.tasks_from_interval(
+                                name,
+                                &source_intervals,
+                                &target_intervals,
+                                sindex,
+                                tindex,
+                                sheader_size,
+                                theader_size,
+                                sdata_offset,
+                                tdata_offset,
+                                dtype_size,
+                                &mut tasks,
+                            );
+                        }
                     }
                 }
-                Tensor::Shared(info) => {
-                    todo!("{info:?}");
-                }
-            }
-        }
-        Ok(tasks)
-    }
-
-    fn distributed_task(
-        &self,
-        name: &str,
-        target_chunk: &Chunk,
-        full_strides: &[usize],
-        full_shape: &[usize],
-    ) -> Vec<WriteTask> {
-        let mut tasks = vec![];
-        let source_tensor = self
-            .source
-            .topology
-            .tensors()
-            .get(name)
-            .expect("Both topology should contain the same tensors");
-        let target_intervals = get_intervals(target_chunk, full_strides, full_shape);
-        let tindex = target_chunk.filename_index();
-        let theader_size = self.target.metadatas[tindex].0;
-        let tdata_offset = self.target.metadatas[tindex]
-            .1
-            .tensors()
-            .get(name)
-            .expect("Tensor missing from metadata")
-            .data_offsets
-            .0;
-        match source_tensor {
-            Tensor::Distributed(sinfo) => {
-                assert_eq!(sinfo.shape(), full_shape);
-                let dtype_size = sinfo.dtype().size();
-                for source_chunk in sinfo.chunks() {
-                    let source_intervals = get_intervals(source_chunk, full_strides, full_shape);
-
-                    for (sstart, tstart, length) in
-                        intersection(&source_intervals, &target_intervals)
-                    {
-                        // Convert from offset to bytes
-                        let sstart = sstart * dtype_size;
-                        let tstart = tstart * dtype_size;
-                        let length = length * dtype_size;
-
-                        let sindex = source_chunk.filename_index();
-                        let sheader_size = self.source.metadatas[sindex].0;
-                        let sdata_offset = self.source.metadatas[sindex]
-                            .1
-                            .tensors()
-                            .get(name)
-                            .expect("Tensor missing from metadata")
-                            .data_offsets
-                            .0;
-
-                        let target_start = (theader_size + tdata_offset + tstart) as u64;
-                        let source_start = (sheader_size + sdata_offset + sstart) as u64;
-                        let semaphore = Arc::clone(&self.file_semaphore);
-                        let target_filename = self
-                            .target
-                            .dir
-                            .join(&self.target.topology.filenames()[tindex]);
-                        let source_filename = self
-                            .source
-                            .dir
-                            .join(&self.source.topology.filenames()[sindex]);
-                        tasks.push(WriteTask {
-                            source_filename,
-                            source_start,
-                            target_filename,
-                            target_start,
-                            semaphore,
-                            length,
-                        });
+                (Tensor::Shared(sinfo), Tensor::Distributed(tinfo)) => {
+                    assert_eq!(sinfo.shape(), tinfo.shape());
+                    assert_eq!(sinfo.dtype(), tinfo.dtype());
+                    let dtype_size = sinfo.dtype().size();
+                    let ndim = sinfo.shape().len();
+                    let full_shape = sinfo.shape();
+                    let mut full_strides = vec![1; ndim];
+                    for i in (0..ndim - 1).rev() {
+                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
                     }
-                }
-            }
-            Tensor::Shared(sinfo) => {
-                let mut tstart = 0;
-                let dtype_size = sinfo.dtype().size();
-                for (sstart, sstop) in target_intervals {
-                    let length = (sstop - sstart) * dtype_size;
-
+                    let n: usize = sinfo.shape().iter().product();
+                    let source_intervals = vec![(0, n)];
                     let sindex = sinfo.filename_index();
                     let sheader_size = self.source.metadatas[sindex].0;
                     let sdata_offset = self.source.metadatas[sindex]
@@ -377,89 +349,79 @@ impl AsyncTensorRedistributor {
                         .expect("Tensor missing from metadata")
                         .data_offsets
                         .0;
-
-                    let target_start = (theader_size + tdata_offset + tstart * dtype_size) as u64;
-                    let source_start = (sheader_size + sdata_offset + sstart * dtype_size) as u64;
-                    println!("Tensor {name} {sstart} {theader_size} {tdata_offset}");
-                    println!("T {target_start} S {source_start}");
-                    println!("T {theader_size} O {tdata_offset} S {tstart}");
-
-                    let semaphore = Arc::clone(&self.file_semaphore);
-                    let target_filename = self
-                        .target
-                        .dir
-                        .join(&self.target.topology.filenames()[tindex]);
-                    let source_filename = self
-                        .source
-                        .dir
-                        .join(&self.source.topology.filenames()[sindex]);
-                    tasks.push(WriteTask {
-                        source_filename,
-                        source_start,
-                        target_filename,
-                        target_start,
-                        semaphore,
-                        length,
-                    });
-                    tstart += length;
+                    for tchunk in tinfo.chunks() {
+                        let target_intervals = get_intervals(tchunk, &full_strides, full_shape);
+                        let tindex = tchunk.filename_index();
+                        let theader_size = self.target.metadatas[tindex].0;
+                        let tdata_offset = self.target.metadatas[tindex]
+                            .1
+                            .tensors()
+                            .get(name)
+                            .expect("Tensor missing from metadata")
+                            .data_offsets
+                            .0;
+                        self.tasks_from_interval(
+                            name,
+                            &source_intervals,
+                            &target_intervals,
+                            sindex,
+                            tindex,
+                            sheader_size,
+                            theader_size,
+                            sdata_offset,
+                            tdata_offset,
+                            dtype_size,
+                            &mut tasks,
+                        );
+                    }
                 }
+                pat => todo!("other variants: {pat:?}"),
             }
         }
-        tasks
+        Ok(tasks)
     }
 
-    // fn to_shared_task(&self, rank: usize, name: &str, info: &SharedInfo) -> Vec<WriteTask> {
-    //     let source_tensor = self
-    //         .source
-    //         .topology
-    //         .tensors()
-    //         .get(name)
-    //         .expect("tensor is missing in source");
-    //     match source_tensor {
-    //         Tensor::Distributed(_) => todo!("distributed"),
-    //         Tensor::Shared(source_info) => {
-    //             assert_eq!(info.shape(), source_info.shape());
-    //             assert_eq!(info.dtype(), source_info.dtype());
+    fn tasks_from_interval(
+        &self,
+        name: &str,
+        source_intervals: &[(usize, usize)],
+        target_intervals: &[(usize, usize)],
+        sindex: usize,
+        tindex: usize,
+        sheader_size: usize,
+        theader_size: usize,
+        sdata_offset: usize,
+        tdata_offset: usize,
+        dtype_size: usize,
+        tasks: &mut Vec<WriteTask>,
+    ) {
+        for (sstart, tstart, length) in intersection(&source_intervals, &target_intervals) {
+            // Convert from offset to bytes
+            let sstart = sstart * dtype_size;
+            let tstart = tstart * dtype_size;
+            let length = length * dtype_size;
 
-    //             let length = info.shape().iter().product::<usize>() * info.dtype().size();
-    //             let source_filename = self
-    //                 .source
-    //                 .dir
-    //                 .join(&self.source.topology.filenames()[source_info.filename_index()]);
-    //             let target_filename = self
-    //                 .target
-    //                 .dir
-    //                 .join(&self.target.topology.filenames()[info.filename_index()]);
-    //             let (target_offset, tmetadata) = &self.target.metadatas[info.filename_index()];
-    //             let (tstart, tstop) = tmetadata
-    //                 .tensors()
-    //                 .get(name)
-    //                 .expect("Tensor should exist")
-    //                 .data_offsets;
-    //             assert_eq!(tstop - tstart, length);
-    //             let (source_offset, smetadata) =
-    //                 &self.source.metadatas[source_info.filename_index()];
-    //             let (sstart, sstop) = smetadata
-    //                 .tensors()
-    //                 .get(name)
-    //                 .expect("Tensor should exist")
-    //                 .data_offsets;
-    //             assert_eq!(tstop - tstart, length);
-    //             assert_eq!(sstop - sstart, length);
-    //             let target_start = tstart + target_offset;
-    //             let source_start = sstart + source_offset;
-
-    //             vec![WriteTask {
-    //                 source_filename,
-    //                 source_start: source_start as u64,
-    //                 target_filename,
-    //                 target_start: target_start as u64,
-    //                 length,
-    //                 semaphore: Arc::clone(&self.file_semaphore),
-    //             }]
-    //         }
-    //     }
-    // }
+            let target_start = (theader_size + tdata_offset + tstart) as u64;
+            let source_start = (sheader_size + sdata_offset + sstart) as u64;
+            let semaphore = Arc::clone(&self.file_semaphore);
+            let target_filename = self
+                .target
+                .dir
+                .join(&self.target.topology.filenames()[tindex]);
+            let source_filename = self
+                .source
+                .dir
+                .join(&self.source.topology.filenames()[sindex]);
+            tasks.push(WriteTask {
+                source_filename,
+                source_start,
+                target_filename,
+                target_start,
+                semaphore,
+                length,
+            });
+        }
+    }
 
     /// Create all files with headers
     async fn create_files_with_headers(&self) -> Result<()> {
@@ -492,7 +454,7 @@ impl AsyncTensorRedistributor {
                 f.write_all(&metadata_buf).await?;
                 let total = data_len + metadata_buf.len() + 8;
                 f.set_len(total as u64).await?;
-                println!("File {filename:?} should have size {total}");
+                // println!("File {filename:?} should have size {total}");
                 f.flush().await?;
 
                 Ok(())
