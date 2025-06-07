@@ -107,20 +107,21 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     // Load the existing topology (or create from model.safetensors)
     let source_topology = load_or_create_topology(input_dir)?;
 
-    let source_ranks = source_topology.n_ranks();
+    let source_ranks = source_topology.world_size();
     println!("Source topology has {} ranks", source_ranks);
 
     // Create target topology
-    let target_topology = create_target_topology(&source_topology, target_world_size)?;
+    let target_topology = create_target_topology(&source_topology, target_world_size).unwrap();
     println!(
         "Target topology will have {} ranks",
-        target_topology.n_ranks()
+        target_topology.world_size()
     );
+    println!("Target topology {target_topology:#?}",);
 
     // Create and run the async redistributor
-    let redistributor = AsyncTensorRedistributor::new_from_topology(input_dir, target_topology)?;
+    let redistributor = AsyncTensorRedistributor::new(input_dir, output_dir, target_topology)?;
 
-    let _created_files = redistributor.redistribute(output_dir).await?;
+    let _created_files = redistributor.redistribute().await?;
     Ok(())
 }
 

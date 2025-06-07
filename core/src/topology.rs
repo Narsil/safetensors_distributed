@@ -109,16 +109,20 @@ impl Chunk {
 pub struct SimpleTopo {
     tensors: HashMap<String, Tensor>,
     filenames: Vec<String>,
-    n_ranks: usize,
+    world_size: usize,
 }
 
 impl SimpleTopo {
     /// Creates a new simple topology with the given tensors, filenames, and number of ranks
-    pub fn new(tensors: HashMap<String, Tensor>, filenames: Vec<String>, n_ranks: usize) -> Self {
+    pub fn new(
+        tensors: HashMap<String, Tensor>,
+        filenames: Vec<String>,
+        world_size: usize,
+    ) -> Self {
         Self {
             tensors,
             filenames,
-            n_ranks,
+            world_size,
         }
     }
 }
@@ -128,7 +132,7 @@ impl SimpleTopo {
 pub struct Topology {
     tensors: HashMap<String, Tensor>,
     filenames: Vec<String>,
-    n_ranks: usize,
+    world_size: usize,
 }
 
 /// Error type for topology operations
@@ -271,7 +275,7 @@ impl TryFrom<SimpleTopo> for Topology {
     fn try_from(value: SimpleTopo) -> Result<Self, Self::Error> {
         let topo = Topology {
             filenames: value.filenames,
-            n_ranks: value.n_ranks,
+            world_size: value.world_size,
             tensors: value.tensors,
         };
         topo.validate()?;
@@ -282,28 +286,28 @@ impl Topology {
     pub fn new(
         tensors: HashMap<String, Tensor>,
         filenames: Vec<String>,
-        n_ranks: usize,
+        world_size: usize,
     ) -> Result<Self, TopologyError> {
         let topo = Self {
             tensors,
             filenames,
-            n_ranks,
+            world_size,
         };
         topo.validate()?;
         Ok(topo)
     }
     #[cfg(test)]
-    fn empty(n_ranks: usize) -> Self {
+    fn empty(world_size: usize) -> Self {
         Self {
             tensors: HashMap::new(),
             filenames: vec![],
-            n_ranks,
+            world_size,
         }
     }
 
     /// Returns the number of ranks in the topology
-    pub fn n_ranks(&self) -> usize {
-        self.n_ranks
+    pub fn world_size(&self) -> usize {
+        self.world_size
     }
 
     /// Returns an iterator over the tensor names and their corresponding tensors
@@ -329,10 +333,10 @@ impl Topology {
             match tensor {
                 Tensor::Distributed(info) => {
                     // Check number of chunks
-                    if info.chunks.len() != self.n_ranks {
+                    if info.chunks.len() != self.world_size {
                         return Err(TopologyError::InvalidChunkCount(
                             name.clone(),
-                            self.n_ranks,
+                            self.world_size,
                             info.chunks.len(),
                         ));
                     }
@@ -569,7 +573,7 @@ mod tests {
         let topology = Topology::empty(4);
         assert_eq!(
             serde_json::to_string(&topology).unwrap(),
-            r#"{"tensors":{},"filenames":[],"n_ranks":4}"#
+            r#"{"tensors":{},"filenames":[],"world_size":4}"#
         );
     }
 
