@@ -390,33 +390,49 @@ impl AsyncTensorRedistributor {
         rank_file_infos: &[RankFileInfo],
     ) -> Result<()> {
         let output_dir = output_dir.as_ref();
+        let mut tensor_tasks = Vec::new();
 
-        // Create futures for processing and writing each tensor
-        let mut all_tensor_tasks = Vec::new();
-        for rank_info in rank_file_infos {
-            all_tensor_tasks.extend(rank_info.tensor_tasks.clone());
+        // Collect all tensor tasks
+        for info in rank_file_infos {
+            tensor_tasks.extend(info.tensor_tasks.clone());
         }
 
-        let tensor_futures: Vec<_> = all_tensor_tasks
-            .into_iter()
-            .map(|task| {
-                let output_dir = output_dir.to_path_buf();
-
-                async move { self.process_and_write_tensor(task, &output_dir).await }
-            })
-            .collect();
-
-        // Wait for all tensor processing and writing to complete
-        let tensor_results: Vec<Result<()>> = join_all(tensor_futures).await;
-        for result in tensor_results {
-            result?;
+        // Calculate total bytes to write
+        let mut total_bytes: u64 = 0;
+        for task in &tensor_tasks {
+            // Get tensor metadata to determine size
+            let tensor_metadata = self.get_tensor_metadata(&task.tensor_name).await?;
+            let split_dim = self.determine_split_dimension(&task.tensor_name, &tensor_metadata);
+            let tensor_size = if tensor_metadata.shape[split_dim] % self.target_world_size == 0 {
+                // Distributed: get chunk size for this rank
+                let chunk_size_per_rank = tensor_metadata.shape[split_dim] / self.target_world_size;
+                let mut chunk_shape = tensor_metadata.shape.clone();
+                chunk_shape[split_dim] = chunk_size_per_rank;
+                chunk_shape.iter().product::<usize>() * tensor_metadata.dtype.size()
+            } else {
+                // Shared: full tensor
+                tensor_metadata.shape.iter().product::<usize>() * tensor_metadata.dtype.size()
+            };
+            total_bytes += tensor_size as u64;
         }
 
+        // Create progress bar for bytes written
+        let pb = ProgressBar::new(total_bytes);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner} [{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({eta}) {bytes_per_sec}")
+            .unwrap());
+
+        // Process tensors sequentially, updating the progress bar by bytes written
+        for task in tensor_tasks {
+            let tensor_data = self.process_and_write_tensor(task, output_dir, &pb).await?;
+        }
+
+        pb.finish_with_message("Finished processing tensors");
         Ok(())
     }
 
     /// Process a single tensor and write it directly to the file
-    async fn process_and_write_tensor(&self, task: TensorTask, output_dir: &Path) -> Result<()> {
+    async fn process_and_write_tensor(&self, task: TensorTask, output_dir: &Path, pb: &ProgressBar) -> Result<()> {
         // Get the tensor data for this rank
         let _permit = self.file_semaphore.acquire().await?;
         let tensor_data = self
@@ -439,6 +455,9 @@ impl AsyncTensorRedistributor {
         file.flush().await?;
 
         let _remaining_count = CONCURRENT_FILE_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+
+        // Update progress bar with bytes written
+        pb.inc(tensor_data.len() as u64);
 
         Ok(())
     }
@@ -838,7 +857,7 @@ pub async fn load_or_create_topology<P: AsRef<Path>>(input_dir: P) -> Result<Top
                 // Create progress bar for chunk files
                 let pb = ProgressBar::new(chunk_files.len() as u64);
                 pb.set_style(ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                    .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
                     .unwrap()
                     .progress_chars("#>-"));
 
