@@ -1,13 +1,10 @@
-use crate::tensor::TensorData;
-use crate::topology::{
-    Chunk, DistributedInfo, SharedInfo, Tensor, Topology, TopologyError, get_intervals,
-};
+use crate::topology::{Chunk, SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
 use indicatif::style::TemplateError;
-use indicatif::{ProgressBar, ProgressStyle};
+// use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
+use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
-use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,8 +28,8 @@ impl WriteTask {
         let _permit = self.semaphore.acquire().await?;
         let mut f = File::open(&self.source_filename).await?;
         f.seek(SeekFrom::Start(self.source_start)).await?;
-        let mut buf = Vec::with_capacity(self.length);
-        f.take(self.length as u64).read(&mut buf).await?;
+        let mut buf = vec![0u8; self.length];
+        f.read_exact(&mut buf).await?;
 
         let mut f = File::options()
             .write(true)
@@ -48,6 +45,11 @@ impl WriteTask {
         println!("  Source: {}", self.source_start);
         println!("  Target: {}", self.target_start);
         println!("  Size: {}", self.length);
+        println!(
+            "  Buf: {:?} - {}",
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) },
+            self.length
+        );
         Ok(())
     }
 }
@@ -57,17 +59,6 @@ impl WriteTask {
 struct SafetensorsIndex {
     /// Map of tensor names to their containing file
     weight_map: HashMap<String, String>,
-}
-
-fn human_prefix(mut value: u64, unit: &str) -> String {
-    for prefix in ["k", "M", "G"] {
-        if value > 1000 {
-            value /= 1000;
-            continue;
-        }
-        return format!("{value} {prefix}{unit}");
-    }
-    todo!("Implement more of this");
 }
 
 /// Error type for redistributor operations
@@ -126,15 +117,6 @@ pub enum RedistributorError {
 /// Result type for redistributor operations
 type Result<T> = std::result::Result<T, RedistributorError>;
 
-/// Represents a tensor processing and writing task
-#[derive(Debug, Clone)]
-pub struct TensorTask {
-    tensor_name: String,
-    rank: usize,
-    file_offset: usize,
-    chunk_size: usize,
-}
-
 /// Data source for tensor redistribution
 struct Layout {
     topology: Topology,
@@ -146,12 +128,6 @@ struct Layout {
 pub struct AsyncTensorRedistributor {
     source: Layout,
     target: Layout,
-    // source.dir: PathBuf,
-    // source.topology: Topology,
-    // source.metadatas: Vec<Metadata>,
-    // target.dir: PathBuf,
-    // target.topology: Topology,
-    // target.metadatas: Vec<Metadata>,
     file_semaphore: Arc<Semaphore>,
 }
 
@@ -342,12 +318,18 @@ impl AsyncTensorRedistributor {
         match source_tensor {
             Tensor::Distributed(sinfo) => {
                 assert_eq!(sinfo.shape(), full_shape);
+                let dtype_size = sinfo.dtype().size();
                 for source_chunk in sinfo.chunks() {
                     let source_intervals = get_intervals(source_chunk, full_strides, full_shape);
 
                     for (sstart, tstart, length) in
                         intersection(&source_intervals, &target_intervals)
                     {
+                        // Convert from offset to bytes
+                        let sstart = sstart * dtype_size;
+                        let tstart = tstart * dtype_size;
+                        let length = length * dtype_size;
+
                         let sindex = source_chunk.filename_index();
                         let sheader_size = self.source.metadatas[sindex].0;
                         let sdata_offset = self.source.metadatas[sindex]
@@ -382,8 +364,9 @@ impl AsyncTensorRedistributor {
             }
             Tensor::Shared(sinfo) => {
                 let mut tstart = 0;
+                let dtype_size = sinfo.dtype().size();
                 for (sstart, sstop) in target_intervals {
-                    let length = sstop - sstart;
+                    let length = (sstop - sstart) * dtype_size;
 
                     let sindex = sinfo.filename_index();
                     let sheader_size = self.source.metadatas[sindex].0;
@@ -395,8 +378,8 @@ impl AsyncTensorRedistributor {
                         .data_offsets
                         .0;
 
-                    let target_start = (theader_size + tdata_offset + tstart) as u64;
-                    let source_start = (sheader_size + sdata_offset + sstart) as u64;
+                    let target_start = (theader_size + tdata_offset + tstart * dtype_size) as u64;
+                    let source_start = (sheader_size + sdata_offset + sstart * dtype_size) as u64;
                     println!("Tensor {name} {sstart} {theader_size} {tdata_offset}");
                     println!("T {target_start} S {source_start}");
                     println!("T {theader_size} O {tdata_offset} S {tstart}");
@@ -425,58 +408,58 @@ impl AsyncTensorRedistributor {
         tasks
     }
 
-    fn to_shared_task(&self, rank: usize, name: &str, info: &SharedInfo) -> Vec<WriteTask> {
-        let source_tensor = self
-            .source
-            .topology
-            .tensors()
-            .get(name)
-            .expect("tensor is missing in source");
-        match source_tensor {
-            Tensor::Distributed(_) => todo!("distributed"),
-            Tensor::Shared(source_info) => {
-                assert_eq!(info.shape(), source_info.shape());
-                assert_eq!(info.dtype(), source_info.dtype());
+    // fn to_shared_task(&self, rank: usize, name: &str, info: &SharedInfo) -> Vec<WriteTask> {
+    //     let source_tensor = self
+    //         .source
+    //         .topology
+    //         .tensors()
+    //         .get(name)
+    //         .expect("tensor is missing in source");
+    //     match source_tensor {
+    //         Tensor::Distributed(_) => todo!("distributed"),
+    //         Tensor::Shared(source_info) => {
+    //             assert_eq!(info.shape(), source_info.shape());
+    //             assert_eq!(info.dtype(), source_info.dtype());
 
-                let length = info.shape().iter().product::<usize>() * info.dtype().size();
-                let source_filename = self
-                    .source
-                    .dir
-                    .join(&self.source.topology.filenames()[source_info.filename_index()]);
-                let target_filename = self
-                    .target
-                    .dir
-                    .join(&self.target.topology.filenames()[info.filename_index()]);
-                let (target_offset, tmetadata) = &self.target.metadatas[info.filename_index()];
-                let (tstart, tstop) = tmetadata
-                    .tensors()
-                    .get(name)
-                    .expect("Tensor should exist")
-                    .data_offsets;
-                assert_eq!(tstop - tstart, length);
-                let (source_offset, smetadata) =
-                    &self.source.metadatas[source_info.filename_index()];
-                let (sstart, sstop) = smetadata
-                    .tensors()
-                    .get(name)
-                    .expect("Tensor should exist")
-                    .data_offsets;
-                assert_eq!(tstop - tstart, length);
-                assert_eq!(sstop - sstart, length);
-                let target_start = tstart + target_offset;
-                let source_start = sstart + source_offset;
+    //             let length = info.shape().iter().product::<usize>() * info.dtype().size();
+    //             let source_filename = self
+    //                 .source
+    //                 .dir
+    //                 .join(&self.source.topology.filenames()[source_info.filename_index()]);
+    //             let target_filename = self
+    //                 .target
+    //                 .dir
+    //                 .join(&self.target.topology.filenames()[info.filename_index()]);
+    //             let (target_offset, tmetadata) = &self.target.metadatas[info.filename_index()];
+    //             let (tstart, tstop) = tmetadata
+    //                 .tensors()
+    //                 .get(name)
+    //                 .expect("Tensor should exist")
+    //                 .data_offsets;
+    //             assert_eq!(tstop - tstart, length);
+    //             let (source_offset, smetadata) =
+    //                 &self.source.metadatas[source_info.filename_index()];
+    //             let (sstart, sstop) = smetadata
+    //                 .tensors()
+    //                 .get(name)
+    //                 .expect("Tensor should exist")
+    //                 .data_offsets;
+    //             assert_eq!(tstop - tstart, length);
+    //             assert_eq!(sstop - sstart, length);
+    //             let target_start = tstart + target_offset;
+    //             let source_start = sstart + source_offset;
 
-                vec![WriteTask {
-                    source_filename,
-                    source_start: source_start as u64,
-                    target_filename,
-                    target_start: target_start as u64,
-                    length,
-                    semaphore: Arc::clone(&self.file_semaphore),
-                }]
-            }
-        }
-    }
+    //             vec![WriteTask {
+    //                 source_filename,
+    //                 source_start: source_start as u64,
+    //                 target_filename,
+    //                 target_start: target_start as u64,
+    //                 length,
+    //                 semaphore: Arc::clone(&self.file_semaphore),
+    //             }]
+    //         }
+    //     }
+    // }
 
     /// Create all files with headers
     async fn create_files_with_headers(&self) -> Result<()> {
@@ -599,5 +582,154 @@ fn intersection(
     source_intervals: &[(usize, usize)],
     target_intervals: &[(usize, usize)],
 ) -> Vec<(usize, usize, usize)> {
-    vec![]
+    let mut result = Vec::new();
+
+    let mut soffset = 0;
+    let mut toffset = 0;
+    let mut sindex = 0;
+    let mut tindex = 0;
+
+    while sindex < source_intervals.len() && tindex < target_intervals.len() {
+        let (source_start, source_end) = &source_intervals[sindex];
+        let (target_start, target_end) = &target_intervals[tindex];
+        let intersection_start = (*source_start).max(*target_start);
+        let intersection_end = (*source_end).min(*target_end);
+
+        if intersection_start < intersection_end {
+            // There is an overlap
+            let source_offset = soffset + (intersection_start - source_start);
+            let target_offset = toffset + (intersection_start - target_start);
+            let length = intersection_end - intersection_start;
+
+            result.push((source_offset, target_offset, length));
+        }
+
+        if source_end < target_end {
+            sindex += 1;
+            soffset += source_end - source_start;
+        } else {
+            tindex += 1;
+            toffset += target_end - target_start;
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_intersection_function() {
+        // Test case: [8, 8] full array (64 elements total)
+        // Source chunk: [4:, :] = rows 4-7, all columns = elements 32-63 in 1D
+        // Target chunk: [:, :2] = all rows, columns 0-1
+
+        // Source intervals: [4:, :] covers elements 32-63
+        let source_intervals = vec![(32, 64)];
+
+        // Target intervals: [:, :2] covers first 2 columns of each row
+        // Row 0, cols 0-1: elements 0-1   = (0, 2)
+        // Row 1, cols 0-1: elements 8-9   = (8, 10)
+        // Row 2, cols 0-1: elements 16-17 = (16, 18)
+        // Row 3, cols 0-1: elements 24-25 = (24, 26)
+        // Row 4, cols 0-1: elements 32-33 = (32, 34)  <- intersects with source
+        // Row 5, cols 0-1: elements 40-41 = (40, 42)  <- intersects with source
+        // Row 6, cols 0-1: elements 48-49 = (48, 50)  <- intersects with source
+        // Row 7, cols 0-1: elements 56-57 = (56, 58)  <- intersects with source
+        let target_intervals = vec![
+            (0, 2),
+            (8, 10),
+            (16, 18),
+            (24, 26),
+            (32, 34),
+            (40, 42),
+            (48, 50),
+            (56, 58),
+        ];
+
+        let result = intersection(&source_intervals, &target_intervals);
+
+        // Expected result: (source_offset, target_offset, length)
+        // - (32, 34): source_offset=0 (32-32), target_offset=8 (4 intervals * 2 bytes each), length=2
+        // - (40, 42): source_offset=8 (40-32), target_offset=10 (5 intervals * 2 bytes each), length=2
+        // - (48, 50): source_offset=16 (48-32), target_offset=12 (6 intervals * 2 bytes each), length=2
+        // - (56, 58): source_offset=24 (56-32), target_offset=14 (7 intervals * 2 bytes each), length=2
+        let expected = vec![
+            (0, 8, 2),   // (32,34) -> source offset 0, target offset 8, length 2
+            (8, 10, 2),  // (40,42) -> source offset 8, target offset 10, length 2
+            (16, 12, 2), // (48,50) -> source offset 16, target offset 12, length 2
+            (24, 14, 2), // (56,58) -> source offset 24, target offset 14, length 2
+        ];
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_intersection_no_overlap() {
+        // Test case where there's no overlap
+        let source_intervals = vec![(10, 20)];
+        let target_intervals = vec![(0, 5), (25, 30)];
+
+        let result = intersection(&source_intervals, &target_intervals);
+        assert_eq!(result, vec![]);
+    }
+
+    #[test]
+    fn test_intersection_partial_overlap() {
+        // Test case with partial overlaps
+        let source_intervals = vec![(5, 15)];
+        let target_intervals = vec![(0, 8), (12, 20)];
+
+        // Expected intersections:
+        // (5, 8) with source_offset=0, target_offset=5 (within first target interval), length=3
+        // (12, 15) with source_offset=7, target_offset=8 (8 bytes from first interval + 0 from second), length=3
+        let expected = vec![
+            (0, 5, 3), // intersection (5,8) - offset 5 within first target interval
+            (7, 8, 3), // intersection (12,15) - offset 8 (cumulative: 8 from first interval + 0)
+        ];
+
+        let result = intersection(&source_intervals, &target_intervals);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_intersection_multiple_source_intervals() {
+        // Test case with multiple source intervals
+        let source_intervals = vec![(0, 5), (10, 15)];
+        let target_intervals = vec![(3, 8), (12, 18)];
+
+        // Expected intersections:
+        // (3, 5) from first source with source_offset=3, target_offset=0 (start of first target interval), length=2
+        // (12, 15) from second source with source_offset=2, target_offset=5 (5 bytes from first interval + 0 from second), length=3
+        let expected = vec![
+            (3, 0, 2), // intersection (3,5) from first source interval
+            (7, 5, 3), // intersection (12,15) from second source interval - offset 5 (cumulative: 5 from first + 0)
+        ];
+
+        let result = intersection(&source_intervals, &target_intervals);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_intersection_target_spans_multiple_sources() {
+        // Test case where a single target interval spans across multiple source intervals
+        let source_intervals = vec![(10, 20), (30, 40)];
+        let target_intervals = vec![(15, 35)];
+
+        // Target interval (15, 35) intersects with:
+        // - First source (10, 20) at (15, 20) - length 5, maps to target offsets 0-4
+        // - Second source (30, 40) at (30, 35) - length 5, maps to target offsets 15-19 (position-based)
+        // OR if sequential filling: target offsets 5-9
+        //
+        // Based on the other tests, target_offset should be position-based, not sequential
+        let expected = vec![
+            (5, 0, 5),   // intersection (15,20): position 15 in target → offset 0
+            (10, 15, 5), // intersection (30,35): position 30 in target → offset 15 (30-15)
+        ];
+
+        let result = intersection(&source_intervals, &target_intervals);
+        assert_eq!(result, expected);
+    }
 }
