@@ -1,16 +1,101 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use hf_hub::api::tokio::ApiBuilder;
 use hf_hub::{
     Repo, RepoType,
-    api::tokio::{Api, ApiRepo},
+    api::tokio::Api,
 };
 use safetensors_distributed::redistributor::{
     AsyncTensorRedistributor, RedistributorConfig, load_or_create_topology,
 };
-use safetensors_distributed::topology::Topology;
+use safetensors_distributed::topology::{Topology, Tensor, DistributedInfo, SharedInfo, Chunk};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::collections::HashMap;
+
+/// Create a target topology for redistribution based on source topology and target world size
+fn create_target_topology(
+    source_topology: &Topology,
+    target_world_size: usize,
+) -> Result<Topology> {
+    let mut target_tensors = HashMap::new();
+    
+    // Generate target filenames
+    let target_filenames = if target_world_size == 1 {
+        vec!["model.safetensors".to_string()]
+    } else {
+        (0..target_world_size)
+            .map(|rank| format!("rank{rank}.safetensors"))
+            .collect()
+    };
+
+    // Process each tensor from the source topology
+    for (tensor_name, source_tensor) in source_topology.tensors() {
+        let (shape, dtype) = match source_tensor {
+            Tensor::Distributed(info) => (info.shape().to_vec(), info.dtype()),
+            Tensor::Shared(info) => (info.shape().to_vec(), info.dtype()),
+        };
+
+        // Determine the best dimension to split based on tensor name and shape
+        let split_dim = determine_split_dimension(tensor_name, &shape);
+
+        if shape[split_dim] % target_world_size == 0 {
+            // Create distributed tensor
+            let chunk_size_per_rank = shape[split_dim] / target_world_size;
+            let mut chunks = Vec::new();
+
+            for rank in 0..target_world_size {
+                let start = rank * chunk_size_per_rank;
+                let end = (rank + 1) * chunk_size_per_rank;
+                let mut chunk_shape = shape.clone();
+                chunk_shape[split_dim] = end - start;
+
+                // Create offsets array for this chunk within the tensor
+                let mut chunk_offsets = vec![0; chunk_shape.len()];
+                chunk_offsets[split_dim] = start;
+
+                let chunk = Chunk::new(chunk_offsets, chunk_shape, rank);
+                chunks.push(chunk);
+            }
+
+            target_tensors.insert(
+                tensor_name.clone(),
+                Tensor::Distributed(DistributedInfo::new(shape, dtype, chunks)),
+            );
+        } else {
+            // Keep as shared tensor
+            target_tensors.insert(
+                tensor_name.clone(),
+                Tensor::Shared(SharedInfo::new(shape, dtype, 0)),
+            );
+        }
+    }
+
+    Ok(Topology::new(target_tensors, target_filenames, target_world_size)?)
+}
+
+/// Determine the best dimension to split a tensor based on its name and shape
+fn determine_split_dimension(tensor_name: &str, shape: &[usize]) -> usize {
+    // Use the same logic as the original GPT-2 splitting
+    if ["c_fc", "c_attn", "wpe", "wte"]
+        .iter()
+        .any(|f| tensor_name.contains(f))
+        && !tensor_name.contains("bias")
+    {
+        1 // Split along dimension 1
+    } else if ["c_attn", "c_proj"].iter().any(|f| tensor_name.contains(f))
+        && !tensor_name.contains("bias")
+    {
+        0 // Split along dimension 0
+    } else {
+        // Default: split along the largest dimension
+        shape
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, size)| *size)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -40,26 +125,22 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize the Hugging Face Hub API
-    let api = ApiBuilder::from_env()
-        .high()
-        .build()
-        .context("Failed to initialize Hugging Face Hub API")?;
-    let repo = Repo::with_revision(args.repo.clone(), RepoType::Model, args.revision.clone());
-    let api_repo = api.repo(repo);
+    println!("Downloading model {} (revision: {})...", args.repo, args.revision);
+
+    // Create API and repo
+    let api = Api::new().context("Failed to create HF API")?;
+    let api_repo = api.repo(Repo::with_revision(
+        args.repo.clone(),
+        RepoType::Model,
+        args.revision.clone(),
+    ));
 
     // Create output directory
-    fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
+    std::fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
 
-    // Try to get topology.json
+    // Check if the repository has a topology.json (distributed model)
     let topology_path = args.output_dir.join("topology.json");
-    let has_topology = match api_repo.get("topology.json").await {
-        Ok(cached_path) => {
-            fs::copy(&cached_path, &topology_path).context("Failed to copy topology.json")?;
-            true
-        }
-        Err(_) => false,
-    };
+    let has_topology = api_repo.get("topology.json").await.is_ok();
 
     if has_topology {
         println!("Found topology.json in repository, downloading distributed files...");
@@ -95,6 +176,9 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to load topology")?;
 
+    // Create target topology
+    let target_topology = create_target_topology(&source_topology, args.world_size)?;
+
     let config = RedistributorConfig {
         max_concurrent_files: args.max_concurrent_files,
         use_model_filename_for_single_rank: true,
@@ -103,7 +187,7 @@ async fn main() -> Result<()> {
     let redistributor = AsyncTensorRedistributor::new_from_topology(
         source_topology,
         &args.output_dir,
-        args.world_size,
+        target_topology,
         config,
     );
 

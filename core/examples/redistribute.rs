@@ -1,8 +1,97 @@
 use anyhow::{Context, Result};
-use safetensors_distributed::redistributor::{
-    AsyncTensorRedistributor, RedistributorConfig, load_or_create_topology,
-};
+use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
+use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Create a target topology for redistribution based on source topology and target world size
+fn create_target_topology(
+    source_topology: &Topology,
+    target_world_size: usize,
+) -> Result<Topology> {
+    let mut target_tensors = HashMap::new();
+
+    // Generate target filenames
+    let target_filenames = if target_world_size == 1 {
+        vec!["model.safetensors".to_string()]
+    } else {
+        (0..target_world_size)
+            .map(|rank| format!("rank{rank}.safetensors"))
+            .collect()
+    };
+
+    // Process each tensor from the source topology
+    for (tensor_name, source_tensor) in source_topology.tensors() {
+        let (shape, dtype) = match source_tensor {
+            Tensor::Distributed(info) => (info.shape().to_vec(), info.dtype()),
+            Tensor::Shared(info) => (info.shape().to_vec(), info.dtype()),
+        };
+
+        // Determine the best dimension to split based on tensor name and shape
+        let split_dim = determine_split_dimension(tensor_name, &shape);
+
+        if shape[split_dim] % target_world_size == 0 {
+            // Create distributed tensor
+            let chunk_size_per_rank = shape[split_dim] / target_world_size;
+            let mut chunks = Vec::new();
+
+            for rank in 0..target_world_size {
+                let start = rank * chunk_size_per_rank;
+                let end = (rank + 1) * chunk_size_per_rank;
+                let mut chunk_shape = shape.clone();
+                chunk_shape[split_dim] = end - start;
+
+                // Create offsets array for this chunk within the tensor
+                let mut chunk_offsets = vec![0; chunk_shape.len()];
+                chunk_offsets[split_dim] = start;
+
+                let chunk = Chunk::new(chunk_offsets, chunk_shape, rank);
+                chunks.push(chunk);
+            }
+
+            target_tensors.insert(
+                tensor_name.clone(),
+                Tensor::Distributed(DistributedInfo::new(shape, dtype, chunks)),
+            );
+        } else {
+            // Keep as shared tensor
+            target_tensors.insert(
+                tensor_name.clone(),
+                Tensor::Shared(SharedInfo::new(shape, dtype, 0)),
+            );
+        }
+    }
+
+    Ok(Topology::new(
+        target_tensors,
+        target_filenames,
+        target_world_size,
+    )?)
+}
+
+/// Determine the best dimension to split a tensor based on its name and shape
+fn determine_split_dimension(tensor_name: &str, shape: &[usize]) -> usize {
+    // Use the same logic as the original GPT-2 splitting
+    if ["c_fc", "c_attn", "wpe", "wte"]
+        .iter()
+        .any(|f| tensor_name.contains(f))
+        && !tensor_name.contains("bias")
+    {
+        1 // Split along dimension 1
+    } else if ["c_attn", "c_proj"].iter().any(|f| tensor_name.contains(f))
+        && !tensor_name.contains("bias")
+    {
+        0 // Split along dimension 0
+    } else {
+        // Default: split along the largest dimension
+        shape
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, size)| *size)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+}
 
 /// Main redistribution function using async parallel approach
 async fn redistribute_model_async<P: AsRef<Path>>(
@@ -16,33 +105,22 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     println!("Reading model from {:?}", input_dir);
 
     // Load the existing topology (or create from model.safetensors)
-    let source_topology = load_or_create_topology(input_dir).await?;
+    let source_topology = load_or_create_topology(input_dir)?;
 
     let source_ranks = source_topology.n_ranks();
     println!("Source topology has {} ranks", source_ranks);
 
-    // Create and run the async redistributor
-    let config = RedistributorConfig::default();
-    let redistributor = AsyncTensorRedistributor::new_from_topology(
-        source_topology,
-        input_dir,
-        target_world_size,
-        config,
-    );
-
-    let created_files = redistributor.redistribute(output_dir).await?;
-
-    // Print created files and success message
-    for filename in &created_files {
-        println!("Saved {}", filename);
-    }
-
+    // Create target topology
+    let target_topology = create_target_topology(&source_topology, target_world_size)?;
     println!(
-        "Model successfully redistributed from {} to {} ranks",
-        source_ranks, target_world_size
+        "Target topology will have {} ranks",
+        target_topology.n_ranks()
     );
-    println!("Output saved to {:?}", output_dir);
 
+    // Create and run the async redistributor
+    let redistributor = AsyncTensorRedistributor::new_from_topology(input_dir, target_topology)?;
+
+    let _created_files = redistributor.redistribute(output_dir).await?;
     Ok(())
 }
 
@@ -75,4 +153,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
