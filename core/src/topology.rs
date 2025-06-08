@@ -12,15 +12,15 @@ pub enum Tensor {
 pub struct SharedInfo {
     shape: Vec<usize>,
     dtype: Dtype,
-    filename_index: usize,
+    filename_indices: Vec<usize>,
 }
 
 impl SharedInfo {
-    pub fn new(shape: Vec<usize>, dtype: Dtype, filename_index: usize) -> Self {
+    pub fn new(shape: Vec<usize>, dtype: Dtype, filename_indices: Vec<usize>) -> Self {
         Self {
             shape,
             dtype,
-            filename_index,
+            filename_indices,
         }
     }
     /// Returns the shape of the tensor
@@ -34,8 +34,8 @@ impl SharedInfo {
     }
 
     /// Returns the index of the file containing this tensor
-    pub fn filename_index(&self) -> usize {
-        self.filename_index
+    pub fn filename_indices(&self) -> &[usize] {
+        &self.filename_indices
     }
 }
 
@@ -365,12 +365,14 @@ impl Topology {
                     check_overlapping_chunks(info, name)?;
                 }
                 Tensor::Shared(info) => {
-                    if info.filename_index >= self.filenames.len() {
-                        return Err(TopologyError::InvalidFilenameIndex(
-                            name.clone(),
-                            info.filename_index,
-                            self.filenames.len(),
-                        ));
+                    for filename_index in &info.filename_indices {
+                        if *filename_index >= self.filenames.len() {
+                            return Err(TopologyError::InvalidFilenameIndex(
+                                name.clone(),
+                                *filename_index,
+                                self.filenames.len(),
+                            ));
+                        }
                     }
                 }
             }
@@ -598,7 +600,7 @@ mod tests {
             Tensor::Shared(SharedInfo {
                 shape: vec![10, 10],
                 dtype: Dtype::F32,
-                filename_index: 0,
+                filename_indices: vec![0],
             }),
         );
         assert_eq!(topology.validate(), Ok(()));

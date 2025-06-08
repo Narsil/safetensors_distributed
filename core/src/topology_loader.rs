@@ -235,7 +235,7 @@ fn fetch_shared(
             let request = FetchRequest {
                 client: Client::new(),
                 // TODO we need the local filename
-                filename: remote_topology.filenames()[info.filename_index()]
+                filename: remote_topology.filenames()[info.filename_indices()[0]]
                     .clone()
                     .into(),
                 range: (remote_start + remote_offset, remote_stop + remote_offset),

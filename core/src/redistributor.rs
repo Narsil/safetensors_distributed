@@ -1,4 +1,4 @@
-use crate::topology::{Chunk, SharedInfo, Tensor, Topology, TopologyError, get_intervals};
+use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
 use indicatif::style::TemplateError;
 // use indicatif::{ProgressBar, ProgressStyle};
@@ -313,7 +313,6 @@ impl AsyncTensorRedistributor {
                                 .data_offsets
                                 .0;
                             self.tasks_from_interval(
-                                name,
                                 &source_intervals,
                                 &target_intervals,
                                 sindex,
@@ -340,7 +339,7 @@ impl AsyncTensorRedistributor {
                     }
                     let n: usize = sinfo.shape().iter().product();
                     let source_intervals = vec![(0, n)];
-                    let sindex = sinfo.filename_index();
+                    let sindex = sinfo.filename_indices()[0];
                     let sheader_size = self.source.metadatas[sindex].0;
                     let sdata_offset = self.source.metadatas[sindex]
                         .1
@@ -361,7 +360,6 @@ impl AsyncTensorRedistributor {
                             .data_offsets
                             .0;
                         self.tasks_from_interval(
-                            name,
                             &source_intervals,
                             &target_intervals,
                             sindex,
@@ -375,7 +373,99 @@ impl AsyncTensorRedistributor {
                         );
                     }
                 }
-                pat => todo!("other variants: {pat:?}"),
+                (Tensor::Shared(sinfo), Tensor::Shared(tinfo)) => {
+                    assert_eq!(sinfo.shape(), tinfo.shape());
+                    assert_eq!(sinfo.dtype(), tinfo.dtype());
+                    let dtype_size = sinfo.dtype().size();
+                    let ndim = sinfo.shape().len();
+                    let full_shape = sinfo.shape();
+                    let mut full_strides = vec![1; ndim];
+                    for i in (0..ndim - 1).rev() {
+                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+                    }
+                    let n: usize = sinfo.shape().iter().product();
+                    let source_intervals = vec![(0, n)];
+                    let sindex = sinfo.filename_indices()[0];
+                    let sheader_size = self.source.metadatas[sindex].0;
+                    let sdata_offset = self.source.metadatas[sindex]
+                        .1
+                        .tensors()
+                        .get(name)
+                        .expect("Tensor missing from metadata")
+                        .data_offsets
+                        .0;
+                    let target_intervals = vec![(0, n)];
+                    for &tindex in tinfo.filename_indices() {
+                        let theader_size = self.target.metadatas[tindex].0;
+                        let tdata_offset = self.target.metadatas[tindex]
+                            .1
+                            .tensors()
+                            .get(name)
+                            .expect("Tensor missing from metadata")
+                            .data_offsets
+                            .0;
+                        self.tasks_from_interval(
+                            &source_intervals,
+                            &target_intervals,
+                            sindex,
+                            tindex,
+                            sheader_size,
+                            theader_size,
+                            sdata_offset,
+                            tdata_offset,
+                            dtype_size,
+                            &mut tasks,
+                        );
+                    }
+                }
+                (Tensor::Distributed(sinfo), Tensor::Shared(tinfo)) => {
+                    assert_eq!(sinfo.shape(), tinfo.shape());
+                    assert_eq!(sinfo.dtype(), tinfo.dtype());
+                    let dtype_size = sinfo.dtype().size();
+                    let ndim = sinfo.shape().len();
+                    let full_shape = sinfo.shape();
+                    let mut full_strides = vec![1; ndim];
+                    for i in (0..ndim - 1).rev() {
+                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+                    }
+                    let n: usize = sinfo.shape().iter().product();
+
+                    let target_intervals = vec![(0, n)];
+                    for &tindex in tinfo.filename_indices() {
+                        let theader_size = self.target.metadatas[tindex].0;
+                        let tdata_offset = self.target.metadatas[tindex]
+                            .1
+                            .tensors()
+                            .get(name)
+                            .expect("Tensor missing from metadata")
+                            .data_offsets
+                            .0;
+                        for schunk in sinfo.chunks() {
+                            let source_intervals = get_intervals(schunk, &full_strides, full_shape);
+                            let sindex = schunk.filename_index();
+                            let sheader_size = self.source.metadatas[sindex].0;
+                            let sdata_offset = self.source.metadatas[sindex]
+                                .1
+                                .tensors()
+                                .get(name)
+                                .expect("Tensor missing from metadata")
+                                .data_offsets
+                                .0;
+                            self.tasks_from_interval(
+                                &source_intervals,
+                                &target_intervals,
+                                sindex,
+                                tindex,
+                                sheader_size,
+                                theader_size,
+                                sdata_offset,
+                                tdata_offset,
+                                dtype_size,
+                                &mut tasks,
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(tasks)
@@ -383,7 +473,6 @@ impl AsyncTensorRedistributor {
 
     fn tasks_from_interval(
         &self,
-        name: &str,
         source_intervals: &[(usize, usize)],
         target_intervals: &[(usize, usize)],
         sindex: usize,
@@ -529,7 +618,7 @@ pub fn load_or_create_topology<P: AsRef<Path>>(dir: P) -> Result<Topology> {
                 Tensor::Shared(SharedInfo::new(
                     tensor_info.shape.to_vec(),
                     tensor_info.dtype,
-                    file_index, // Use the correct file index
+                    vec![file_index], // Use the correct file index
                 )),
             );
         }

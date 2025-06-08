@@ -57,7 +57,7 @@ fn create_target_topology(
             // Keep as shared tensor
             target_tensors.insert(
                 tensor_name.clone(),
-                Tensor::Shared(SharedInfo::new(shape, dtype, 0)),
+                Tensor::Shared(SharedInfo::new(shape, dtype, vec![0])),
             );
         }
     }
