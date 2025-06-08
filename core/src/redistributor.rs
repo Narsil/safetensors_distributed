@@ -8,12 +8,10 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -21,30 +19,26 @@ use tokio::task::{JoinError, JoinHandle};
 struct MmapWriteTask {
     source_mmap: Arc<Mmap>,
     source_start: u64,
-    target_mmap: Arc<Mutex<MmapMut>>,
+    target_mmap: Arc<MmapMut>,
     target_start: u64,
     length: usize,
 }
 
 impl MmapWriteTask {
-    async fn run(&self) -> Result<()> {
-        // let source_guard = self.source_mmap.lock().await;
-        // let mut target_guard = self.target_mmap.lock().await;
-        let lock_start = Instant::now();
-        let source_guard = &self.source_mmap;
-        let mut target_guard = self.target_mmap.lock().await;
-        // let lock_time = lock_start.elapsed();
+    fn run(&self) -> Result<()> {
+        let source_slice = &self.source_mmap
+            [self.source_start as usize..(self.source_start as usize + self.length)];
 
-        // if lock_time > Duration::from_millis(1) {
-        //     println!("Lock took: {:?}", lock_time);
-        // }
-
-        let source_slice =
-            &source_guard[self.source_start as usize..(self.source_start as usize + self.length)];
-        let target_slice = &mut target_guard
-            [self.target_start as usize..(self.target_start as usize + self.length)];
-
-        target_slice.copy_from_slice(source_slice);
+        // SAFETY: This is safe because:
+        // 1. All write ranges are pre-calculated and guaranteed non-overlapping
+        // 2. Each task writes to a unique byte range within the memory-mapped file
+        // 3. No two tasks will ever write to the same memory location
+        // 4. The topology calculation ensures mutually exclusive write regions
+        unsafe {
+            let target_ptr = self.target_mmap.as_ptr().add(self.target_start as usize) as *mut u8;
+            let target_slice = std::slice::from_raw_parts_mut(target_ptr, self.length);
+            target_slice.copy_from_slice(source_slice);
+        }
 
         Ok(())
     }
@@ -119,7 +113,7 @@ pub struct AsyncTensorRedistributor {
     source: Layout,
     source_mmaps: Vec<Arc<Mmap>>,
     target: Layout,
-    target_mmaps: Vec<Arc<Mutex<MmapMut>>>,
+    target_mmaps: Vec<Arc<MmapMut>>,
 }
 
 impl AsyncTensorRedistributor {
@@ -173,7 +167,7 @@ impl AsyncTensorRedistributor {
                     .read(true)
                     .write(true)
                     .open(&filepath)?;
-                unsafe { Ok(Arc::new(Mutex::new(MmapMut::map_mut(&file)?))) }
+                unsafe { Ok(Arc::new(MmapMut::map_mut(&file)?)) }
             })
             .collect();
         let target_mmaps = target_mmaps?;
@@ -562,7 +556,7 @@ impl AsyncTensorRedistributor {
                     target_start,
                     length,
                 };
-                task.run().await?;
+                task.run()?;
                 Ok(length)
             }))
             .await
