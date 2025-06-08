@@ -8,17 +8,18 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::{JoinError, JoinHandle};
 
 // Memory-mapped task type for high performance file operations
 struct MmapWriteTask {
-    source_mmap: Arc<Mutex<Mmap>>,
+    source_mmap: Arc<Mmap>,
     source_start: u64,
     target_mmap: Arc<Mutex<MmapMut>>,
     target_start: u64,
@@ -27,8 +28,16 @@ struct MmapWriteTask {
 
 impl MmapWriteTask {
     async fn run(&self) -> Result<()> {
-        let source_guard = self.source_mmap.lock().await;
+        // let source_guard = self.source_mmap.lock().await;
+        // let mut target_guard = self.target_mmap.lock().await;
+        let lock_start = Instant::now();
+        let source_guard = &self.source_mmap;
         let mut target_guard = self.target_mmap.lock().await;
+        // let lock_time = lock_start.elapsed();
+
+        // if lock_time > Duration::from_millis(1) {
+        //     println!("Lock took: {:?}", lock_time);
+        // }
 
         let source_slice =
             &source_guard[self.source_start as usize..(self.source_start as usize + self.length)];
@@ -108,7 +117,7 @@ struct Layout {
 /// Async streaming tensor redistributor with parallel processing and pre-calculated offsets
 pub struct AsyncTensorRedistributor {
     source: Layout,
-    source_mmaps: Vec<Arc<Mutex<Mmap>>>,
+    source_mmaps: Vec<Arc<Mmap>>,
     target: Layout,
     target_mmaps: Vec<Arc<Mutex<MmapMut>>>,
 }
@@ -150,7 +159,7 @@ impl AsyncTensorRedistributor {
             .map(|filename| {
                 let filepath = source.dir.join(filename);
                 let file = std::fs::File::open(&filepath)?;
-                unsafe { Ok(Arc::new(Mutex::new(Mmap::map(&file)?))) }
+                unsafe { Ok(Arc::new(Mmap::map(&file)?)) }
             })
             .collect();
         let source_mmaps = source_mmaps?;
@@ -189,7 +198,7 @@ impl AsyncTensorRedistributor {
         // Estimate of the data needed to be copied.
         let mut total = 0;
         for mmap in self.source_mmaps.iter() {
-            let data = mmap.lock().await;
+            let data = mmap;
             total += data.len() as u64;
         }
 
@@ -211,11 +220,11 @@ impl AsyncTensorRedistributor {
         self.create_tasks(&tx).await?;
         drop(tx);
         handle.await?;
-        // Flush all target mmaps
-        for mmap in &self.target_mmaps {
-            let mmap_guard = mmap.lock().await;
-            mmap_guard.flush()?;
-        }
+        // // Flush all target mmaps
+        // for mmap in &self.target_mmaps {
+        //     let mmap_guard = mmap.lock().await;
+        //     mmap_guard.flush()?;
+        // }
         progress.finish();
         println!("Tasks done {:?}", start.elapsed());
 
