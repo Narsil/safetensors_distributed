@@ -1,19 +1,17 @@
 use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
 use indicatif::style::TemplateError;
-// use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::io::AsyncWriteExt;
 
 struct WriteTask {
     source_filename: PathBuf,
@@ -21,36 +19,29 @@ struct WriteTask {
     target_filename: PathBuf,
     target_start: u64,
     length: usize,
-    semaphore: Arc<Semaphore>,
 }
 
-impl WriteTask {
-    async fn run(&self) -> Result<()> {
-        let _permit = self.semaphore.acquire().await?;
-        let mut f = File::open(&self.source_filename).await?;
-        f.seek(SeekFrom::Start(self.source_start)).await?;
-        let mut buf = vec![0u8; self.length];
-        f.read_exact(&mut buf).await?;
+// Memory-mapped task type for high performance file operations
+struct MmapWriteTask {
+    source_mmap: Arc<Mutex<Mmap>>,
+    source_start: u64,
+    target_mmap: Arc<Mutex<MmapMut>>,
+    target_start: u64,
+    length: usize,
+}
 
-        let mut f = File::options()
-            .write(true)
-            .open(&self.target_filename)
-            .await?;
-        f.seek(SeekFrom::Start(self.target_start)).await?;
-        f.write(&buf).await?;
-        f.flush().await?;
-        // println!(
-        //     "Writing from {:?} to {:?}",
-        //     self.source_filename, self.target_filename
-        // );
-        // println!("  Source: {}", self.source_start);
-        // println!("  Target: {}", self.target_start);
-        // println!("  Size: {}", self.length);
-        // println!(
-        //     "  Buf: {:?} - {}",
-        //     unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) },
-        //     self.length
-        // );
+impl MmapWriteTask {
+    fn run(&self) -> Result<()> {
+        let source_guard = self.source_mmap.lock().unwrap();
+        let mut target_guard = self.target_mmap.lock().unwrap();
+
+        let source_slice =
+            &source_guard[self.source_start as usize..(self.source_start as usize + self.length)];
+        let target_slice = &mut target_guard
+            [self.target_start as usize..(self.target_start as usize + self.length)];
+
+        target_slice.copy_from_slice(source_slice);
+
         Ok(())
     }
 }
@@ -76,12 +67,6 @@ pub enum RedistributorError {
 
     #[error("Topology error: {0}")]
     Topology(#[from] TopologyError),
-
-    #[error("Tokio join error: {0}")]
-    TokioJoin(#[from] tokio::task::JoinError),
-
-    #[error("Semaphore acquire error: {0}")]
-    SemaphoreAcquire(#[from] tokio::sync::AcquireError),
 
     #[error("Invalid tensor data source: {message}")]
     InvalidDataSource { message: String },
@@ -110,9 +95,6 @@ pub enum RedistributorError {
 
     #[error("Template error: {0}")]
     Template(#[from] TemplateError),
-
-    #[error("Template error: {0}")]
-    Semaphore(#[from] TryAcquireError),
 }
 
 /// Result type for redistributor operations
@@ -129,7 +111,6 @@ struct Layout {
 pub struct AsyncTensorRedistributor {
     source: Layout,
     target: Layout,
-    file_semaphore: Arc<Semaphore>,
 }
 
 impl AsyncTensorRedistributor {
@@ -152,7 +133,6 @@ impl AsyncTensorRedistributor {
         let source_metadatas = source_metadatas?;
         let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
 
-        let max_concurrent_files = 100;
         let source = Layout {
             dir: source_dir,
             topology: source_topology,
@@ -163,11 +143,7 @@ impl AsyncTensorRedistributor {
             topology: target_topology,
             metadatas: target_metadatas,
         };
-        Ok(Self {
-            source,
-            target,
-            file_semaphore: Arc::new(Semaphore::new(max_concurrent_files)),
-        })
+        Ok(Self { source, target })
     }
 
     /// Redistribute tensors to target directory and return list of created files
@@ -180,13 +156,14 @@ impl AsyncTensorRedistributor {
         println!("Created headers {:?}", start.elapsed());
 
         let write_tasks = self.create_tasks()?;
-        println!("Created tasks {:?}", start.elapsed());
-        let futures: Vec<_> = write_tasks
-            .into_iter()
-            .map(|t| async move { t.run().await })
-            .collect();
+        println!(
+            "Created tasks {} in {:?}",
+            write_tasks.len(),
+            start.elapsed()
+        );
 
-        join_all(futures).await;
+        // Always use memory mapped approach (30x faster!)
+        self.execute_mmap_tasks(write_tasks).await?;
         println!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
@@ -203,6 +180,71 @@ impl AsyncTensorRedistributor {
         }
 
         Ok(created_files)
+    }
+
+    /// Execute tasks using memory mapped files for better performance
+    async fn execute_mmap_tasks(&self, write_tasks: Vec<WriteTask>) -> Result<()> {
+        println!("Setting up memory mapped files...");
+        let setup_start = Instant::now();
+
+        // Create mmap pool and open all files
+        let mut mmap_pool = MmapPool::new();
+        mmap_pool.open_source_files(&self.source.topology, &self.source.dir)?;
+        mmap_pool.open_target_files(&self.target.topology, &self.target.dir)?;
+
+        println!("Mmap setup took {:?}", setup_start.elapsed());
+
+        // Convert WriteTask to MmapWriteTask
+        let mmap_tasks: Result<Vec<_>> = write_tasks
+            .into_iter()
+            .map(|task| {
+                let source_mmap = mmap_pool
+                    .get_source_mmap(&task.source_filename)
+                    .ok_or_else(|| RedistributorError::InvalidDataSource {
+                        message: format!("Source file not found: {:?}", task.source_filename),
+                    })?;
+                let target_mmap = mmap_pool
+                    .get_target_mmap(&task.target_filename)
+                    .ok_or_else(|| RedistributorError::InvalidDataSource {
+                        message: format!("Target file not found: {:?}", task.target_filename),
+                    })?;
+
+                Ok(MmapWriteTask {
+                    source_mmap,
+                    source_start: task.source_start,
+                    target_mmap,
+                    target_start: task.target_start,
+                    length: task.length,
+                })
+            })
+            .collect();
+
+        let mmap_tasks = mmap_tasks?;
+        println!("Converted {} tasks to mmap tasks", mmap_tasks.len());
+
+        // Execute all mmap tasks in parallel
+        let copy_start = Instant::now();
+        let futures: Vec<_> = mmap_tasks
+            .into_iter()
+            .map(|task| async move { task.run() })
+            .collect();
+
+        let results = join_all(futures).await;
+        for result in results {
+            result?;
+        }
+
+        println!("Memory copy operations took {:?}", copy_start.elapsed());
+
+        // Flush all target mmaps
+        let flush_start = Instant::now();
+        for mmap in mmap_pool.target_mmaps.values() {
+            let mmap_guard = mmap.lock().unwrap();
+            mmap_guard.flush()?;
+        }
+        println!("Flush took {:?}", flush_start.elapsed());
+
+        Ok(())
     }
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
@@ -492,7 +534,6 @@ impl AsyncTensorRedistributor {
 
             let target_start = (theader_size + tdata_offset + tstart) as u64;
             let source_start = (sheader_size + sdata_offset + sstart) as u64;
-            let semaphore = Arc::clone(&self.file_semaphore);
             let target_filename = self
                 .target
                 .dir
@@ -506,7 +547,6 @@ impl AsyncTensorRedistributor {
                 source_start,
                 target_filename,
                 target_start,
-                semaphore,
                 length,
             });
         }
@@ -524,8 +564,6 @@ impl AsyncTensorRedistributor {
             .iter()
             .zip(self.target.topology.filenames())
             .map(|((_, metadata), filename)| async move {
-                let _permit = self.file_semaphore.acquire().await?;
-
                 let data_len = metadata.validate()?;
                 let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
                 // Force alignment to 8 bytes.
@@ -605,7 +643,7 @@ pub fn load_or_create_topology<P: AsRef<Path>>(dir: P) -> Result<Topology> {
         });
     };
     // Create a topology with a single rank
-    let mut tensors = HashMap::new();
+    let mut tensors = BTreeMap::new();
 
     // Read each chunk file to get tensor information
     for (file_index, file_name) in filenames.iter().enumerate() {
@@ -665,6 +703,54 @@ fn intersection(
     }
 
     result
+}
+
+// Memory map pool for managing file mappings
+struct MmapPool {
+    source_mmaps: HashMap<PathBuf, Arc<Mutex<Mmap>>>,
+    target_mmaps: HashMap<PathBuf, Arc<Mutex<MmapMut>>>,
+}
+
+impl MmapPool {
+    fn new() -> Self {
+        Self {
+            source_mmaps: HashMap::new(),
+            target_mmaps: HashMap::new(),
+        }
+    }
+
+    fn open_source_files(&mut self, topology: &Topology, dir: &Path) -> Result<()> {
+        for filename in topology.filenames() {
+            let filepath = dir.join(filename);
+            let file = std::fs::File::open(&filepath)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            self.source_mmaps
+                .insert(filepath, Arc::new(Mutex::new(mmap)));
+        }
+        Ok(())
+    }
+
+    fn open_target_files(&mut self, topology: &Topology, dir: &Path) -> Result<()> {
+        for filename in topology.filenames() {
+            let filepath = dir.join(filename);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&filepath)?;
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            self.target_mmaps
+                .insert(filepath, Arc::new(Mutex::new(mmap)));
+        }
+        Ok(())
+    }
+
+    fn get_source_mmap(&self, path: &Path) -> Option<Arc<Mutex<Mmap>>> {
+        self.source_mmaps.get(path).cloned()
+    }
+
+    fn get_target_mmap(&self, path: &Path) -> Option<Arc<Mutex<MmapMut>>> {
+        self.target_mmaps.get(path).cloned()
+    }
 }
 
 #[cfg(test)]

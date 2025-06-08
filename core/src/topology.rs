@@ -1,6 +1,6 @@
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::BTreeMap};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Tensor {
@@ -107,7 +107,7 @@ impl Chunk {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimpleTopo {
-    tensors: HashMap<String, Tensor>,
+    tensors: BTreeMap<String, Tensor>,
     filenames: Vec<String>,
     world_size: usize,
 }
@@ -115,7 +115,7 @@ pub struct SimpleTopo {
 impl SimpleTopo {
     /// Creates a new simple topology with the given tensors, filenames, and number of ranks
     pub fn new(
-        tensors: HashMap<String, Tensor>,
+        tensors: BTreeMap<String, Tensor>,
         filenames: Vec<String>,
         world_size: usize,
     ) -> Self {
@@ -130,7 +130,7 @@ impl SimpleTopo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SimpleTopo")]
 pub struct Topology {
-    tensors: HashMap<String, Tensor>,
+    tensors: BTreeMap<String, Tensor>,
     filenames: Vec<String>,
     world_size: usize,
 }
@@ -284,7 +284,7 @@ impl TryFrom<SimpleTopo> for Topology {
 }
 impl Topology {
     pub fn new(
-        tensors: HashMap<String, Tensor>,
+        tensors: BTreeMap<String, Tensor>,
         filenames: Vec<String>,
         world_size: usize,
     ) -> Result<Self, TopologyError> {
@@ -299,7 +299,7 @@ impl Topology {
     #[cfg(test)]
     fn empty(world_size: usize) -> Self {
         Self {
-            tensors: HashMap::new(),
+            tensors: BTreeMap::new(),
             filenames: vec![],
             world_size,
         }
@@ -311,7 +311,7 @@ impl Topology {
     }
 
     /// Returns an iterator over the tensor names and their corresponding tensors
-    pub fn tensors(&self) -> &HashMap<String, Tensor> {
+    pub fn tensors(&self) -> &BTreeMap<String, Tensor> {
         &self.tensors
     }
 

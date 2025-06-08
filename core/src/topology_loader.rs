@@ -433,7 +433,7 @@ mod tests {
     use super::*;
     use crate::topology::{Chunk, DistributedInfo, SimpleTopo, Tensor};
     use safetensors::Dtype;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use tokio::fs;
 
@@ -443,7 +443,7 @@ mod tests {
         let temp_dir = Arc::new(temp_dir);
 
         // Create a simple local topology
-        let mut local_tensors = HashMap::new();
+        let mut local_tensors = BTreeMap::new();
         let local_tensor = Tensor::Distributed(DistributedInfo::new(
             vec![4, 4],
             Dtype::F32,
@@ -458,7 +458,7 @@ mod tests {
         .unwrap();
 
         // Create a simple remote topology
-        let mut remote_tensors = HashMap::new();
+        let mut remote_tensors = BTreeMap::new();
         let remote_tensor = Tensor::Distributed(DistributedInfo::new(
             vec![4, 4],
             Dtype::F32,

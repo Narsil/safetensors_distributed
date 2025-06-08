@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
 use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Create a target topology for redistribution based on source topology and target world size
@@ -9,7 +9,7 @@ fn create_target_topology(
     source_topology: &Topology,
     target_world_size: usize,
 ) -> Result<Topology> {
-    let mut target_tensors = HashMap::new();
+    let mut target_tensors = BTreeMap::new();
 
     // Generate target filenames
     let target_filenames = if target_world_size == 1 {
