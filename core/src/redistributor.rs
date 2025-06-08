@@ -196,7 +196,7 @@ impl AsyncTensorRedistributor {
         let progress = ProgressBar::new(total);
         progress.set_style(
             ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .template("[{eta_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
                 .unwrap(),
         );
         let p = progress.clone();
