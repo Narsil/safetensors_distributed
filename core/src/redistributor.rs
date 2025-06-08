@@ -13,22 +13,25 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinError;
 
 // Memory-mapped task type for high performance file operations
 struct MmapWriteTask {
-    source_mmap: Arc<Mmap>,
-    source_start: u64,
+    // Target write info - single contiguous region
     target_mmap: Arc<MmapMut>,
     target_start: u64,
+    target_end: u64,
     target_file_index: usize,
-    length: usize,
+
+    // Source read info - multiple reads from potentially multiple files
+    source_mmaps: Vec<Arc<Mmap>>, // All source mmaps we need to read from
+    source_ranges: Vec<(u64, u64)>, // Flat list of (start, end) byte ranges
+    ranges_per_file: Vec<usize>,  // How many ranges belong to each source file
 }
 
 impl MmapWriteTask {
     fn run(&self) -> Result<()> {
-        let source_slice = &self.source_mmap
-            [self.source_start as usize..(self.source_start as usize + self.length)];
+        let target_length = (self.target_end - self.target_start) as usize;
 
         // SAFETY: This is safe because:
         // 1. All write ranges are pre-calculated and guaranteed non-overlapping
@@ -37,8 +40,34 @@ impl MmapWriteTask {
         // 4. The topology calculation ensures mutually exclusive write regions
         unsafe {
             let target_ptr = self.target_mmap.as_ptr().add(self.target_start as usize) as *mut u8;
-            let target_slice = std::slice::from_raw_parts_mut(target_ptr, self.length);
-            target_slice.copy_from_slice(source_slice);
+            let target_slice = std::slice::from_raw_parts_mut(target_ptr, target_length);
+
+            let mut target_offset = 0usize;
+            let mut range_idx = 0usize;
+
+            // Process each source file
+            for (file_idx, &num_ranges) in self.ranges_per_file.iter().enumerate() {
+                let source_mmap = &self.source_mmaps[file_idx];
+
+                // Process all ranges for this source file
+                for _ in 0..num_ranges {
+                    let (source_start, source_end) = self.source_ranges[range_idx];
+                    let range_length = (source_end - source_start) as usize;
+
+                    // Read from source
+                    let source_slice = &source_mmap[source_start as usize..source_end as usize];
+
+                    // Write to target at current offset
+                    target_slice[target_offset..target_offset + range_length]
+                        .copy_from_slice(source_slice);
+
+                    target_offset += range_length;
+                    range_idx += 1;
+                }
+            }
+
+            // Sanity check: we should have written exactly the target length
+            debug_assert_eq!(target_offset, target_length);
         }
 
         Ok(())
@@ -222,19 +251,19 @@ impl AsyncTensorRedistributor {
         let p = progress.clone();
         let handle = tokio::spawn(async move {
             let mut batch = Vec::with_capacity(1024);
-            
+
             loop {
                 let received = rx.recv_many(&mut batch, 1024).await;
                 if received == 0 {
                     break; // Channel closed
                 }
-                
+
                 // Sort by target file index, then by target offset for sequential I/O
                 batch.sort_by_key(|task| (task.target_file_index, task.target_start));
-                
+
                 // Execute batch in sorted order
                 for task in batch.drain(..) {
-                    let length = task.length;
+                    let length = (task.target_end - task.target_start) as usize;
                     if let Err(e) = task.run() {
                         eprintln!("Write task failed: {}", e);
                         // Continue with other tasks rather than failing completely
@@ -331,263 +360,311 @@ impl AsyncTensorRedistributor {
     }
 
     async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
-        // let mut tasks = vec![];
-        for (name, source_tensor) in self.source.topology.tensors() {
-            // for (name, target_tensor) in self.target.topology.tensors() {
-            let target_tensor = self
-                .target
-                .topology
-                .tensors()
-                .get(name)
-                .expect("Both topology should contain the same tensors");
-            // let source_tensor = self
-            //     .source
-            //     .topology
-            //     .tensors()
-            //     .get(name)
-            //     .expect("Both topology should contain the same tensors");
+        // Process each target file in order
+        for (target_file_index, _filename) in self.target.topology.filenames().iter().enumerate() {
+            // Get the metadata for this target file
+            let (header_size, metadata) = &self.target.metadatas[target_file_index];
 
-            match (source_tensor, target_tensor) {
-                (Tensor::Distributed(sinfo), Tensor::Distributed(tinfo)) => {
-                    assert_eq!(sinfo.shape(), tinfo.shape());
-                    assert_eq!(sinfo.dtype(), tinfo.dtype());
-                    let dtype_size = sinfo.dtype().size();
-                    let ndim = sinfo.shape().len();
-                    let full_shape = sinfo.shape();
-                    let mut full_strides = vec![1; ndim];
-                    for i in (0..ndim - 1).rev() {
-                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-                    }
-                    for schunk in sinfo.chunks() {
-                        for tchunk in tinfo.chunks() {
-                            let source_intervals = get_intervals(schunk, &full_strides, full_shape);
-                            let target_intervals = get_intervals(tchunk, &full_strides, full_shape);
-                            let sindex = schunk.filename_index();
-                            let tindex = tchunk.filename_index();
-                            let sheader_size = self.source.metadatas[tindex].0;
-                            let theader_size = self.target.metadatas[tindex].0;
-                            let sdata_offset = self.source.metadatas[tindex]
-                                .1
-                                .tensors()
-                                .get(name)
-                                .expect("Tensor missing from metadata")
-                                .data_offsets
-                                .0;
-                            let tdata_offset = self.target.metadatas[tindex]
-                                .1
-                                .tensors()
-                                .get(name)
-                                .expect("Tensor missing from metadata")
-                                .data_offsets
-                                .0;
-                            self.tasks_from_interval(
-                                &source_intervals,
-                                &target_intervals,
-                                sindex,
-                                tindex,
-                                sheader_size,
-                                theader_size,
-                                sdata_offset,
-                                tdata_offset,
-                                dtype_size,
-                                tx,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                (Tensor::Shared(sinfo), Tensor::Distributed(tinfo)) => {
-                    // In theory this shouldn't happen
-                    // But when we're copying over from a full
-                    // checkpoint, there is no difference
-                    // between Shared and Distributed with 1 chunk
-                    // So allowing shared here makes sense
-                    // so we don't have to know in advance
-                    // if a tensor is supposed to be shared or not
-                    // in the default created source topology
-                    // We instead rely on the user provided
-                    // target topology.
-                    assert_eq!(sinfo.shape(), tinfo.shape());
-                    assert_eq!(sinfo.dtype(), tinfo.dtype());
-                    let dtype_size = sinfo.dtype().size();
-                    let ndim = sinfo.shape().len();
-                    let full_shape = sinfo.shape();
-                    let mut full_strides = vec![1; ndim];
-                    for i in (0..ndim - 1).rev() {
-                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-                    }
-                    let n: usize = sinfo.shape().iter().product();
-                    let source_intervals = vec![(0, n)];
-                    let sindex = sinfo.filename_indices()[0];
-                    let sheader_size = self.source.metadatas[sindex].0;
-                    let sdata_offset = self.source.metadatas[sindex]
-                        .1
-                        .tensors()
-                        .get(name)
-                        .expect("Tensor missing from metadata")
-                        .data_offsets
-                        .0;
-                    for tchunk in tinfo.chunks() {
-                        let target_intervals = get_intervals(tchunk, &full_strides, full_shape);
-                        let tindex = tchunk.filename_index();
-                        let theader_size = self.target.metadatas[tindex].0;
-                        let tdata_offset = self.target.metadatas[tindex]
-                            .1
-                            .tensors()
-                            .get(name)
-                            .expect("Tensor missing from metadata")
-                            .data_offsets
-                            .0;
-                        self.tasks_from_interval(
-                            &source_intervals,
-                            &target_intervals,
-                            sindex,
-                            tindex,
-                            sheader_size,
-                            theader_size,
-                            sdata_offset,
-                            tdata_offset,
-                            dtype_size,
-                            tx,
-                        )
-                        .await;
-                    }
-                }
-                (Tensor::Shared(sinfo), Tensor::Shared(tinfo)) => {
-                    assert_eq!(sinfo.shape(), tinfo.shape());
-                    assert_eq!(sinfo.dtype(), tinfo.dtype());
-                    let dtype_size = sinfo.dtype().size();
-                    let ndim = sinfo.shape().len();
-                    let full_shape = sinfo.shape();
-                    let mut full_strides = vec![1; ndim];
-                    for i in (0..ndim - 1).rev() {
-                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-                    }
-                    let n: usize = sinfo.shape().iter().product();
-                    let source_intervals = vec![(0, n)];
-                    let sindex = sinfo.filename_indices()[0];
-                    let sheader_size = self.source.metadatas[sindex].0;
-                    let sdata_offset = self.source.metadatas[sindex]
-                        .1
-                        .tensors()
-                        .get(name)
-                        .expect("Tensor missing from metadata")
-                        .data_offsets
-                        .0;
-                    let target_intervals = vec![(0, n)];
-                    for &tindex in tinfo.filename_indices() {
-                        let theader_size = self.target.metadatas[tindex].0;
-                        let tdata_offset = self.target.metadatas[tindex]
-                            .1
-                            .tensors()
-                            .get(name)
-                            .expect("Tensor missing from metadata")
-                            .data_offsets
-                            .0;
-                        self.tasks_from_interval(
-                            &source_intervals,
-                            &target_intervals,
-                            sindex,
-                            tindex,
-                            sheader_size,
-                            theader_size,
-                            sdata_offset,
-                            tdata_offset,
-                            dtype_size,
-                            tx,
-                        )
-                        .await;
-                    }
-                }
-                (Tensor::Distributed(sinfo), Tensor::Shared(tinfo)) => {
-                    assert_eq!(sinfo.shape(), tinfo.shape());
-                    assert_eq!(sinfo.dtype(), tinfo.dtype());
-                    let dtype_size = sinfo.dtype().size();
-                    let ndim = sinfo.shape().len();
-                    let full_shape = sinfo.shape();
-                    let mut full_strides = vec![1; ndim];
-                    for i in (0..ndim - 1).rev() {
-                        full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-                    }
-                    let n: usize = sinfo.shape().iter().product();
+            // Collect tensors and sort by data offset for sequential writes
+            let tensors = metadata.tensors();
+            let mut tensor_entries: Vec<(&String, &TensorInfo)> =
+                tensors.iter().map(|(k, v)| (k, *v)).collect();
+            tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
-                    let target_intervals = vec![(0, n)];
-                    for &tindex in tinfo.filename_indices() {
-                        let theader_size = self.target.metadatas[tindex].0;
-                        let tdata_offset = self.target.metadatas[tindex]
-                            .1
-                            .tensors()
-                            .get(name)
-                            .expect("Tensor missing from metadata")
-                            .data_offsets
-                            .0;
-                        for schunk in sinfo.chunks() {
-                            let source_intervals = get_intervals(schunk, &full_strides, full_shape);
-                            let sindex = schunk.filename_index();
-                            let sheader_size = self.source.metadatas[sindex].0;
-                            let sdata_offset = self.source.metadatas[sindex]
-                                .1
-                                .tensors()
-                                .get(name)
-                                .expect("Tensor missing from metadata")
-                                .data_offsets
-                                .0;
-                            self.tasks_from_interval(
-                                &source_intervals,
-                                &target_intervals,
-                                sindex,
-                                tindex,
-                                sheader_size,
-                                theader_size,
-                                sdata_offset,
-                                tdata_offset,
-                                dtype_size,
-                                tx,
-                            )
-                            .await;
-                        }
-                    }
-                }
+            // Process each tensor in write order
+            for (tensor_name, tensor_info) in tensor_entries {
+                self.create_task_for_tensor(
+                    tx,
+                    target_file_index,
+                    *header_size,
+                    tensor_name,
+                    tensor_info,
+                )
+                .await?;
             }
         }
         Ok(())
     }
 
-    async fn tasks_from_interval(
+    async fn create_task_for_tensor(
         &self,
-        source_intervals: &[(usize, usize)],
-        target_intervals: &[(usize, usize)],
-        sindex: usize,
-        tindex: usize,
-        sheader_size: usize,
-        theader_size: usize,
-        sdata_offset: usize,
-        tdata_offset: usize,
-        dtype_size: usize,
         tx: &Sender<MmapWriteTask>,
-    ) {
-        for (sstart, tstart, length) in intersection(&source_intervals, &target_intervals) {
-            // Convert from offset to bytes
-            let sstart = sstart * dtype_size;
-            let tstart = tstart * dtype_size;
-            let length = length * dtype_size;
+        target_file_index: usize,
+        target_header_size: usize,
+        tensor_name: &str,
+        target_tensor_info: &TensorInfo,
+    ) -> Result<()> {
+        // Look up the tensor in source topology
+        let source_tensor = self
+            .source
+            .topology
+            .tensors()
+            .get(tensor_name)
+            .ok_or_else(|| RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            })?;
 
-            let target_start = (theader_size + tdata_offset + tstart) as u64;
-            let source_start = (sheader_size + sdata_offset + sstart) as u64;
-            let target_mmap = Arc::clone(&self.target_mmaps.as_ref().unwrap()[tindex]);
-            let source_mmap = Arc::clone(&self.source_mmaps[sindex]);
-            
+        let target_tensor = self
+            .target
+            .topology
+            .tensors()
+            .get(tensor_name)
+            .ok_or_else(|| RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            })?;
+
+        // Get target write parameters
+        let target_mmap = Arc::clone(&self.target_mmaps.as_ref().unwrap()[target_file_index]);
+        let target_start = (target_header_size + target_tensor_info.data_offsets.0) as u64;
+        let target_end = (target_header_size + target_tensor_info.data_offsets.1) as u64;
+
+        // Collect source reads needed to fulfill this target write
+        let mut source_mmaps = Vec::new();
+        let mut source_ranges = Vec::new();
+        let mut ranges_per_file = Vec::new();
+
+        match (source_tensor, target_tensor) {
+            (Tensor::Distributed(source_info), Tensor::Distributed(target_info)) => {
+                self.collect_reads_distributed_to_distributed(
+                    tensor_name,
+                    source_info,
+                    target_info,
+                    target_file_index,
+                    &mut source_mmaps,
+                    &mut source_ranges,
+                    &mut ranges_per_file,
+                )?;
+            }
+            (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
+                self.collect_reads_shared_to_distributed(
+                    tensor_name,
+                    source_info,
+                    target_info,
+                    target_file_index,
+                    &mut source_mmaps,
+                    &mut source_ranges,
+                    &mut ranges_per_file,
+                )?;
+            }
+            (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
+                self.collect_reads_shared_to_shared(
+                    tensor_name,
+                    source_info,
+                    target_info,
+                    target_file_index,
+                    &mut source_mmaps,
+                    &mut source_ranges,
+                    &mut ranges_per_file,
+                )?;
+            }
+            (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
+                self.collect_reads_distributed_to_shared(
+                    tensor_name,
+                    source_info,
+                    target_info,
+                    target_file_index,
+                    &mut source_mmaps,
+                    &mut source_ranges,
+                    &mut ranges_per_file,
+                )?;
+            }
+        }
+
+        // Create and send the task if we have any reads to do
+        if !source_ranges.is_empty() {
             let task = MmapWriteTask {
-                source_mmap,
-                source_start,
                 target_mmap,
                 target_start,
-                target_file_index: tindex,
-                length,
+                target_end,
+                target_file_index,
+                source_mmaps,
+                source_ranges,
+                ranges_per_file,
             };
-            
+
             tx.send(task).await.unwrap();
         }
+
+        Ok(())
+    }
+
+    fn collect_reads_distributed_to_distributed(
+        &self,
+        tensor_name: &str,
+        source_info: &crate::topology::DistributedInfo,
+        target_info: &crate::topology::DistributedInfo,
+        target_file_index: usize,
+        source_mmaps: &mut Vec<Arc<Mmap>>,
+        source_ranges: &mut Vec<(u64, u64)>,
+        ranges_per_file: &mut Vec<usize>,
+    ) -> Result<()> {
+        // Find the target chunk that belongs to this target file
+        let target_chunk = target_info
+            .chunks()
+            .iter()
+            .find(|chunk| chunk.filename_index() == target_file_index)
+            .ok_or_else(|| RedistributorError::InvalidDataSource {
+                message: format!(
+                    "No chunk found for target file {} in tensor {}",
+                    target_file_index, tensor_name
+                ),
+            })?;
+
+        // Get tensor properties
+        let full_shape = source_info.shape();
+        let dtype_size = source_info.dtype().size();
+        
+        // Calculate strides for the full tensor
+        let ndim = full_shape.len();
+        let mut full_strides = vec![1; ndim];
+        for i in (0..ndim - 1).rev() {
+            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+        }
+
+        // Get the intervals (element ranges) for this target chunk
+        let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
+
+        // Process each source chunk to see if it overlaps with our target
+        for source_chunk in source_info.chunks() {
+            let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
+            
+            // Find intersection between source and target intervals
+            let intersections = intersection(&source_intervals, &target_intervals);
+            
+            if !intersections.is_empty() {
+                let source_file_index = source_chunk.filename_index();
+                
+                // Get source file metadata to calculate byte offsets
+                let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+                let source_tensors = source_metadata.tensors();
+                let source_tensor_info = source_tensors
+                    .get(tensor_name)
+                    .ok_or_else(|| RedistributorError::TensorNotFound {
+                        name: tensor_name.to_string(),
+                    })?;
+                let source_data_offset = source_tensor_info.data_offsets.0;
+
+                // Convert intersection results to byte ranges
+                let mut ranges_for_this_file = 0;
+                for (source_offset, _target_offset, length) in intersections {
+                    let start_bytes = source_offset * dtype_size;
+                    let end_bytes = (source_offset + length) * dtype_size;
+                    
+                    let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
+                    let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
+                    
+                    source_ranges.push((source_start, source_end));
+                    ranges_for_this_file += 1;
+                }
+
+                // Add the source mmap and record how many ranges belong to this file
+                if ranges_for_this_file > 0 {
+                    source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+                    ranges_per_file.push(ranges_for_this_file);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_reads_shared_to_distributed(
+        &self,
+        tensor_name: &str,
+        source_info: &crate::topology::SharedInfo,
+        target_info: &crate::topology::DistributedInfo,
+        target_file_index: usize,
+        source_mmaps: &mut Vec<Arc<Mmap>>,
+        source_ranges: &mut Vec<(u64, u64)>,
+        ranges_per_file: &mut Vec<usize>,
+    ) -> Result<()> {
+        // Find the target chunk that belongs to this target file
+        let target_chunk = target_info
+            .chunks()
+            .iter()
+            .find(|chunk| chunk.filename_index() == target_file_index)
+            .ok_or_else(|| RedistributorError::InvalidDataSource {
+                message: format!(
+                    "No chunk found for target file {} in tensor {}",
+                    target_file_index, tensor_name
+                ),
+            })?;
+
+        // Get tensor properties
+        let full_shape = source_info.shape();
+        let dtype_size = source_info.dtype().size();
+        
+        // Calculate strides for the full tensor
+        let ndim = full_shape.len();
+        let mut full_strides = vec![1; ndim];
+        for i in (0..ndim - 1).rev() {
+            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+        }
+
+        // Get the intervals (element ranges) for this target chunk
+        let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
+
+        // Pick the first source file that contains this tensor (they're all identical for shared tensors)
+        let source_file_index = source_info.filename_indices()[0];
+        
+        // Get source file metadata to calculate byte offsets
+        let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+        let source_tensors = source_metadata.tensors();
+        let source_tensor_info = source_tensors
+            .get(tensor_name)
+            .ok_or_else(|| RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            })?;
+        let source_data_offset = source_tensor_info.data_offsets.0;
+
+        // Convert element intervals to byte ranges
+        let mut ranges_for_this_file = 0;
+        for (start_elem, end_elem) in target_intervals {
+            let start_bytes = start_elem * dtype_size;
+            let end_bytes = end_elem * dtype_size;
+            
+            let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
+            let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
+            
+            source_ranges.push((source_start, source_end));
+            ranges_for_this_file += 1;
+        }
+
+        // Add the source mmap and record how many ranges belong to this file
+        if ranges_for_this_file > 0 {
+            source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+            ranges_per_file.push(ranges_for_this_file);
+        }
+
+        Ok(())
+    }
+
+    fn collect_reads_shared_to_shared(
+        &self,
+        _tensor_name: &str,
+        _source_info: &crate::topology::SharedInfo,
+        _target_info: &crate::topology::SharedInfo,
+        _target_file_index: usize,
+        _source_mmaps: &mut Vec<Arc<Mmap>>,
+        _source_ranges: &mut Vec<(u64, u64)>,
+        _ranges_per_file: &mut Vec<usize>,
+    ) -> Result<()> {
+        // TODO: Implement shared -> shared reading
+        Ok(())
+    }
+
+    fn collect_reads_distributed_to_shared(
+        &self,
+        _tensor_name: &str,
+        _source_info: &crate::topology::DistributedInfo,
+        _target_info: &crate::topology::SharedInfo,
+        _target_file_index: usize,
+        _source_mmaps: &mut Vec<Arc<Mmap>>,
+        _source_ranges: &mut Vec<(u64, u64)>,
+        _ranges_per_file: &mut Vec<usize>,
+    ) -> Result<()> {
+        // TODO: Implement distributed -> shared reading
+        Ok(())
     }
 
     /// Create all files with headers
