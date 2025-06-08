@@ -1,6 +1,6 @@
 use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
-use indicatif::style::TemplateError;
+use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
 use memmap2::{Mmap, MmapMut};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
@@ -195,6 +195,7 @@ impl AsyncTensorRedistributor {
         println!("Mmap setup took {:?}", setup_start.elapsed());
 
         // Convert WriteTask to MmapWriteTask
+        let mut total = 0;
         let mmap_tasks: Result<Vec<_>> = write_tasks
             .into_iter()
             .map(|task| {
@@ -208,6 +209,7 @@ impl AsyncTensorRedistributor {
                     .ok_or_else(|| RedistributorError::InvalidDataSource {
                         message: format!("Target file not found: {:?}", task.target_filename),
                     })?;
+                total += task.length;
 
                 Ok(MmapWriteTask {
                     source_mmap,
@@ -223,16 +225,29 @@ impl AsyncTensorRedistributor {
         println!("Converted {} tasks to mmap tasks", mmap_tasks.len());
 
         // Execute all mmap tasks in parallel
+        let progress = ProgressBar::new(total as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .unwrap(),
+        );
         let copy_start = Instant::now();
         let futures: Vec<_> = mmap_tasks
             .into_iter()
-            .map(|task| async move { task.run() })
+            .map(|task| {
+                let p = progress.clone();
+                async move {
+                    p.inc(task.length as u64);
+                    task.run()
+                }
+            })
             .collect();
 
         let results = join_all(futures).await;
         for result in results {
             result?;
         }
+        progress.finish();
 
         println!("Memory copy operations took {:?}", copy_start.elapsed());
 
