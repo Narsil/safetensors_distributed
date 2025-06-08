@@ -7,19 +7,14 @@ use safetensors::tensor::{Metadata, TensorInfo};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-
-struct WriteTask {
-    source_filename: PathBuf,
-    source_start: u64,
-    target_filename: PathBuf,
-    target_start: u64,
-    length: usize,
-}
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Sender, channel};
+use tokio::task::{JoinError, JoinHandle};
 
 // Memory-mapped task type for high performance file operations
 struct MmapWriteTask {
@@ -31,9 +26,9 @@ struct MmapWriteTask {
 }
 
 impl MmapWriteTask {
-    fn run(&self) -> Result<()> {
-        let source_guard = self.source_mmap.lock().unwrap();
-        let mut target_guard = self.target_mmap.lock().unwrap();
+    async fn run(&self) -> Result<()> {
+        let source_guard = self.source_mmap.lock().await;
+        let mut target_guard = self.target_mmap.lock().await;
 
         let source_slice =
             &source_guard[self.source_start as usize..(self.source_start as usize + self.length)];
@@ -95,6 +90,9 @@ pub enum RedistributorError {
 
     #[error("Template error: {0}")]
     Template(#[from] TemplateError),
+
+    #[error("Join error: {0}")]
+    Join(#[from] JoinError),
 }
 
 /// Result type for redistributor operations
@@ -110,7 +108,9 @@ struct Layout {
 /// Async streaming tensor redistributor with parallel processing and pre-calculated offsets
 pub struct AsyncTensorRedistributor {
     source: Layout,
+    source_mmaps: Vec<Arc<Mutex<Mmap>>>,
     target: Layout,
+    target_mmaps: Vec<Arc<Mutex<MmapMut>>>,
 }
 
 impl AsyncTensorRedistributor {
@@ -143,7 +143,37 @@ impl AsyncTensorRedistributor {
             topology: target_topology,
             metadatas: target_metadatas,
         };
-        Ok(Self { source, target })
+        let source_mmaps: Result<Vec<_>> = source
+            .topology
+            .filenames()
+            .iter()
+            .map(|filename| {
+                let filepath = source.dir.join(filename);
+                let file = std::fs::File::open(&filepath)?;
+                unsafe { Ok(Arc::new(Mutex::new(Mmap::map(&file)?))) }
+            })
+            .collect();
+        let source_mmaps = source_mmaps?;
+        let target_mmaps: Result<Vec<_>> = target
+            .topology
+            .filenames()
+            .iter()
+            .map(|filename| {
+                let filepath = target.dir.join(filename);
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&filepath)?;
+                unsafe { Ok(Arc::new(Mutex::new(MmapMut::map_mut(&file)?))) }
+            })
+            .collect();
+        let target_mmaps = target_mmaps?;
+        Ok(Self {
+            source,
+            source_mmaps,
+            target,
+            target_mmaps,
+        })
     }
 
     /// Redistribute tensors to target directory and return list of created files
@@ -155,15 +185,40 @@ impl AsyncTensorRedistributor {
         self.create_files_with_headers().await?;
         println!("Created headers {:?}", start.elapsed());
 
-        let write_tasks = self.create_tasks()?;
+        let (tx, mut rx) = channel::<JoinHandle<Result<usize>>>(10_000);
+        // Estimate of the data needed to be copied.
+        let mut total = 0;
+        for mmap in self.source_mmaps.iter() {
+            let data = mmap.lock().await;
+            total += data.len() as u64;
+        }
+
+        let progress = ProgressBar::new(total);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .unwrap(),
+        );
+        let p = progress.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(task_handle) = rx.recv().await {
+                // TODO unwrap
+                let length = task_handle.await.unwrap().unwrap();
+                p.inc(length as u64)
+            }
+        });
+
+        self.create_tasks(&tx).await?;
+        drop(tx);
+        handle.await?;
+        progress.finish();
         println!(
-            "Created tasks {} in {:?}",
-            write_tasks.len(),
+            "Created tasks in {:?}",
+            // write_tasks.len(),
             start.elapsed()
         );
 
-        // Always use memory mapped approach (30x faster!)
-        self.execute_mmap_tasks(write_tasks).await?;
+        // self.execute_mmap_tasks(write_tasks).await?;
         println!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
@@ -180,86 +235,6 @@ impl AsyncTensorRedistributor {
         }
 
         Ok(created_files)
-    }
-
-    /// Execute tasks using memory mapped files for better performance
-    async fn execute_mmap_tasks(&self, write_tasks: Vec<WriteTask>) -> Result<()> {
-        println!("Setting up memory mapped files...");
-        let setup_start = Instant::now();
-
-        // Create mmap pool and open all files
-        let mut mmap_pool = MmapPool::new();
-        mmap_pool.open_source_files(&self.source.topology, &self.source.dir)?;
-        mmap_pool.open_target_files(&self.target.topology, &self.target.dir)?;
-
-        println!("Mmap setup took {:?}", setup_start.elapsed());
-
-        // Convert WriteTask to MmapWriteTask
-        let mut total = 0;
-        let mmap_tasks: Result<Vec<_>> = write_tasks
-            .into_iter()
-            .map(|task| {
-                let source_mmap = mmap_pool
-                    .get_source_mmap(&task.source_filename)
-                    .ok_or_else(|| RedistributorError::InvalidDataSource {
-                        message: format!("Source file not found: {:?}", task.source_filename),
-                    })?;
-                let target_mmap = mmap_pool
-                    .get_target_mmap(&task.target_filename)
-                    .ok_or_else(|| RedistributorError::InvalidDataSource {
-                        message: format!("Target file not found: {:?}", task.target_filename),
-                    })?;
-                total += task.length;
-
-                Ok(MmapWriteTask {
-                    source_mmap,
-                    source_start: task.source_start,
-                    target_mmap,
-                    target_start: task.target_start,
-                    length: task.length,
-                })
-            })
-            .collect();
-
-        let mmap_tasks = mmap_tasks?;
-        println!("Converted {} tasks to mmap tasks", mmap_tasks.len());
-
-        // Execute all mmap tasks in parallel
-        let progress = ProgressBar::new(total as u64);
-        progress.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
-                .unwrap(),
-        );
-        let copy_start = Instant::now();
-        let futures: Vec<_> = mmap_tasks
-            .into_iter()
-            .map(|task| {
-                let p = progress.clone();
-                async move {
-                    p.inc(task.length as u64);
-                    task.run()
-                }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
-        for result in results {
-            result?;
-        }
-        progress.finish();
-
-        println!("Memory copy operations took {:?}", copy_start.elapsed());
-
-        // Flush all target mmaps
-        let flush_start = Instant::now();
-        for mmap in mmap_pool.target_mmaps.values() {
-            let mmap_guard = mmap.lock().unwrap();
-            mmap_guard.flush()?;
-        }
-        println!("Flush took {:?}", flush_start.elapsed());
-
-        Ok(())
     }
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
@@ -326,8 +301,8 @@ impl AsyncTensorRedistributor {
         Ok(metadatas)
     }
 
-    fn create_tasks(&self) -> Result<Vec<WriteTask>> {
-        let mut tasks = vec![];
+    async fn create_tasks(&self, tx: &Sender<JoinHandle<Result<usize>>>) -> Result<()> {
+        // let mut tasks = vec![];
         for (name, target_tensor) in self.target.topology.tensors() {
             let source_tensor = self
                 .source
@@ -379,12 +354,23 @@ impl AsyncTensorRedistributor {
                                 sdata_offset,
                                 tdata_offset,
                                 dtype_size,
-                                &mut tasks,
-                            );
+                                tx,
+                            )
+                            .await;
                         }
                     }
                 }
                 (Tensor::Shared(sinfo), Tensor::Distributed(tinfo)) => {
+                    // In theory this shouldn't happen
+                    // But when we're copying over from a full
+                    // checkpoint, there is no difference
+                    // between Shared and Distributed with 1 chunk
+                    // So allowing shared here makes sense
+                    // so we don't have to know in advance
+                    // if a tensor is supposed to be shared or not
+                    // in the default created source topology
+                    // We instead rely on the user provided
+                    // target topology.
                     assert_eq!(sinfo.shape(), tinfo.shape());
                     assert_eq!(sinfo.dtype(), tinfo.dtype());
                     let dtype_size = sinfo.dtype().size();
@@ -426,8 +412,9 @@ impl AsyncTensorRedistributor {
                             sdata_offset,
                             tdata_offset,
                             dtype_size,
-                            &mut tasks,
-                        );
+                            tx,
+                        )
+                        .await;
                     }
                 }
                 (Tensor::Shared(sinfo), Tensor::Shared(tinfo)) => {
@@ -471,8 +458,9 @@ impl AsyncTensorRedistributor {
                             sdata_offset,
                             tdata_offset,
                             dtype_size,
-                            &mut tasks,
-                        );
+                            tx,
+                        )
+                        .await;
                     }
                 }
                 (Tensor::Distributed(sinfo), Tensor::Shared(tinfo)) => {
@@ -518,17 +506,18 @@ impl AsyncTensorRedistributor {
                                 sdata_offset,
                                 tdata_offset,
                                 dtype_size,
-                                &mut tasks,
-                            );
+                                tx,
+                            )
+                            .await;
                         }
                     }
                 }
             }
         }
-        Ok(tasks)
+        Ok(())
     }
 
-    fn tasks_from_interval(
+    async fn tasks_from_interval(
         &self,
         source_intervals: &[(usize, usize)],
         target_intervals: &[(usize, usize)],
@@ -539,7 +528,7 @@ impl AsyncTensorRedistributor {
         sdata_offset: usize,
         tdata_offset: usize,
         dtype_size: usize,
-        tasks: &mut Vec<WriteTask>,
+        tx: &Sender<JoinHandle<Result<usize>>>,
     ) {
         for (sstart, tstart, length) in intersection(&source_intervals, &target_intervals) {
             // Convert from offset to bytes
@@ -549,21 +538,21 @@ impl AsyncTensorRedistributor {
 
             let target_start = (theader_size + tdata_offset + tstart) as u64;
             let source_start = (sheader_size + sdata_offset + sstart) as u64;
-            let target_filename = self
-                .target
-                .dir
-                .join(&self.target.topology.filenames()[tindex]);
-            let source_filename = self
-                .source
-                .dir
-                .join(&self.source.topology.filenames()[sindex]);
-            tasks.push(WriteTask {
-                source_filename,
-                source_start,
-                target_filename,
-                target_start,
-                length,
-            });
+            let target_mmap = Arc::clone(&self.target_mmaps[tindex]);
+            let source_mmap = Arc::clone(&self.source_mmaps[sindex]);
+            tx.send(tokio::spawn(async move {
+                let task = MmapWriteTask {
+                    source_mmap,
+                    source_start,
+                    target_mmap,
+                    target_start,
+                    length,
+                };
+                task.run().await?;
+                Ok(length)
+            }))
+            .await
+            .unwrap();
         }
     }
 
@@ -596,7 +585,6 @@ impl AsyncTensorRedistributor {
                 f.write_all(&metadata_buf).await?;
                 let total = data_len + metadata_buf.len() + 8;
                 f.set_len(total as u64).await?;
-                // println!("File {filename:?} should have size {total}");
                 f.flush().await?;
 
                 Ok(())
@@ -718,54 +706,6 @@ fn intersection(
     }
 
     result
-}
-
-// Memory map pool for managing file mappings
-struct MmapPool {
-    source_mmaps: HashMap<PathBuf, Arc<Mutex<Mmap>>>,
-    target_mmaps: HashMap<PathBuf, Arc<Mutex<MmapMut>>>,
-}
-
-impl MmapPool {
-    fn new() -> Self {
-        Self {
-            source_mmaps: HashMap::new(),
-            target_mmaps: HashMap::new(),
-        }
-    }
-
-    fn open_source_files(&mut self, topology: &Topology, dir: &Path) -> Result<()> {
-        for filename in topology.filenames() {
-            let filepath = dir.join(filename);
-            let file = std::fs::File::open(&filepath)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            self.source_mmaps
-                .insert(filepath, Arc::new(Mutex::new(mmap)));
-        }
-        Ok(())
-    }
-
-    fn open_target_files(&mut self, topology: &Topology, dir: &Path) -> Result<()> {
-        for filename in topology.filenames() {
-            let filepath = dir.join(filename);
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&filepath)?;
-            let mmap = unsafe { MmapMut::map_mut(&file)? };
-            self.target_mmaps
-                .insert(filepath, Arc::new(Mutex::new(mmap)));
-        }
-        Ok(())
-    }
-
-    fn get_source_mmap(&self, path: &Path) -> Option<Arc<Mutex<Mmap>>> {
-        self.source_mmaps.get(path).cloned()
-    }
-
-    fn get_target_mmap(&self, path: &Path) -> Option<Arc<Mutex<MmapMut>>> {
-        self.target_mmaps.get(path).cloned()
-    }
 }
 
 #[cfg(test)]
