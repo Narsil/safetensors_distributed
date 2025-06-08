@@ -301,13 +301,20 @@ impl AsyncTensorRedistributor {
 
     async fn create_tasks(&self, tx: &Sender<JoinHandle<Result<usize>>>) -> Result<()> {
         // let mut tasks = vec![];
-        for (name, target_tensor) in self.target.topology.tensors() {
-            let source_tensor = self
-                .source
+        for (name, source_tensor) in self.source.topology.tensors() {
+            // for (name, target_tensor) in self.target.topology.tensors() {
+            let target_tensor = self
+                .target
                 .topology
                 .tensors()
                 .get(name)
                 .expect("Both topology should contain the same tensors");
+            // let source_tensor = self
+            //     .source
+            //     .topology
+            //     .tensors()
+            //     .get(name)
+            //     .expect("Both topology should contain the same tensors");
 
             match (source_tensor, target_tensor) {
                 (Tensor::Distributed(sinfo), Tensor::Distributed(tinfo)) => {
