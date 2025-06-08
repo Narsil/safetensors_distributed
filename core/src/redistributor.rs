@@ -211,14 +211,12 @@ impl AsyncTensorRedistributor {
         self.create_tasks(&tx).await?;
         drop(tx);
         handle.await?;
+        // Flush all target mmaps
+        for mmap in &self.target_mmaps {
+            let mmap_guard = mmap.lock().await;
+            mmap_guard.flush()?;
+        }
         progress.finish();
-        println!(
-            "Created tasks in {:?}",
-            // write_tasks.len(),
-            start.elapsed()
-        );
-
-        // self.execute_mmap_tasks(write_tasks).await?;
         println!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
