@@ -433,7 +433,7 @@ mod tests {
     use super::*;
     use crate::topology::{Chunk, DistributedInfo, SimpleTopo, Tensor};
     use safetensors::Dtype;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::fs;
 

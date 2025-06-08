@@ -113,7 +113,7 @@ pub struct AsyncTensorRedistributor {
     source: Layout,
     source_mmaps: Vec<Arc<Mmap>>,
     target: Layout,
-    target_mmaps: Vec<Arc<MmapMut>>,
+    target_mmaps: Option<Vec<Arc<MmapMut>>>,
 }
 
 impl AsyncTensorRedistributor {
@@ -157,12 +157,29 @@ impl AsyncTensorRedistributor {
             })
             .collect();
         let source_mmaps = source_mmaps?;
-        let target_mmaps: Result<Vec<_>> = target
+
+        // Don't open target files yet - they might not exist
+        Ok(Self {
+            source,
+            source_mmaps,
+            target,
+            target_mmaps: None,
+        })
+    }
+
+    /// Initialize target memory maps after files have been created
+    fn init_target_mmaps(&mut self) -> Result<()> {
+        if self.target_mmaps.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let target_mmaps: Result<Vec<_>> = self
+            .target
             .topology
             .filenames()
             .iter()
             .map(|filename| {
-                let filepath = target.dir.join(filename);
+                let filepath = self.target.dir.join(filename);
                 let file = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -170,23 +187,22 @@ impl AsyncTensorRedistributor {
                 unsafe { Ok(Arc::new(MmapMut::map_mut(&file)?)) }
             })
             .collect();
-        let target_mmaps = target_mmaps?;
-        Ok(Self {
-            source,
-            source_mmaps,
-            target,
-            target_mmaps,
-        })
+
+        self.target_mmaps = Some(target_mmaps?);
+        Ok(())
     }
 
     /// Redistribute tensors to target directory and return list of created files
-    pub async fn redistribute(&self) -> Result<Vec<String>> {
+    pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         println!("Start");
         let start = Instant::now();
         tokio::fs::create_dir_all(&self.target.dir).await?;
 
         self.create_files_with_headers().await?;
         println!("Created headers {:?}", start.elapsed());
+
+        // Initialize target memory maps now that files exist
+        self.init_target_mmaps()?;
 
         let (tx, mut rx) = channel::<JoinHandle<Result<usize>>>(10_000);
         // Estimate of the data needed to be copied.
@@ -214,11 +230,6 @@ impl AsyncTensorRedistributor {
         self.create_tasks(&tx).await?;
         drop(tx);
         handle.await?;
-        // // Flush all target mmaps
-        // for mmap in &self.target_mmaps {
-        //     let mmap_guard = mmap.lock().await;
-        //     mmap_guard.flush()?;
-        // }
         progress.finish();
         println!("Tasks done {:?}", start.elapsed());
 
@@ -546,7 +557,7 @@ impl AsyncTensorRedistributor {
 
             let target_start = (theader_size + tdata_offset + tstart) as u64;
             let source_start = (sheader_size + sdata_offset + sstart) as u64;
-            let target_mmap = Arc::clone(&self.target_mmaps[tindex]);
+            let target_mmap = Arc::clone(&self.target_mmaps.as_ref().unwrap()[tindex]);
             let source_mmap = Arc::clone(&self.source_mmaps[sindex]);
             tx.send(tokio::spawn(async move {
                 let task = MmapWriteTask {
@@ -719,6 +730,188 @@ fn intersection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::{Chunk, DistributedInfo, SharedInfo};
+    use safetensors::{Dtype, serialize, tensor::TensorView};
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    // Helper function to convert f32 slice to little-endian bytes
+    fn f32s_to_le_bytes(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    // Helper function to create test data
+    fn create_test_data_8x4() -> Vec<f32> {
+        (0..32).map(|i| i as f32).collect()
+    }
+
+    fn create_test_data_4x8() -> Vec<f32> {
+        (100..132).map(|i| i as f32).collect()
+    }
+
+    // Helper function to calculate SHA256 of a file
+    async fn calculate_file_hash<P: AsRef<Path>>(path: P) -> String {
+        let contents = tokio::fs::read(path).await.unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&contents);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn test_redistribution_round_trip() {
+        // Create temp directories
+        let source_dir = TempDir::new().unwrap();
+        let distributed_dir = TempDir::new().unwrap();
+        let final_dir = TempDir::new().unwrap();
+
+        // Step 1: Create original model.safetensors with 2 tensors
+        let tensor1_data = create_test_data_8x4(); // 8x4 tensor = 32 elements
+        let tensor2_data = create_test_data_4x8(); // 4x8 tensor = 32 elements
+
+        let tensor1_bytes = f32s_to_le_bytes(&tensor1_data);
+        let tensor2_bytes = f32s_to_le_bytes(&tensor2_data);
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "tensor1".to_string(),
+            TensorView::new(Dtype::F32, vec![8, 4], &tensor1_bytes).unwrap(),
+        );
+        tensors.insert(
+            "tensor2".to_string(),
+            TensorView::new(Dtype::F32, vec![4, 8], &tensor2_bytes).unwrap(),
+        );
+
+        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_path = source_dir.path().join("model.safetensors");
+        tokio::fs::write(&original_path, &original_bytes)
+            .await
+            .unwrap();
+
+        // Calculate hash of original file
+        let original_hash = calculate_file_hash(&original_path).await;
+        println!("Original file hash: {}", original_hash);
+
+        // Step 2: Create target topology for 2 ranks with different split dimensions
+        let mut target_tensors = BTreeMap::new();
+
+        // Split tensor1 (8x4) along first dimension (8/2 = 4 each)
+        target_tensors.insert(
+            "tensor1".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![8, 4],
+                Dtype::F32,
+                vec![
+                    Chunk::new(vec![0, 0], vec![4, 4], 0), // First 4 rows to rank 0
+                    Chunk::new(vec![4, 0], vec![4, 4], 1), // Last 4 rows to rank 1
+                ],
+            )),
+        );
+
+        // Split tensor2 (4x8) along second dimension (8/2 = 4 each)
+        target_tensors.insert(
+            "tensor2".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![4, 8],
+                Dtype::F32,
+                vec![
+                    Chunk::new(vec![0, 0], vec![4, 4], 0), // First 4 columns to rank 0
+                    Chunk::new(vec![0, 4], vec![4, 4], 1), // Last 4 columns to rank 1
+                ],
+            )),
+        );
+
+        let distributed_topology = Topology::new(
+            target_tensors,
+            vec![
+                "rank0.safetensors".to_string(),
+                "rank1.safetensors".to_string(),
+            ],
+            2,
+        )
+        .unwrap();
+
+        // Step 3: Redistribute from single file to 2 ranks
+        let mut redistributor1 = AsyncTensorRedistributor::new(
+            source_dir.path(),
+            distributed_dir.path(),
+            distributed_topology,
+        )
+        .unwrap();
+
+        let created_files = redistributor1.redistribute().await.unwrap();
+        println!("Created distributed files: {:?}", created_files);
+
+        // Verify distributed files exist
+        assert!(distributed_dir.path().join("rank0.safetensors").exists());
+        assert!(distributed_dir.path().join("rank1.safetensors").exists());
+        assert!(distributed_dir.path().join("topology.json").exists());
+
+        // Step 4: Create target topology for reconstruction back to 1 rank
+        let mut final_tensors = BTreeMap::new();
+        final_tensors.insert(
+            "tensor1".to_string(),
+            Tensor::Shared(SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])),
+        );
+        final_tensors.insert(
+            "tensor2".to_string(),
+            Tensor::Shared(SharedInfo::new(vec![4, 8], Dtype::F32, vec![0])),
+        );
+
+        let final_topology =
+            Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
+
+        // Step 5: Redistribute from 2 ranks back to single file
+        let mut redistributor2 =
+            AsyncTensorRedistributor::new(distributed_dir.path(), final_dir.path(), final_topology)
+                .unwrap();
+
+        let final_files = redistributor2.redistribute().await.unwrap();
+        println!("Created final files: {:?}", final_files);
+
+        // Verify final file exists
+        let final_path = final_dir.path().join("model.safetensors");
+        assert!(final_path.exists());
+
+        // Step 6: Calculate hash of final file and compare
+        let final_hash = calculate_file_hash(&final_path).await;
+        println!("Final file hash: {}", final_hash);
+
+        // The files should be identical
+        assert_eq!(
+            original_hash, final_hash,
+            "Round-trip redistribution should preserve file integrity"
+        );
+
+        // Step 7: Additional verification - load and compare tensor data
+        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_safetensors = SafeTensors::deserialize(&final_bytes).unwrap();
+
+        // Verify tensor1
+        let final_tensor1 = final_safetensors.tensor("tensor1").unwrap();
+        assert_eq!(final_tensor1.shape(), vec![8, 4]);
+        assert_eq!(final_tensor1.dtype(), Dtype::F32);
+        let final_tensor1_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_tensor1.data().as_ptr() as *const f32,
+                final_tensor1.data().len() / 4,
+            )
+        };
+        assert_eq!(final_tensor1_data, tensor1_data.as_slice());
+
+        // Verify tensor2
+        let final_tensor2 = final_safetensors.tensor("tensor2").unwrap();
+        assert_eq!(final_tensor2.shape(), vec![4, 8]);
+        assert_eq!(final_tensor2.dtype(), Dtype::F32);
+        let final_tensor2_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_tensor2.data().as_ptr() as *const f32,
+                final_tensor2.data().len() / 4,
+            )
+        };
+        assert_eq!(final_tensor2_data, tensor2_data.as_slice());
+
+        println!("✅ Round-trip redistribution test passed!");
+    }
 
     #[test]
     fn test_intersection_function() {

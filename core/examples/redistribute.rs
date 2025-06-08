@@ -118,7 +118,7 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     );
 
     // Create and run the async redistributor
-    let redistributor = AsyncTensorRedistributor::new(input_dir, output_dir, target_topology)?;
+    let mut redistributor = AsyncTensorRedistributor::new(input_dir, output_dir, target_topology)?;
 
     let _created_files = redistributor.redistribute().await?;
     Ok(())
