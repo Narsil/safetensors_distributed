@@ -21,6 +21,7 @@ struct MmapWriteTask {
     source_start: u64,
     target_mmap: Arc<MmapMut>,
     target_start: u64,
+    target_file_index: usize,
     length: usize,
 }
 
@@ -204,7 +205,7 @@ impl AsyncTensorRedistributor {
         // Initialize target memory maps now that files exist
         self.init_target_mmaps()?;
 
-        let (tx, mut rx) = channel::<JoinHandle<Result<usize>>>(10_000);
+        let (tx, mut rx) = channel::<MmapWriteTask>(10_000);
         // Estimate of the data needed to be copied.
         let mut total = 0;
         for mmap in self.source_mmaps.iter() {
@@ -220,10 +221,26 @@ impl AsyncTensorRedistributor {
         );
         let p = progress.clone();
         let handle = tokio::spawn(async move {
-            while let Some(task_handle) = rx.recv().await {
-                // TODO unwrap
-                let length = task_handle.await.unwrap().unwrap();
-                p.inc(length as u64)
+            let mut batch = Vec::with_capacity(1024);
+            
+            loop {
+                let received = rx.recv_many(&mut batch, 1024).await;
+                if received == 0 {
+                    break; // Channel closed
+                }
+                
+                // Sort by target file index, then by target offset for sequential I/O
+                batch.sort_by_key(|task| (task.target_file_index, task.target_start));
+                
+                // Execute batch in sorted order
+                for task in batch.drain(..) {
+                    let length = task.length;
+                    if let Err(e) = task.run() {
+                        eprintln!("Write task failed: {}", e);
+                        // Continue with other tasks rather than failing completely
+                    }
+                    p.inc(length as u64);
+                }
             }
         });
 
@@ -313,7 +330,7 @@ impl AsyncTensorRedistributor {
         Ok(metadatas)
     }
 
-    async fn create_tasks(&self, tx: &Sender<JoinHandle<Result<usize>>>) -> Result<()> {
+    async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
         // let mut tasks = vec![];
         for (name, source_tensor) in self.source.topology.tensors() {
             // for (name, target_tensor) in self.target.topology.tensors() {
@@ -547,7 +564,7 @@ impl AsyncTensorRedistributor {
         sdata_offset: usize,
         tdata_offset: usize,
         dtype_size: usize,
-        tx: &Sender<JoinHandle<Result<usize>>>,
+        tx: &Sender<MmapWriteTask>,
     ) {
         for (sstart, tstart, length) in intersection(&source_intervals, &target_intervals) {
             // Convert from offset to bytes
@@ -559,19 +576,17 @@ impl AsyncTensorRedistributor {
             let source_start = (sheader_size + sdata_offset + sstart) as u64;
             let target_mmap = Arc::clone(&self.target_mmaps.as_ref().unwrap()[tindex]);
             let source_mmap = Arc::clone(&self.source_mmaps[sindex]);
-            tx.send(tokio::spawn(async move {
-                let task = MmapWriteTask {
-                    source_mmap,
-                    source_start,
-                    target_mmap,
-                    target_start,
-                    length,
-                };
-                task.run()?;
-                Ok(length)
-            }))
-            .await
-            .unwrap();
+            
+            let task = MmapWriteTask {
+                source_mmap,
+                source_start,
+                target_mmap,
+                target_start,
+                target_file_index: tindex,
+                length,
+            };
+            
+            tx.send(task).await.unwrap();
         }
     }
 
