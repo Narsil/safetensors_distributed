@@ -1,5 +1,6 @@
 use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
+use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
 use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
@@ -525,6 +526,341 @@ impl AsyncTensorRedistributor {
                 },
             },
         })
+    }
+
+    /// Create a new redistributor for reconstruction from remote distributed files
+    pub async fn from_url<P: AsRef<Path>>(
+        base_url: Url,
+        auth_headers: HeaderMap,
+        target_dir: P,
+        target_topology: Topology,
+    ) -> Result<Self> {
+        let target_dir = target_dir.as_ref().to_path_buf();
+        let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
+
+        let target_layout = Layout {
+            topology: target_topology,
+            metadatas: target_metadatas,
+        };
+
+        let client = Client::new();
+
+        // Discover remote topology and metadata
+        let source_topology =
+            Self::load_or_create_remote_topology(&client, &base_url, &auth_headers).await?;
+        let file_paths = source_topology.filenames().to_vec();
+
+        // Fetch metadata for each remote file
+        let source_metadatas =
+            Self::load_remote_metadatas(&client, &base_url, &auth_headers, &file_paths).await?;
+
+        let source_layout = Layout {
+            topology: source_topology,
+            metadatas: source_metadatas,
+        };
+
+        Ok(Self {
+            source: Source {
+                layout: source_layout,
+                location: SourceLocation::Remote {
+                    client,
+                    base_url,
+                    auth_headers,
+                    file_paths: file_paths.to_vec(),
+                },
+            },
+            target: Target {
+                layout: target_layout,
+                location: WriteLocation {
+                    dir: target_dir,
+                    mmaps: None,
+                },
+            },
+        })
+    }
+
+    /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
+    async fn load_or_create_remote_topology(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Topology> {
+        // Try to fetch topology.json first (distributed setup)
+        if let Ok(topology) = Self::try_fetch_topology_json(client, base_url, auth_headers).await {
+            return Ok(topology);
+        }
+
+        // Try to fetch model.safetensors.index.json (chunked setup)
+        if let Ok(topology) = Self::try_fetch_index_json(client, base_url, auth_headers).await {
+            return Ok(topology);
+        }
+
+        // Try to fetch model.safetensors (single file setup)
+        if let Ok(topology) =
+            Self::try_fetch_model_safetensors(client, base_url, auth_headers).await
+        {
+            return Ok(topology);
+        }
+
+        Err(RedistributorError::NoValidInput {
+            path: PathBuf::from(base_url.as_str()),
+        })
+    }
+
+    /// Try to fetch and parse topology.json
+    async fn try_fetch_topology_json(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Topology> {
+        let topology_url = base_url.join("topology.json").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid topology URL: {}", e),
+            ))
+        })?;
+
+        let response = client
+            .get(topology_url)
+            .headers(auth_headers.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to fetch topology.json: {}", e),
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "topology.json not found",
+            )));
+        }
+
+        let topology_data = response.text().await.map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to read topology.json: {}", e),
+            ))
+        })?;
+
+        let topology: Topology = serde_json::from_str(&topology_data)?;
+        Ok(topology)
+    }
+
+    /// Try to fetch and parse model.safetensors.index.json
+    async fn try_fetch_index_json(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Topology> {
+        let index_url = base_url.join("model.safetensors.index.json").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid index URL: {}", e),
+            ))
+        })?;
+
+        let response = client
+            .get(index_url)
+            .headers(auth_headers.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to fetch index.json: {}", e),
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "model.safetensors.index.json not found",
+            )));
+        }
+
+        let index_data = response.text().await.map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to read index.json: {}", e),
+            ))
+        })?;
+
+        let index: SafetensorsIndex = serde_json::from_str(&index_data)?;
+
+        // Group tensors by their chunk file and create topology
+        let mut filenames: HashSet<String> = HashSet::new();
+        for (_tensor_name, file_name) in &index.weight_map {
+            filenames.insert(file_name.clone());
+        }
+        let mut filenames = filenames.into_iter().collect::<Vec<_>>();
+        filenames.sort();
+
+        // Create a topology with shared tensors (chunked model)
+        let mut tensors = BTreeMap::new();
+
+        // TODO: We need to fetch metadata from each file to get tensor shapes and dtypes
+        // For now, create placeholder shared tensors
+        for (tensor_name, _file_name) in &index.weight_map {
+            tensors.insert(
+                tensor_name.clone(),
+                Tensor::Shared(SharedInfo::new(
+                    vec![1],                 // Placeholder shape
+                    safetensors::Dtype::F32, // Placeholder dtype
+                    vec![0],                 // Placeholder file indices
+                )),
+            );
+        }
+
+        let topology = Topology::new(tensors, filenames, 1)?;
+        Ok(topology)
+    }
+
+    /// Try to fetch and create topology from model.safetensors
+    async fn try_fetch_model_safetensors(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Topology> {
+        let model_url = base_url.join("model.safetensors").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid model URL: {}", e),
+            ))
+        })?;
+
+        // Try to fetch the metadata from the file
+        let metadata =
+            Self::fetch_remote_safetensors_metadata(client, &model_url, auth_headers).await?;
+
+        // Create a topology with shared tensors (single file model)
+        let mut tensors = BTreeMap::new();
+        for (tensor_name, tensor_info) in metadata.tensors() {
+            tensors.insert(
+                tensor_name,
+                Tensor::Shared(SharedInfo::new(
+                    tensor_info.shape.to_vec(),
+                    tensor_info.dtype,
+                    vec![0], // Single file at index 0
+                )),
+            );
+        }
+
+        let topology = Topology::new(tensors, vec!["model.safetensors".to_string()], 1)?;
+        Ok(topology)
+    }
+
+    /// Load metadata for all remote files
+    async fn load_remote_metadatas(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+        file_paths: &[String],
+    ) -> Result<Vec<(usize, Metadata)>> {
+        let mut metadatas = Vec::new();
+
+        for file_path in file_paths {
+            let file_url = base_url.join(file_path).map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid file URL: {}", e),
+                ))
+            })?;
+
+            let metadata =
+                Self::fetch_remote_safetensors_metadata(client, &file_url, auth_headers).await?;
+
+            // Calculate header size (this is a bit of an approximation)
+            let metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
+            let extra = (8 - metadata_buf.len() % 8) % 8;
+            let header_size = metadata_buf.len() + 8 + extra;
+
+            metadatas.push((header_size, metadata));
+        }
+
+        Ok(metadatas)
+    }
+
+    /// Fetch safetensors metadata from remote file using streaming
+    async fn fetch_remote_safetensors_metadata(
+        client: &Client,
+        file_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Metadata> {
+        // Make a single request and stream the response, cutting it early once we have the header
+        let response = client
+            .get(file_url.clone())
+            .headers(auth_headers.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to fetch from {}: {}", file_url, e),
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Failed to fetch from {}: status {}", file_url, response.status()),
+            )));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut header_length: Option<u64> = None;
+
+        // Stream chunks and process them
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to read chunk: {}", e),
+                ))
+            })?;
+            
+            buffer.extend_from_slice(&chunk);
+
+            // Step 1: Once we have at least 8 bytes, parse the header length
+            if header_length.is_none() && buffer.len() >= 8 {
+                let header_length_bytes: [u8; 8] = buffer[..8].try_into().map_err(|_| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Failed to convert header length bytes to array",
+                    ))
+                })?;
+                
+                header_length = Some(u64::from_le_bytes(header_length_bytes));
+            }
+
+            // Step 2: Once we know the header length, check if we have the complete header
+            if let Some(len) = header_length {
+                let total_needed = 8 + len as usize; // 8 bytes for length + header JSON
+                
+                if buffer.len() >= total_needed {
+                    // We have all the data we need, extract the header JSON and stop streaming
+                    let header_bytes = &buffer[8..total_needed];
+                    
+                    // Step 3: Parse the JSON as safetensors metadata
+                    let metadata: Metadata = serde_json::from_slice(header_bytes)
+                        .map_err(|e| {
+                            RedistributorError::Json(e)
+                        })?;
+
+                    return Ok(metadata);
+                }
+            }
+        }
+
+        // If we get here, the stream ended before we got all the data we needed
+        Err(RedistributorError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Stream ended before complete header was received",
+        )))
     }
 
     /// Redistribute tensors to target directory and return list of created files
@@ -1417,7 +1753,7 @@ mod tests {
         .unwrap();
 
         // Step 3: Redistribute from single file to 2 ranks
-        let mut redistributor1 = AsyncTensorRedistributor::new(
+        let mut redistributor1 = AsyncTensorRedistributor::from_local(
             source_dir.path(),
             distributed_dir.path(),
             distributed_topology,
@@ -1447,9 +1783,12 @@ mod tests {
             Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
 
         // Step 5: Redistribute from 2 ranks back to single file
-        let mut redistributor2 =
-            AsyncTensorRedistributor::new(distributed_dir.path(), final_dir.path(), final_topology)
-                .unwrap();
+        let mut redistributor2 = AsyncTensorRedistributor::from_local(
+            distributed_dir.path(),
+            final_dir.path(),
+            final_topology,
+        )
+        .unwrap();
 
         let final_files = redistributor2.redistribute().await.unwrap();
         trace!("Created final files: {:?}", final_files);

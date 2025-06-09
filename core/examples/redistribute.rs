@@ -1,8 +1,42 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use clap::Parser;
 use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
 use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
 use std::collections::BTreeMap;
 use std::path::Path;
+use reqwest::header::HeaderMap;
+use url::Url;
+
+#[derive(Parser)]
+#[command(name = "redistribute")]
+#[command(about = "Redistribute safetensors models between different world sizes")]
+struct Args {
+    /// Input directory containing topology.json + rank*.safetensors OR model.safetensors
+    #[arg(long, conflicts_with = "input_url")]
+    input_dir: Option<String>,
+
+    /// Input URL for remote model (HTTP/HTTPS)
+    #[arg(long, conflicts_with = "input_dir")]
+    input_url: Option<Url>,
+
+    /// Output directory for redistributed files
+    #[arg(long, short)]
+    output_dir: String,
+
+    /// Target world size (number of ranks)
+    #[arg(long, short)]
+    target_world_size: usize,
+}
+
+impl Args {
+    fn validate(&self) -> Result<()> {
+        match (&self.input_dir, &self.input_url) {
+            (Some(_), Some(_)) => anyhow::bail!("Cannot specify both --input-dir and --input-url"),
+            (None, None) => anyhow::bail!("Must specify either --input-dir or --input-url"),
+            _ => Ok(()),
+        }
+    }
+}
 
 /// Create a target topology for redistribution based on source topology and target world size
 fn create_target_topology(
@@ -100,8 +134,8 @@ fn determine_split_dimension(tensor_name: &str) -> Option<usize> {
     }
 }
 
-/// Main redistribution function using async parallel approach
-async fn redistribute_model_async<P: AsRef<Path>>(
+/// Main redistribution function for local input using async parallel approach
+async fn redistribute_model_from_local<P: AsRef<Path>>(
     input_dir: P,
     output_dir: P,
     target_world_size: usize,
@@ -109,7 +143,7 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     let input_dir = input_dir.as_ref();
     let output_dir = output_dir.as_ref();
 
-    println!("Reading model from {:?}", input_dir);
+    println!("Reading model from local directory: {:?}", input_dir);
 
     // Load the existing topology (or create from model.safetensors)
     let source_topology = load_or_create_topology(input_dir)?;
@@ -125,7 +159,63 @@ async fn redistribute_model_async<P: AsRef<Path>>(
     );
 
     // Create and run the async redistributor
-    let mut redistributor = AsyncTensorRedistributor::new(input_dir, output_dir, target_topology)?;
+    let mut redistributor = AsyncTensorRedistributor::from_local(input_dir, output_dir, target_topology)?;
+
+    let _created_files = redistributor.redistribute().await?;
+    Ok(())
+}
+
+/// Main redistribution function for remote input using async parallel approach
+async fn redistribute_model_from_url<P: AsRef<Path>>(
+    input_url: &Url,
+    output_dir: P,
+    target_world_size: usize,
+) -> Result<()> {
+    let output_dir = output_dir.as_ref();
+
+    println!("Reading model from remote URL: {}", input_url);
+
+    let base_url = input_url.clone();
+    
+    // For now, use empty auth headers. In the future, this could be configurable
+    let auth_headers = HeaderMap::new();
+
+    // We need to create a target topology, but we don't know the source topology yet
+    // For now, we'll need to load the remote topology first to determine the structure
+    // This is a simplified approach - in practice, you might want to make this configurable
+    
+    println!("Note: Remote topology discovery will be performed during redistribution");
+    println!("Target world size: {}", target_world_size);
+
+    // Generate target filenames
+    let target_filenames = if target_world_size == 1 {
+        vec!["model.safetensors".to_string()]
+    } else {
+        (0..target_world_size)
+            .map(|rank| format!("rank{rank}.safetensors"))
+            .collect()
+    };
+
+    // For remote redistribution, we need to create a placeholder target topology
+    // The actual redistribution logic will need to handle this properly
+    let target_tensors = BTreeMap::new();
+    
+    // Create a simple placeholder topology for now
+    // In a real implementation, you might want to fetch the remote topology first
+    // to create an appropriate target topology
+    let target_topology = Topology::new(
+        target_tensors,
+        target_filenames,
+        target_world_size,
+    )?;
+
+    // Create and run the async redistributor from URL
+    let mut redistributor = AsyncTensorRedistributor::from_url(
+        base_url,
+        auth_headers,
+        output_dir,
+        target_topology,
+    ).await?;
 
     let _created_files = redistributor.redistribute().await?;
     Ok(())
@@ -133,30 +223,21 @@ async fn redistribute_model_async<P: AsRef<Path>>(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
+    
+    // Validate that exactly one input source is provided
+    args.validate()?;
 
-    if args.len() != 4 {
-        eprintln!(
-            "Usage: {} <input_dir> <output_dir> <target_world_size>",
-            args[0]
-        );
-        eprintln!(
-            "Example: {} distributed_gpt2 redistributed_gpt2_async 2",
-            args[0]
-        );
-        eprintln!("        {} single_model_dir redistributed_async 4", args[0]);
-        eprintln!("Input: topology.json + rank*.safetensors OR model.safetensors");
-        eprintln!("Note: target_world_size=1 creates model.safetensors (no topology.json)");
-        std::process::exit(1);
+    match (&args.input_dir, &args.input_url) {
+        (Some(input_dir), None) => {
+            redistribute_model_from_local(input_dir, &args.output_dir, args.target_world_size).await?;
+        }
+        (None, Some(input_url)) => {
+            redistribute_model_from_url(input_url, &args.output_dir, args.target_world_size).await?;
+        }
+        _ => unreachable!("Validation should have caught this case"),
     }
 
-    let input_dir = &args[1];
-    let output_dir = &args[2];
-    let target_world_size: usize = args[3]
-        .parse()
-        .with_context(|| format!("Invalid target world size: {}", args[3]))?;
-
-    redistribute_model_async(input_dir, output_dir, target_world_size).await?;
-
+    println!("Redistribution completed successfully!");
     Ok(())
 }
