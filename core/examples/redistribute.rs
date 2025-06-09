@@ -1,11 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
 use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
 use std::collections::BTreeMap;
 use std::path::Path;
-use reqwest::header::HeaderMap;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Parser)]
@@ -160,7 +161,8 @@ async fn redistribute_model_from_local<P: AsRef<Path>>(
     );
 
     // Create and run the async redistributor
-    let mut redistributor = AsyncTensorRedistributor::from_local(input_dir, output_dir, target_topology)?;
+    let mut redistributor =
+        AsyncTensorRedistributor::from_local(input_dir, output_dir, target_topology)?;
 
     let _created_files = redistributor.redistribute().await?;
     Ok(())
@@ -180,11 +182,25 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
     
     // For now, use empty auth headers. In the future, this could be configurable
     let auth_headers = HeaderMap::new();
-    let client = Client::new();
+    
+    // Create a single HTTP client for connection pooling
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer
+        .pool_max_idle_per_host(32) // Allow more concurrent connections per host
+        .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
+        .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keep-alive timeout
+        .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
+        .tcp_keepalive(Duration::from_secs(60)) // TCP-level keep-alive
+        .build()
+        .expect("Failed to create HTTP client");
 
     // Load the source topology from the remote URL first
     println!("Loading remote topology...");
-    let source_topology = AsyncTensorRedistributor::load_or_create_remote_topology(&client, &base_url, &auth_headers).await?;
+    let source_topology =
+        AsyncTensorRedistributor::load_or_create_remote_topology(&client, &base_url, &auth_headers)
+            .await?;
 
     let source_ranks = source_topology.world_size();
     println!("Source topology has {} ranks", source_ranks);
@@ -196,13 +212,11 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
         target_topology.world_size()
     );
 
-    // Create and run the async redistributor from URL
-    let mut redistributor = AsyncTensorRedistributor::from_url(
-        base_url,
-        auth_headers,
-        output_dir,
-        target_topology,
-    ).await?;
+    // Create and run the async redistributor from URL - pass the same client for connection reuse
+    let mut redistributor =
+        AsyncTensorRedistributor::from_url_with_client(client, base_url, auth_headers, output_dir, target_topology)
+            .await?;
+    println!("Initiated");
 
     let _created_files = redistributor.redistribute().await?;
     Ok(())
@@ -210,17 +224,22 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    // Initialize env_logger to see reqwest debug logs
+    env_logger::init();
     
+    let args = Args::parse();
+
     // Validate that exactly one input source is provided
     args.validate()?;
 
     match (&args.input_dir, &args.input_url) {
         (Some(input_dir), None) => {
-            redistribute_model_from_local(input_dir, &args.output_dir, args.target_world_size).await?;
+            redistribute_model_from_local(input_dir, &args.output_dir, args.target_world_size)
+                .await?;
         }
         (None, Some(input_url)) => {
-            redistribute_model_from_url(input_url, &args.output_dir, args.target_world_size).await?;
+            redistribute_model_from_url(input_url, &args.output_dir, args.target_world_size)
+                .await?;
         }
         _ => unreachable!("Validation should have caught this case"),
     }

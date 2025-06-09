@@ -16,6 +16,7 @@ hf-hub = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+env_logger = { workspace = true }
 memmap2 = { workspace = true }
 clap = { workspace = true }
 

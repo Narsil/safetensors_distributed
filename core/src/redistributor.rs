@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
 use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
+use reqwest::header::RANGE;
 use reqwest::{Client, header::HeaderMap};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
@@ -12,10 +13,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinError;
 use url::Url;
@@ -28,6 +30,7 @@ enum TaskSources {
         base_url: Url,
         auth_headers: HeaderMap,
         file_paths: Vec<String>,
+        http_semaphore: Arc<Semaphore>, // Limit concurrent HTTP requests
     },
 }
 
@@ -44,7 +47,16 @@ impl TaskSources {
                 base_url,
                 auth_headers,
                 file_paths,
+                http_semaphore,
             } => {
+                // Acquire semaphore permit to limit concurrent HTTP requests
+                let _permit = http_semaphore.acquire().await.map_err(|_| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to acquire HTTP semaphore permit",
+                    ))
+                })?;
+
                 let url = base_url.join(&file_paths[file_index]).map_err(|e| {
                     RedistributorError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -53,28 +65,70 @@ impl TaskSources {
                 })?;
 
                 let range_header = format!("bytes={}-{}", start, end - 1);
+                let expected_size = (end - start) as usize;
+
+                trace!("Fetching range {} from {}", range_header, url);
 
                 let response = client
-                    .get(url)
+                    .get(url.clone())
                     .headers(auth_headers.clone())
-                    .header("Range", range_header)
+                    .header(RANGE, range_header.clone())
+                    .timeout(Duration::from_secs(30)) // 30 second timeout
                     .send()
                     .await
                     .map_err(|e| {
                         RedistributorError::Io(std::io::Error::new(
                             std::io::ErrorKind::Other,
-                            format!("HTTP request failed: {}", e),
+                            format!("HTTP request failed for {}: {}", url, e),
                         ))
                     })?;
 
-                let bytes = response.bytes().await.map_err(|e| {
-                    RedistributorError::Io(std::io::Error::new(
+                if !response.status().is_success() {
+                    return Err(RedistributorError::Io(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("Failed to read response body: {}", e),
-                    ))
-                })?;
+                        format!(
+                            "HTTP request failed with status {} for {}",
+                            response.status(),
+                            url
+                        ),
+                    )));
+                }
 
-                Ok(Cow::Owned(bytes.to_vec()))
+                // Stream the response chunk by chunk to avoid loading everything into memory
+                let mut stream = response.bytes_stream();
+                let mut buffer = Vec::with_capacity(expected_size);
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| {
+                        RedistributorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to read response chunk from {}: {}", url, e),
+                        ))
+                    })?;
+
+                    buffer.extend_from_slice(&chunk);
+
+                    // Safety check: if we're getting way more data than expected, stop
+                    if buffer.len() > expected_size * 2 {
+                        return Err(RedistributorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Response size {} exceeds expected {} for range {}",
+                                buffer.len(),
+                                expected_size,
+                                range_header
+                            ),
+                        )));
+                    }
+                }
+
+                trace!(
+                    "Successfully fetched {} bytes (expected {})",
+                    buffer.len(),
+                    expected_size
+                );
+                Ok(Cow::Owned(buffer))
+                // _permit automatically dropped here, releasing semaphore
             }
         }
     }
@@ -90,6 +144,7 @@ enum TaskSource {
         base_url: Url,
         auth_headers: HeaderMap,
         file_paths: Vec<String>,
+        http_semaphore: Arc<Semaphore>,
     },
 }
 
@@ -100,12 +155,18 @@ impl TaskSource {
     }
 
     /// Create a new empty task source builder for remote sources
-    fn new_remote(client: Client, base_url: Url, auth_headers: HeaderMap) -> Self {
+    fn new_remote(
+        client: Client,
+        base_url: Url,
+        auth_headers: HeaderMap,
+        http_semaphore: Arc<Semaphore>,
+    ) -> Self {
         Self::Remote {
             client,
             base_url,
             auth_headers,
             file_paths: Vec::new(),
+            http_semaphore,
         }
     }
 
@@ -150,11 +211,13 @@ impl TaskSource {
                 base_url,
                 auth_headers,
                 file_paths,
+                http_semaphore,
             } => TaskSources::Remote {
                 client,
                 base_url,
                 auth_headers,
                 file_paths,
+                http_semaphore,
             },
         }
     }
@@ -320,6 +383,7 @@ enum SourceLocation {
         base_url: Url,
         auth_headers: HeaderMap,
         file_paths: Vec<String>,
+        http_semaphore: Arc<Semaphore>,
     },
 }
 
@@ -332,15 +396,30 @@ struct WriteLocation {
 impl WriteLocation {
     /// Initialize target files and memory maps
     async fn init(&mut self, layout: &Layout) -> Result<()> {
+        println!("INIT: Starting target location initialization...");
+
         // Create directory
+        println!("INIT: Creating directory...");
+        let dir_start = Instant::now();
         tokio::fs::create_dir_all(&self.dir).await?;
+        println!("INIT: Directory created in {:?}", dir_start.elapsed());
 
         // Create files with headers
+        println!("INIT: Creating files with headers...");
+        let files_start = Instant::now();
         self.create_files_with_headers(layout).await?;
+        println!("INIT: Files created in {:?}", files_start.elapsed());
 
         // Initialize memory maps
+        println!("INIT: Initializing memory maps...");
+        let mmap_start = Instant::now();
         self.init_target_mmaps(layout)?;
+        println!(
+            "INIT: Memory maps initialized in {:?}",
+            mmap_start.elapsed()
+        );
 
+        println!("INIT: Target location initialization complete");
         Ok(())
     }
 
@@ -535,6 +614,35 @@ impl AsyncTensorRedistributor {
         target_dir: P,
         target_topology: Topology,
     ) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60)) // Overall request timeout
+            .connect_timeout(Duration::from_secs(10)) // Connection timeout
+            .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer
+            .pool_max_idle_per_host(32) // Allow more concurrent connections per host
+            .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
+            .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keep-alive timeout
+            .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
+            .tcp_keepalive(Duration::from_secs(60)) // TCP-level keep-alive
+            .build()
+            .map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create HTTP client: {}", e),
+                ))
+            })?;
+
+        Self::from_url_with_client(client, base_url, auth_headers, target_dir, target_topology)
+            .await
+    }
+
+    /// Create redistributor from remote URL with provided HTTP client (for connection pooling)
+    pub async fn from_url_with_client<P: AsRef<Path>>(
+        client: Client,
+        base_url: Url,
+        auth_headers: HeaderMap,
+        target_dir: P,
+        target_topology: Topology,
+    ) -> Result<Self> {
         let target_dir = target_dir.as_ref().to_path_buf();
         let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
 
@@ -543,16 +651,44 @@ impl AsyncTensorRedistributor {
             metadatas: target_metadatas,
         };
 
-        let client = Client::new();
+        // Create semaphore with 100 permits for HTTP request throttling
+        let http_semaphore = Arc::new(Semaphore::new(100));
 
-        // Discover remote topology and metadata
-        let source_topology =
-            Self::load_or_create_remote_topology(&client, &base_url, &auth_headers).await?;
+        // Discover remote topology and metadata WITH CACHING to avoid duplicate requests
+        let (source_topology, metadata_cache) =
+            Self::load_or_create_remote_topology_with_cache(&client, &base_url, &auth_headers)
+                .await?;
         let file_paths = source_topology.filenames().to_vec();
 
-        // Fetch metadata for each remote file
-        let source_metadatas =
-            Self::load_remote_metadatas(&client, &base_url, &auth_headers, &file_paths).await?;
+        // Fetch metadata for each remote file, using cache when available
+        let mut source_metadatas = Vec::new();
+        for file_path in &file_paths {
+            if let Some(cached_metadata) = metadata_cache.get(file_path) {
+                // Use cached metadata (avoids redundant request)
+                trace!("Using cached metadata for {}", file_path);
+                let metadata_buf = serde_json::to_string(cached_metadata)?.into_bytes();
+                let extra = (8 - metadata_buf.len() % 8) % 8;
+                let header_size = metadata_buf.len() + 8 + extra;
+                source_metadatas.push((header_size, cached_metadata.clone()));
+            } else {
+                // Fetch metadata if not cached
+                let file_url = base_url.join(file_path).map_err(|e| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid file URL: {}", e),
+                    ))
+                })?;
+
+                let metadata =
+                    Self::fetch_remote_safetensors_metadata(&client, &file_url, &auth_headers)
+                        .await?;
+
+                let metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
+                let extra = (8 - metadata_buf.len() % 8) % 8;
+                let header_size = metadata_buf.len() + 8 + extra;
+                source_metadatas.push((header_size, metadata));
+            }
+        }
 
         let source_layout = Layout {
             topology: source_topology,
@@ -567,6 +703,7 @@ impl AsyncTensorRedistributor {
                     base_url,
                     auth_headers,
                     file_paths: file_paths.to_vec(),
+                    http_semaphore: http_semaphore.clone(),
                 },
             },
             target: Target {
@@ -580,31 +717,96 @@ impl AsyncTensorRedistributor {
     }
 
     /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
-    pub async fn load_or_create_remote_topology(
+    /// Returns (topology, metadata_cache) to avoid duplicate metadata fetching
+    pub async fn load_or_create_remote_topology_with_cache(
         client: &Client,
         base_url: &Url,
         auth_headers: &HeaderMap,
-    ) -> Result<Topology> {
-        // Try to fetch topology.json first (distributed setup)
-        if let Ok(topology) = Self::try_fetch_topology_json(client, base_url, auth_headers).await {
-            return Ok(topology);
+    ) -> Result<(Topology, HashMap<String, Metadata>)> {
+        let mut metadata_cache = HashMap::new();
+
+        // Optimized approach: Use HEAD requests to check file existence first to avoid unnecessary downloads
+        let topology_url = base_url.join("topology.json").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid topology URL: {}", e),
+            ))
+        })?;
+
+        let index_url = base_url.join("model.safetensors.index.json").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid index URL: {}", e),
+            ))
+        })?;
+
+        let model_url = base_url.join("model.safetensors").map_err(|e| {
+            RedistributorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid model URL: {}", e),
+            ))
+        })?;
+
+        // Use HEAD requests to quickly check which files exist
+        let topology_exists = Self::check_file_exists(client, &topology_url, auth_headers).await;
+        let index_exists = Self::check_file_exists(client, &index_url, auth_headers).await;
+        let model_exists = Self::check_file_exists(client, &model_url, auth_headers).await;
+
+        // Try distributed setup first (topology.json)
+        if topology_exists {
+            if let Ok(topology) =
+                Self::try_fetch_topology_json(client, base_url, auth_headers).await
+            {
+                return Ok((topology, metadata_cache));
+            }
         }
 
-        // Try to fetch model.safetensors.index.json (chunked setup)
-        if let Ok(topology) = Self::try_fetch_index_json(client, base_url, auth_headers).await {
-            return Ok(topology);
+        // Try chunked setup (index.json)
+        if index_exists {
+            if let Ok(topology) = Self::try_fetch_index_json(client, base_url, auth_headers).await {
+                return Ok((topology, metadata_cache));
+            }
         }
 
-        // Try to fetch model.safetensors (single file setup)
-        if let Ok(topology) =
-            Self::try_fetch_model_safetensors(client, base_url, auth_headers).await
-        {
-            return Ok(topology);
+        // Try single file setup (model.safetensors)
+        if model_exists {
+            if let Ok((topology, metadata)) =
+                Self::try_fetch_model_safetensors_with_cache(client, base_url, auth_headers).await
+            {
+                // Cache the metadata we just fetched to avoid redundant request
+                metadata_cache.insert("model.safetensors".to_string(), metadata);
+                return Ok((topology, metadata_cache));
+            }
         }
 
         Err(RedistributorError::NoValidInput {
             path: PathBuf::from(base_url.as_str()),
         })
+    }
+
+    /// Check if a file exists using a HEAD request (fast and lightweight)
+    async fn check_file_exists(client: &Client, url: &Url, auth_headers: &HeaderMap) -> bool {
+        match client
+            .head(url.clone())
+            .headers(auth_headers.clone())
+            .timeout(Duration::from_secs(5)) // Short timeout for existence checks
+            .send()
+            .await
+        {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
+    pub async fn load_or_create_remote_topology(
+        client: &Client,
+        base_url: &Url,
+        auth_headers: &HeaderMap,
+    ) -> Result<Topology> {
+        let (topology, _) =
+            Self::load_or_create_remote_topology_with_cache(client, base_url, auth_headers).await?;
+        Ok(topology)
     }
 
     /// Try to fetch and parse topology.json
@@ -719,12 +921,12 @@ impl AsyncTensorRedistributor {
         Ok(topology)
     }
 
-    /// Try to fetch and create topology from model.safetensors
-    async fn try_fetch_model_safetensors(
+    /// Try to fetch and create topology from model.safetensors, returning metadata for caching
+    async fn try_fetch_model_safetensors_with_cache(
         client: &Client,
         base_url: &Url,
         auth_headers: &HeaderMap,
-    ) -> Result<Topology> {
+    ) -> Result<(Topology, Metadata)> {
         let model_url = base_url.join("model.safetensors").map_err(|e| {
             RedistributorError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -750,38 +952,7 @@ impl AsyncTensorRedistributor {
         }
 
         let topology = Topology::new(tensors, vec!["model.safetensors".to_string()], 1)?;
-        Ok(topology)
-    }
-
-    /// Load metadata for all remote files
-    async fn load_remote_metadatas(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-        file_paths: &[String],
-    ) -> Result<Vec<(usize, Metadata)>> {
-        let mut metadatas = Vec::new();
-
-        for file_path in file_paths {
-            let file_url = base_url.join(file_path).map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Invalid file URL: {}", e),
-                ))
-            })?;
-
-            let metadata =
-                Self::fetch_remote_safetensors_metadata(client, &file_url, auth_headers).await?;
-
-            // Calculate header size (this is a bit of an approximation)
-            let metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
-            let extra = (8 - metadata_buf.len() % 8) % 8;
-            let header_size = metadata_buf.len() + 8 + extra;
-
-            metadatas.push((header_size, metadata));
-        }
-
-        Ok(metadatas)
+        Ok((topology, metadata))
     }
 
     /// Fetch safetensors metadata from remote file using streaming
@@ -869,11 +1040,22 @@ impl AsyncTensorRedistributor {
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         trace!("Start");
         let start = Instant::now();
+        println!("REDISTRIBUTION: Starting redistribute process...");
 
+        println!("REDISTRIBUTION: Initializing target location...");
+        let init_start = Instant::now();
         self.target.location.init(&self.target.layout).await?;
+        println!(
+            "REDISTRIBUTION: Target location initialized in {:?}",
+            init_start.elapsed()
+        );
         trace!("Created headers {:?}", start.elapsed());
 
+        println!("REDISTRIBUTION: Setting up task channel...");
         let (tx, mut rx) = channel::<MmapWriteTask>(10_000);
+
+        println!("REDISTRIBUTION: Calculating total size...");
+        let calc_start = Instant::now();
         // Estimate of the data needed to be copied.
         let mut total = 0u64;
         for (header_size, metadata) in &self.source.layout.metadatas {
@@ -888,13 +1070,21 @@ impl AsyncTensorRedistributor {
             // Total file size = header + data section
             total += (header_size + max_data_end) as u64;
         }
+        println!(
+            "REDISTRIBUTION: Total size calculated: {} bytes in {:?}",
+            total,
+            calc_start.elapsed()
+        );
 
+        println!("REDISTRIBUTION: Setting up progress bar...");
         let progress = ProgressBar::new(total);
         progress.set_style(
             ProgressStyle::default_bar()
                 .template("[{eta_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
                 .unwrap(),
         );
+
+        println!("REDISTRIBUTION: Starting progress task...");
         let p = progress.clone();
         let handle = tokio::spawn(async move {
             let mut batch = Vec::with_capacity(1024);
@@ -920,7 +1110,15 @@ impl AsyncTensorRedistributor {
             }
         });
 
+        println!("REDISTRIBUTION: Creating tasks...");
+        let tasks_start = Instant::now();
         self.create_tasks(&tx).await?;
+        println!(
+            "REDISTRIBUTION: Tasks created in {:?}",
+            tasks_start.elapsed()
+        );
+
+        println!("REDISTRIBUTION: Starting task execution...");
         drop(tx);
         handle.await?;
 
@@ -1013,15 +1211,29 @@ impl AsyncTensorRedistributor {
     }
 
     async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
+        println!("TASKS: Starting task creation...");
+        let start = Instant::now();
+
         trace!(
             "Creating tasks for {} target files",
             self.target.layout.topology.filenames().len()
         );
 
+        let file_count = self.target.layout.topology.filenames().len();
+        println!("TASKS: Processing {} target files", file_count);
+
         // Process each target file in order
         for (target_file_index, filename) in
             self.target.layout.topology.filenames().iter().enumerate()
         {
+            let file_start = Instant::now();
+            println!(
+                "TASKS: Processing target file {}/{}: {}",
+                target_file_index + 1,
+                file_count,
+                filename
+            );
+
             trace!("Processing target file {}: {}", target_file_index, filename);
 
             // Get the metadata for this target file
@@ -1033,6 +1245,12 @@ impl AsyncTensorRedistributor {
                 tensors.iter().map(|(k, v)| (k, *v)).collect();
             tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
+            let tensor_count = tensor_entries.len();
+            println!(
+                "TASKS: Found {} tensors in target file {}",
+                tensor_count, target_file_index
+            );
+
             trace!(
                 "  Found {} tensors in target file {}",
                 tensor_entries.len(),
@@ -1040,7 +1258,19 @@ impl AsyncTensorRedistributor {
             );
 
             // Process each tensor in write order
-            for (tensor_name, tensor_info) in tensor_entries {
+            for (i, (tensor_name, tensor_info)) in tensor_entries.iter().enumerate() {
+                let tensor_start = Instant::now();
+                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
+                    println!(
+                        "TASKS: Creating task for tensor {}/{}: '{}' (offset: {} -> {})",
+                        i + 1,
+                        tensor_count,
+                        tensor_name,
+                        tensor_info.data_offsets.0,
+                        tensor_info.data_offsets.1
+                    );
+                }
+
                 trace!(
                     "  Creating task for tensor '{}' (offset: {} -> {})",
                     tensor_name, tensor_info.data_offsets.0, tensor_info.data_offsets.1
@@ -1054,9 +1284,24 @@ impl AsyncTensorRedistributor {
                     tensor_info,
                 )
                 .await?;
+
+                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
+                    println!(
+                        "TASKS: Task created for tensor '{}' in {:?}",
+                        tensor_name,
+                        tensor_start.elapsed()
+                    );
+                }
             }
+
+            println!(
+                "TASKS: Completed target file {} in {:?}",
+                target_file_index,
+                file_start.elapsed()
+            );
         }
         trace!("Finished creating tasks");
+        println!("TASKS: All tasks created in {:?}", start.elapsed());
         Ok(())
     }
 
@@ -1100,8 +1345,14 @@ impl AsyncTensorRedistributor {
                 client,
                 base_url,
                 auth_headers,
+                http_semaphore,
                 ..
-            } => TaskSource::new_remote(client.clone(), base_url.clone(), auth_headers.clone()),
+            } => TaskSource::new_remote(
+                client.clone(),
+                base_url.clone(),
+                auth_headers.clone(),
+                http_semaphore.clone(),
+            ),
         };
         let mut source_ranges = Vec::new();
         let mut ranges_per_file = Vec::new();
