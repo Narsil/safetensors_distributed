@@ -16,6 +16,58 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinError;
 
+/// Source data abstraction for tasks
+enum TaskSources {
+    Local(Vec<Arc<Mmap>>),
+    Remote, // TODO: Implement remote source support
+}
+
+impl TaskSources {
+    /// Read data from the specified file index and range
+    fn read(&self, file_index: usize, start: u64, end: u64) -> &[u8] {
+        match self {
+            TaskSources::Local(mmaps) => {
+                let mmap = &mmaps[file_index];
+                &mmap[start as usize..end as usize]
+            }
+            TaskSources::Remote => {
+                unimplemented!("Remote source reading not yet implemented")
+            }
+        }
+    }
+}
+
+/// Builder for collecting task sources during task creation
+struct TaskSource {
+    mmaps: Vec<Arc<Mmap>>,
+}
+
+impl TaskSource {
+    /// Create a new empty task source builder
+    fn new() -> Self {
+        Self {
+            mmaps: Vec::new(),
+        }
+    }
+    
+    /// Add a source from the given location at the specified file index
+    fn add_from_location(&mut self, location: &SourceLocation, file_index: usize) {
+        match location {
+            SourceLocation::Local { mmaps, .. } => {
+                self.mmaps.push(Arc::clone(&mmaps[file_index]));
+            }
+            SourceLocation::Remote { .. } => {
+                unimplemented!("Remote source support not yet implemented")
+            }
+        }
+    }
+    
+    /// Convert into TaskSources for execution
+    fn into_task_sources(self) -> TaskSources {
+        TaskSources::Local(self.mmaps)
+    }
+}
+
 // Memory-mapped task type for high performance file operations
 struct MmapWriteTask {
     // Target write info - single contiguous region
@@ -25,7 +77,7 @@ struct MmapWriteTask {
     target_file_index: usize,
 
     // Source read info - multiple reads from potentially multiple files
-    source_mmaps: Vec<Arc<Mmap>>, // All source mmaps we need to read from
+    source: TaskSources,
     source_ranges: Vec<(u64, u64, u64)>, // Flat list of (start, end, target_offset) byte ranges
     ranges_per_file: Vec<usize>,  // How many ranges belong to each source file
 }
@@ -46,15 +98,19 @@ impl MmapWriteTask {
 
             let mut range_idx = 0usize;
 
+            let source_file_count = match &self.source {
+                TaskSources::Local(mmaps) => mmaps.len(),
+                TaskSources::Remote => 0, // TODO: Implement remote source file counting
+            };
+            
             trace!(
                 "  Executing {} source files, {} total ranges",
-                self.source_mmaps.len(),
+                source_file_count,
                 self.source_ranges.len()
             );
 
             // Process each source file
             for (file_idx, &num_ranges) in self.ranges_per_file.iter().enumerate() {
-                let source_mmap = &self.source_mmaps[file_idx];
                 trace!(
                     "    Processing source file {}: {} ranges",
                     file_idx, num_ranges
@@ -70,8 +126,8 @@ impl MmapWriteTask {
                         range_num, source_start, source_end, range_length, target_offset
                     );
 
-                    // Read from source
-                    let source_slice = &source_mmap[source_start as usize..source_end as usize];
+                    // Read from source using abstracted method
+                    let source_slice = self.source.read(file_idx, source_start, source_end);
 
                     // Write to target at specified offset (not sequential)
                     let target_offset_usize = target_offset as usize;
@@ -160,15 +216,169 @@ type Result<T> = std::result::Result<T, RedistributorError>;
 struct Layout {
     topology: Topology,
     metadatas: Vec<(usize, Metadata)>,
+}
+
+/// Source location for input files
+enum SourceLocation {
+    Local {
+        dir: PathBuf,
+        mmaps: Vec<Arc<Mmap>>,
+    },
+    Remote {
+        // TODO: Add remote source fields (base_url, auth, etc.)
+    },
+}
+
+
+
+/// Write location for target files
+struct WriteLocation {
     dir: PathBuf,
+    mmaps: Option<Vec<Arc<MmapMut>>>,
+}
+
+impl WriteLocation {
+    /// Initialize target files and memory maps
+    async fn init(&mut self, layout: &Layout) -> Result<()> {
+        // Create directory
+        tokio::fs::create_dir_all(&self.dir).await?;
+        
+        // Create files with headers
+        self.create_files_with_headers(layout).await?;
+        
+        // Initialize memory maps
+        self.init_target_mmaps(layout)?;
+        
+        Ok(())
+    }
+    
+    /// Save/flush all memory-mapped files and write topology
+    async fn save(&self, topology: &Topology) -> Result<()> {
+        if let Some(ref target_mmaps) = self.mmaps {
+            for target_mmap in target_mmaps {
+                target_mmap.flush()?;
+            }
+        }
+        self.write_topology(topology).await?;
+        Ok(())
+    }
+    
+    /// Create a write task for the specified file index and parameters
+    fn create_write_task(
+        &self,
+        target_file_index: usize,
+        target_start: u64,
+        target_end: u64,
+        source: TaskSources,
+        source_ranges: Vec<(u64, u64, u64)>,
+        ranges_per_file: Vec<usize>,
+    ) -> Option<MmapWriteTask> {
+        let target_mmap = Arc::clone(self.mmaps.as_ref()?.get(target_file_index)?);
+        
+        Some(MmapWriteTask {
+            target_mmap,
+            target_start,
+            target_end,
+            target_file_index,
+            source,
+            source_ranges,
+            ranges_per_file,
+        })
+    }
+    
+    /// Write topology.json file if needed
+    async fn write_topology(&self, topology: &Topology) -> Result<()> {
+        if topology.world_size() > 1 {
+            let topology_json = serde_json::to_vec_pretty(topology)?;
+            tokio::fs::write(self.dir.join("topology.json"), &topology_json).await?;
+        }
+        Ok(())
+    }
+    
+    /// Create all files with headers
+    async fn create_files_with_headers(&self, layout: &Layout) -> Result<()> {
+        assert_eq!(
+            layout.topology.filenames().len(),
+            layout.metadatas.len()
+        );
+        let file_creation_futures: Vec<_> = layout
+            .metadatas
+            .iter()
+            .zip(layout.topology.filenames())
+            .map(|((_, metadata), filename)| async move {
+                let data_len = metadata.validate()?;
+                let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
+                // Force alignment to 8 bytes.
+                let extra = (8 - metadata_buf.len() % 8) % 8;
+                metadata_buf.extend(vec![b' '; extra]);
+
+                let n: u64 = metadata_buf.len() as u64;
+
+                let mut f = File::options()
+                    .write(true)
+                    .create(true)
+                    .open(self.dir.join(filename))
+                    .await?;
+                f.write_all(&n.to_le_bytes()).await?;
+                f.write_all(&metadata_buf).await?;
+                let total = data_len + metadata_buf.len() + 8;
+                f.set_len(total as u64).await?;
+                f.flush().await?;
+
+                Ok(())
+            })
+            .collect();
+
+        // Wait for all files to be created
+        let creation_results: Vec<Result<_>> = join_all(file_creation_futures).await;
+        for result in creation_results {
+            result?;
+        }
+
+        Ok(())
+    }
+    
+    /// Initialize target memory maps after files have been created
+    fn init_target_mmaps(&mut self, layout: &Layout) -> Result<()> {
+        if self.mmaps.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let target_mmaps: Result<Vec<_>> = layout
+            .topology
+            .filenames()
+            .iter()
+            .map(|filename| {
+                let filepath = self.dir.join(filename);
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&filepath)?;
+                unsafe { Ok(Arc::new(MmapMut::map_mut(&file)?)) }
+            })
+            .collect();
+
+        self.mmaps = Some(target_mmaps?);
+        Ok(())
+    }
+}
+
+/// Source configuration
+struct Source {
+    layout: Layout,
+    location: SourceLocation,
+}
+
+/// Target configuration
+struct Target {
+    layout: Layout,
+    location: WriteLocation,
 }
 
 /// Async streaming tensor redistributor with parallel processing and pre-calculated offsets
 pub struct AsyncTensorRedistributor {
-    source: Layout,
-    source_mmaps: Vec<Arc<Mmap>>,
-    target: Layout,
-    target_mmaps: Option<Vec<Arc<MmapMut>>>,
+    source: Source,
+    target: Target,
 }
 
 impl AsyncTensorRedistributor {
@@ -191,22 +401,20 @@ impl AsyncTensorRedistributor {
         let source_metadatas = source_metadatas?;
         let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
 
-        let source = Layout {
-            dir: source_dir,
+        let source_layout = Layout {
             topology: source_topology,
             metadatas: source_metadatas,
         };
-        let target = Layout {
-            dir: target_dir,
+        let target_layout = Layout {
             topology: target_topology,
             metadatas: target_metadatas,
         };
-        let source_mmaps: Result<Vec<_>> = source
+        let source_mmaps: Result<Vec<_>> = source_layout
             .topology
             .filenames()
             .iter()
             .map(|filename| {
-                let filepath = source.dir.join(filename);
+                let filepath = source_dir.join(filename);
                 let file = std::fs::File::open(&filepath)?;
                 unsafe { Ok(Arc::new(Mmap::map(&file)?)) }
             })
@@ -215,56 +423,45 @@ impl AsyncTensorRedistributor {
 
         // Don't open target files yet - they might not exist
         Ok(Self {
-            source,
-            source_mmaps,
-            target,
-            target_mmaps: None,
+            source: Source {
+                layout: source_layout,
+                location: SourceLocation::Local {
+                    dir: source_dir,
+                    mmaps: source_mmaps,
+                },
+            },
+            target: Target {
+                layout: target_layout,
+                location: WriteLocation {
+                    dir: target_dir,
+                    mmaps: None,
+                },
+            },
         })
     }
 
-    /// Initialize target memory maps after files have been created
-    fn init_target_mmaps(&mut self) -> Result<()> {
-        if self.target_mmaps.is_some() {
-            return Ok(()); // Already initialized
-        }
 
-        let target_mmaps: Result<Vec<_>> = self
-            .target
-            .topology
-            .filenames()
-            .iter()
-            .map(|filename| {
-                let filepath = self.target.dir.join(filename);
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&filepath)?;
-                unsafe { Ok(Arc::new(MmapMut::map_mut(&file)?)) }
-            })
-            .collect();
-
-        self.target_mmaps = Some(target_mmaps?);
-        Ok(())
-    }
 
     /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         trace!("Start");
         let start = Instant::now();
-        tokio::fs::create_dir_all(&self.target.dir).await?;
 
-        self.create_files_with_headers().await?;
+        self.target.location.init(&self.target.layout).await?;
         trace!("Created headers {:?}", start.elapsed());
-
-        // Initialize target memory maps now that files exist
-        self.init_target_mmaps()?;
 
         let (tx, mut rx) = channel::<MmapWriteTask>(10_000);
         // Estimate of the data needed to be copied.
-        let mut total = 0;
-        for mmap in self.source_mmaps.iter() {
-            let data = mmap;
-            total += data.len() as u64;
+        let mut total = 0u64;
+        for (header_size, metadata) in &self.source.layout.metadatas {
+            // Find the maximum data end offset in this file
+            let max_data_end = metadata.tensors().values()
+                .map(|tensor_info| tensor_info.data_offsets.1)
+                .max()
+                .unwrap_or(0);
+            
+            // Total file size = header + data section
+            total += (header_size + max_data_end) as u64;
         }
 
         let progress = ProgressBar::new(total);
@@ -304,25 +501,19 @@ impl AsyncTensorRedistributor {
 
         progress.finish();
         println!("Done write, waiting for the kernel to sync on device...");
-        // Force flush all memory-mapped target files to ensure writes are committed
-        if let Some(ref target_mmaps) = self.target_mmaps {
-            for target_mmap in target_mmaps {
-                target_mmap.flush()?;
-            }
-        }
+        // Force flush all memory-mapped target files and write topology
+        self.target.location.save(&self.target.layout.topology).await?;
 
         trace!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
         let mut created_files = Vec::new();
-        for filename in self.target.topology.filenames() {
+        for filename in self.target.layout.topology.filenames() {
             created_files.push(filename.clone());
         }
 
-        // Write topology.json if needed (for multi-rank outputs)
-        if self.target.topology.world_size() > 1 {
-            let topology_json = serde_json::to_vec_pretty(&self.target.topology)?;
-            tokio::fs::write(self.target.dir.join("topology.json"), &topology_json).await?;
+        // Add topology.json if it was written (for multi-rank outputs)
+        if self.target.layout.topology.world_size() > 1 {
             created_files.push("topology.json".to_string());
         }
 
@@ -396,15 +587,15 @@ impl AsyncTensorRedistributor {
     async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
         trace!(
             "Creating tasks for {} target files",
-            self.target.topology.filenames().len()
+            self.target.layout.topology.filenames().len()
         );
 
         // Process each target file in order
-        for (target_file_index, filename) in self.target.topology.filenames().iter().enumerate() {
+        for (target_file_index, filename) in self.target.layout.topology.filenames().iter().enumerate() {
             trace!("Processing target file {}: {}", target_file_index, filename);
 
             // Get the metadata for this target file
-            let (header_size, metadata) = &self.target.metadatas[target_file_index];
+            let (header_size, metadata) = &self.target.layout.metadatas[target_file_index];
 
             // Collect tensors and sort by data offset for sequential writes
             let tensors = metadata.tensors();
@@ -450,6 +641,7 @@ impl AsyncTensorRedistributor {
         // Look up the tensor in source topology
         let source_tensor = self
             .source
+            .layout
             .topology
             .tensors()
             .get(tensor_name)
@@ -459,6 +651,7 @@ impl AsyncTensorRedistributor {
 
         let target_tensor = self
             .target
+            .layout
             .topology
             .tensors()
             .get(tensor_name)
@@ -466,13 +659,12 @@ impl AsyncTensorRedistributor {
                 name: tensor_name.to_string(),
             })?;
 
-        // Get target write parameters
-        let target_mmap = Arc::clone(&self.target_mmaps.as_ref().unwrap()[target_file_index]);
+        // Calculate target write parameters
         let target_start = (target_header_size + target_tensor_info.data_offsets.0) as u64;
         let target_end = (target_header_size + target_tensor_info.data_offsets.1) as u64;
 
         // Collect source reads needed to fulfill this target write
-        let mut source_mmaps = Vec::new();
+        let mut task_source = TaskSource::new();
         let mut source_ranges = Vec::new();
         let mut ranges_per_file = Vec::new();
 
@@ -484,7 +676,7 @@ impl AsyncTensorRedistributor {
                     source_info,
                     target_info,
                     target_file_index,
-                    &mut source_mmaps,
+                    &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
                 )?;
@@ -496,7 +688,7 @@ impl AsyncTensorRedistributor {
                     source_info,
                     target_info,
                     target_file_index,
-                    &mut source_mmaps,
+                    &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
                 )?;
@@ -508,7 +700,7 @@ impl AsyncTensorRedistributor {
                     source_info,
                     target_info,
                     target_file_index,
-                    &mut source_mmaps,
+                    &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
                 )?;
@@ -520,7 +712,7 @@ impl AsyncTensorRedistributor {
                     source_info,
                     target_info,
                     target_file_index,
-                    &mut source_mmaps,
+                    &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
                 )?;
@@ -529,25 +721,26 @@ impl AsyncTensorRedistributor {
 
         // Create and send the task if we have any reads to do
         if !source_ranges.is_empty() {
+            let source_count = task_source.mmaps.len();
+            
             trace!(
                 "    Task created: {} source files, {} total ranges, writing {}->{}",
-                source_mmaps.len(),
+                source_count,
                 source_ranges.len(),
                 target_start,
                 target_end
             );
 
-            let task = MmapWriteTask {
-                target_mmap,
+            if let Some(task) = self.target.location.create_write_task(
+                target_file_index,
                 target_start,
                 target_end,
-                target_file_index,
-                source_mmaps,
+                task_source.into_task_sources(),
                 source_ranges,
                 ranges_per_file,
-            };
-
-            tx.send(task).await.unwrap();
+            ) {
+                tx.send(task).await.unwrap();
+            }
         } else {
             trace!("    No task created (no source ranges)");
         }
@@ -561,7 +754,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::DistributedInfo,
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
-        source_mmaps: &mut Vec<Arc<Mmap>>,
+        task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -603,7 +796,7 @@ impl AsyncTensorRedistributor {
 
                 // Get source file metadata to calculate byte offsets
                 let (source_header_size, source_metadata) =
-                    &self.source.metadatas[source_file_index];
+                    &self.source.layout.metadatas[source_file_index];
                 let source_tensors = source_metadata.tensors();
                 let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
                     RedistributorError::TensorNotFound {
@@ -633,7 +826,7 @@ impl AsyncTensorRedistributor {
                         "      Added {} ranges from source file {}",
                         ranges_for_this_file, source_file_index
                     );
-                    source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+                    task_source.add_from_location(&self.source.location, source_file_index);
                     ranges_per_file.push(ranges_for_this_file);
                 }
             }
@@ -648,7 +841,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::SharedInfo,
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
-        source_mmaps: &mut Vec<Arc<Mmap>>,
+        task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -682,7 +875,7 @@ impl AsyncTensorRedistributor {
         let source_file_index = source_info.filename_indices()[0];
 
         // Get source file metadata to calculate byte offsets
-        let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+        let (source_header_size, source_metadata) = &self.source.layout.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
         let source_tensor_info =
             source_tensors
@@ -714,7 +907,7 @@ impl AsyncTensorRedistributor {
                 "      Added {} ranges from source file {}",
                 ranges_for_this_file, source_file_index
             );
-            source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+            task_source.add_from_location(&self.source.location, source_file_index);
             ranges_per_file.push(ranges_for_this_file);
         }
 
@@ -727,7 +920,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::SharedInfo,
         target_info: &crate::topology::SharedInfo,
         target_file_index: usize,
-        source_mmaps: &mut Vec<Arc<Mmap>>,
+        task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -741,7 +934,7 @@ impl AsyncTensorRedistributor {
         let source_file_index = source_info.filename_indices()[0];
 
         // Get source file metadata to calculate byte offsets
-        let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+        let (source_header_size, source_metadata) = &self.source.layout.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
         let source_tensor_info =
             source_tensors
@@ -759,7 +952,7 @@ impl AsyncTensorRedistributor {
         let source_end = (source_header_size + source_data_offset + tensor_size_bytes) as u64;
 
         source_ranges.push((source_start, source_end, 0));
-        source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+        task_source.add_from_location(&self.source.location, source_file_index);
         ranges_per_file.push(1); // Single range for the complete tensor
 
         trace!(
@@ -776,7 +969,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::DistributedInfo,
         target_info: &crate::topology::SharedInfo,
         target_file_index: usize,
-        source_mmaps: &mut Vec<Arc<Mmap>>,
+        task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -813,7 +1006,7 @@ impl AsyncTensorRedistributor {
 
                 // Get source file metadata to calculate byte offsets
                 let (source_header_size, source_metadata) =
-                    &self.source.metadatas[source_file_index];
+                    &self.source.layout.metadatas[source_file_index];
                 let source_tensors = source_metadata.tensors();
                 let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
                     RedistributorError::TensorNotFound {
@@ -843,7 +1036,7 @@ impl AsyncTensorRedistributor {
                         "      Added {} ranges from source file {}",
                         ranges_for_this_file, source_file_index
                     );
-                    source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+                    task_source.add_from_location(&self.source.location, source_file_index);
                     ranges_per_file.push(ranges_for_this_file);
                 }
             }
@@ -852,49 +1045,7 @@ impl AsyncTensorRedistributor {
         Ok(())
     }
 
-    /// Create all files with headers
-    async fn create_files_with_headers(&self) -> Result<()> {
-        assert_eq!(
-            self.target.topology.filenames().len(),
-            self.target.metadatas.len()
-        );
-        let file_creation_futures: Vec<_> = self
-            .target
-            .metadatas
-            .iter()
-            .zip(self.target.topology.filenames())
-            .map(|((_, metadata), filename)| async move {
-                let data_len = metadata.validate()?;
-                let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
-                // Force alignment to 8 bytes.
-                let extra = (8 - metadata_buf.len() % 8) % 8;
-                metadata_buf.extend(vec![b' '; extra]);
 
-                let n: u64 = metadata_buf.len() as u64;
-
-                let mut f = File::options()
-                    .write(true)
-                    .create(true)
-                    .open(self.target.dir.join(filename))
-                    .await?;
-                f.write_all(&n.to_le_bytes()).await?;
-                f.write_all(&metadata_buf).await?;
-                let total = data_len + metadata_buf.len() + 8;
-                f.set_len(total as u64).await?;
-                f.flush().await?;
-
-                Ok(())
-            })
-            .collect();
-
-        // Wait for all files to be created
-        let creation_results: Vec<Result<_>> = join_all(file_creation_futures).await;
-        for result in creation_results {
-            result?;
-        }
-
-        Ok(())
-    }
 }
 
 /// Read safetensors file efficiently using memory mapping
