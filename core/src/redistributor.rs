@@ -84,12 +84,14 @@ impl MmapWriteTask {
         }
 
         // Flush just the range we wrote asynchronously to avoid accumulating dirty pages
-        if let Err(e) = self.target_mmap.flush_async_range(
-            self.target_start as usize, 
-            target_length
-        ) {
-            error!("Async flush failed for range {}:{}: {}", 
-                   self.target_start, self.target_end, e);
+        if let Err(e) = self
+            .target_mmap
+            .flush_async_range(self.target_start as usize, target_length)
+        {
+            error!(
+                "Async flush failed for range {}:{}: {}",
+                self.target_start, self.target_end, e
+            );
             // Don't fail the task, just log the error and continue
         }
 
@@ -300,6 +302,8 @@ impl AsyncTensorRedistributor {
         drop(tx);
         handle.await?;
 
+        progress.finish();
+        println!("Done write, waiting for the kernel to sync on device...");
         // Force flush all memory-mapped target files to ensure writes are committed
         if let Some(ref target_mmaps) = self.target_mmaps {
             for target_mmap in target_mmaps {
@@ -307,7 +311,6 @@ impl AsyncTensorRedistributor {
             }
         }
 
-        progress.finish();
         trace!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
