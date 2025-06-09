@@ -251,8 +251,6 @@ impl MmapWriteTask {
             let target_ptr = self.target_mmap.as_ptr().add(self.target_start as usize) as *mut u8;
             let target_slice = std::slice::from_raw_parts_mut(target_ptr, target_length);
 
-            let mut range_idx = 0usize;
-
             let source_file_count = match &self.source {
                 TaskSources::Local(mmaps) => mmaps.len(),
                 TaskSources::Remote { file_paths, .. } => file_paths.len(),
@@ -265,6 +263,7 @@ impl MmapWriteTask {
             );
 
             // Process each source file
+            let mut range_idx = 0usize;
             for (file_idx, &num_ranges) in self.ranges_per_file.iter().enumerate() {
                 trace!(
                     "    Processing source file {}: {} ranges",
@@ -396,30 +395,30 @@ struct WriteLocation {
 impl WriteLocation {
     /// Initialize target files and memory maps
     async fn init(&mut self, layout: &Layout) -> Result<()> {
-        println!("INIT: Starting target location initialization...");
+        trace!("INIT: Starting target location initialization...");
 
         // Create directory
-        println!("INIT: Creating directory...");
+        trace!("INIT: Creating directory...");
         let dir_start = Instant::now();
         tokio::fs::create_dir_all(&self.dir).await?;
-        println!("INIT: Directory created in {:?}", dir_start.elapsed());
+        trace!("INIT: Directory created in {:?}", dir_start.elapsed());
 
         // Create files with headers
-        println!("INIT: Creating files with headers...");
+        trace!("INIT: Creating files with headers...");
         let files_start = Instant::now();
         self.create_files_with_headers(layout).await?;
-        println!("INIT: Files created in {:?}", files_start.elapsed());
+        trace!("INIT: Files created in {:?}", files_start.elapsed());
 
         // Initialize memory maps
-        println!("INIT: Initializing memory maps...");
+        trace!("INIT: Initializing memory maps...");
         let mmap_start = Instant::now();
         self.init_target_mmaps(layout)?;
-        println!(
+        trace!(
             "INIT: Memory maps initialized in {:?}",
             mmap_start.elapsed()
         );
 
-        println!("INIT: Target location initialization complete");
+        trace!("INIT: Target location initialization complete");
         Ok(())
     }
 
@@ -615,14 +614,14 @@ impl AsyncTensorRedistributor {
         target_topology: Topology,
     ) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60)) // Overall request timeout
-            .connect_timeout(Duration::from_secs(10)) // Connection timeout
-            .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer
-            .pool_max_idle_per_host(32) // Allow more concurrent connections per host
-            .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
-            .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keep-alive timeout
+            .timeout(Duration::from_secs(120)) // Longer overall timeout
+            .connect_timeout(Duration::from_secs(30)) // Longer connection timeout
+            .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive much longer (5 minutes)
+            .pool_max_idle_per_host(8) // Fewer connections but longer lived
+            .http2_keep_alive_interval(Duration::from_secs(10)) // More frequent HTTP/2 keep-alive
+            .http2_keep_alive_timeout(Duration::from_secs(30)) // Longer HTTP/2 keep-alive timeout
             .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
-            .tcp_keepalive(Duration::from_secs(60)) // TCP-level keep-alive
+            .tcp_keepalive(Duration::from_secs(30)) // More frequent TCP-level keep-alive
             .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
             .build()
             .map_err(|e| {
@@ -652,8 +651,8 @@ impl AsyncTensorRedistributor {
             metadatas: target_metadatas,
         };
 
-        // Create semaphore with 100 permits for HTTP request throttling
-        let http_semaphore = Arc::new(Semaphore::new(100));
+        // Create semaphore with few permits for batched concurrent reads
+        let http_semaphore = Arc::new(Semaphore::new(5));
 
         // Discover remote topology and metadata WITH CACHING to avoid duplicate requests
         let (source_topology, metadata_cache) =
@@ -963,9 +962,11 @@ impl AsyncTensorRedistributor {
         auth_headers: &HeaderMap,
     ) -> Result<Metadata> {
         // Make a single request and stream the response, cutting it early once we have the header
+        let range_header = format!("bytes={}-{}", 0, 10 * 1024 * 1024);
         let response = client
             .get(file_url.clone())
             .headers(auth_headers.clone())
+            .header(RANGE, range_header)
             .send()
             .await
             .map_err(|e| {
@@ -1041,21 +1042,21 @@ impl AsyncTensorRedistributor {
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         trace!("Start");
         let start = Instant::now();
-        println!("REDISTRIBUTION: Starting redistribute process...");
+        trace!("REDISTRIBUTION: Starting redistribute process...");
 
-        println!("REDISTRIBUTION: Initializing target location...");
+        trace!("REDISTRIBUTION: Initializing target location...");
         let init_start = Instant::now();
         self.target.location.init(&self.target.layout).await?;
-        println!(
+        trace!(
             "REDISTRIBUTION: Target location initialized in {:?}",
             init_start.elapsed()
         );
         trace!("Created headers {:?}", start.elapsed());
 
-        println!("REDISTRIBUTION: Setting up task channel...");
+        trace!("REDISTRIBUTION: Setting up task channel...");
         let (tx, mut rx) = channel::<MmapWriteTask>(10_000);
 
-        println!("REDISTRIBUTION: Calculating total size...");
+        trace!("REDISTRIBUTION: Calculating total size...");
         let calc_start = Instant::now();
         // Estimate of the data needed to be copied.
         let mut total = 0u64;
@@ -1071,13 +1072,13 @@ impl AsyncTensorRedistributor {
             // Total file size = header + data section
             total += (header_size + max_data_end) as u64;
         }
-        println!(
+        trace!(
             "REDISTRIBUTION: Total size calculated: {} bytes in {:?}",
             total,
             calc_start.elapsed()
         );
 
-        println!("REDISTRIBUTION: Setting up progress bar...");
+        trace!("REDISTRIBUTION: Setting up progress bar...");
         let progress = ProgressBar::new(total);
         progress.set_style(
             ProgressStyle::default_bar()
@@ -1085,7 +1086,7 @@ impl AsyncTensorRedistributor {
                 .unwrap(),
         );
 
-        println!("REDISTRIBUTION: Starting progress task...");
+        trace!("REDISTRIBUTION: Starting progress task...");
         let p = progress.clone();
         let handle = tokio::spawn(async move {
             let mut batch = Vec::with_capacity(1024);
@@ -1111,15 +1112,15 @@ impl AsyncTensorRedistributor {
             }
         });
 
-        println!("REDISTRIBUTION: Creating tasks...");
+        trace!("REDISTRIBUTION: Creating tasks...");
         let tasks_start = Instant::now();
         self.create_tasks(&tx).await?;
-        println!(
+        trace!(
             "REDISTRIBUTION: Tasks created in {:?}",
             tasks_start.elapsed()
         );
 
-        println!("REDISTRIBUTION: Starting task execution...");
+        trace!("REDISTRIBUTION: Starting task execution...");
         drop(tx);
         handle.await?;
 
@@ -1212,7 +1213,7 @@ impl AsyncTensorRedistributor {
     }
 
     async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
-        println!("TASKS: Starting task creation...");
+        trace!("TASKS: Starting task creation...");
         let start = Instant::now();
 
         trace!(
@@ -1221,14 +1222,14 @@ impl AsyncTensorRedistributor {
         );
 
         let file_count = self.target.layout.topology.filenames().len();
-        println!("TASKS: Processing {} target files", file_count);
+        trace!("TASKS: Processing {} target files", file_count);
 
         // Process each target file in order
         for (target_file_index, filename) in
             self.target.layout.topology.filenames().iter().enumerate()
         {
             let file_start = Instant::now();
-            println!(
+            trace!(
                 "TASKS: Processing target file {}/{}: {}",
                 target_file_index + 1,
                 file_count,
@@ -1247,7 +1248,7 @@ impl AsyncTensorRedistributor {
             tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
             let tensor_count = tensor_entries.len();
-            println!(
+            trace!(
                 "TASKS: Found {} tensors in target file {}",
                 tensor_count, target_file_index
             );
@@ -1262,7 +1263,7 @@ impl AsyncTensorRedistributor {
             for (i, (tensor_name, tensor_info)) in tensor_entries.iter().enumerate() {
                 let tensor_start = Instant::now();
                 if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
-                    println!(
+                    trace!(
                         "TASKS: Creating task for tensor {}/{}: '{}' (offset: {} -> {})",
                         i + 1,
                         tensor_count,
@@ -1287,7 +1288,7 @@ impl AsyncTensorRedistributor {
                 .await?;
 
                 if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
-                    println!(
+                    trace!(
                         "TASKS: Task created for tensor '{}' in {:?}",
                         tensor_name,
                         tensor_start.elapsed()
@@ -1295,14 +1296,14 @@ impl AsyncTensorRedistributor {
                 }
             }
 
-            println!(
+            trace!(
                 "TASKS: Completed target file {} in {:?}",
                 target_file_index,
                 file_start.elapsed()
             );
         }
         trace!("Finished creating tasks");
-        println!("TASKS: All tasks created in {:?}", start.elapsed());
+        trace!("TASKS: All tasks created in {:?}", start.elapsed());
         Ok(())
     }
 

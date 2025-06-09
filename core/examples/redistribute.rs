@@ -183,16 +183,16 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
     // For now, use empty auth headers. In the future, this could be configurable
     let auth_headers = HeaderMap::new();
     
-    // Create a single HTTP client for connection pooling
+    // Create a single HTTP client for connection pooling with aggressive connection reuse
     let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer
-        .pool_max_idle_per_host(32) // Allow more concurrent connections per host
-        .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keep-alive
-        .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keep-alive timeout
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive much longer (5 minutes)
+        .pool_max_idle_per_host(8) // Fewer connections but longer lived
+        .http2_keep_alive_interval(Duration::from_secs(10)) // More frequent HTTP/2 keep-alive
+        .http2_keep_alive_timeout(Duration::from_secs(30)) // Longer HTTP/2 keep-alive timeout
         .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
-        .tcp_keepalive(Duration::from_secs(60)) // TCP-level keep-alive
+        .tcp_keepalive(Duration::from_secs(30)) // More frequent TCP-level keep-alive
         .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
         .build()
         .expect("Failed to create HTTP client");
