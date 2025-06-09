@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use reqwest::Client;
 use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
 use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
 use std::collections::BTreeMap;
@@ -179,35 +180,21 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
     
     // For now, use empty auth headers. In the future, this could be configurable
     let auth_headers = HeaderMap::new();
+    let client = Client::new();
 
-    // We need to create a target topology, but we don't know the source topology yet
-    // For now, we'll need to load the remote topology first to determine the structure
-    // This is a simplified approach - in practice, you might want to make this configurable
-    
-    println!("Note: Remote topology discovery will be performed during redistribution");
-    println!("Target world size: {}", target_world_size);
+    // Load the source topology from the remote URL first
+    println!("Loading remote topology...");
+    let source_topology = AsyncTensorRedistributor::load_or_create_remote_topology(&client, &base_url, &auth_headers).await?;
 
-    // Generate target filenames
-    let target_filenames = if target_world_size == 1 {
-        vec!["model.safetensors".to_string()]
-    } else {
-        (0..target_world_size)
-            .map(|rank| format!("rank{rank}.safetensors"))
-            .collect()
-    };
+    let source_ranks = source_topology.world_size();
+    println!("Source topology has {} ranks", source_ranks);
 
-    // For remote redistribution, we need to create a placeholder target topology
-    // The actual redistribution logic will need to handle this properly
-    let target_tensors = BTreeMap::new();
-    
-    // Create a simple placeholder topology for now
-    // In a real implementation, you might want to fetch the remote topology first
-    // to create an appropriate target topology
-    let target_topology = Topology::new(
-        target_tensors,
-        target_filenames,
-        target_world_size,
-    )?;
+    // Create target topology from the source topology (same logic as local)
+    let target_topology = create_target_topology(&source_topology, target_world_size)?;
+    println!(
+        "Target topology will have {} ranks",
+        target_topology.world_size()
+    );
 
     // Create and run the async redistributor from URL
     let mut redistributor = AsyncTensorRedistributor::from_url(

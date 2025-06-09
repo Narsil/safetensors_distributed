@@ -580,7 +580,7 @@ impl AsyncTensorRedistributor {
     }
 
     /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
-    async fn load_or_create_remote_topology(
+    pub async fn load_or_create_remote_topology(
         client: &Client,
         base_url: &Url,
         auth_headers: &HeaderMap,
@@ -806,7 +806,11 @@ impl AsyncTensorRedistributor {
         if !response.status().is_success() {
             return Err(RedistributorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Failed to fetch from {}: status {}", file_url, response.status()),
+                format!(
+                    "Failed to fetch from {}: status {}",
+                    file_url,
+                    response.status()
+                ),
             )));
         }
 
@@ -822,7 +826,7 @@ impl AsyncTensorRedistributor {
                     format!("Failed to read chunk: {}", e),
                 ))
             })?;
-            
+
             buffer.extend_from_slice(&chunk);
 
             // Step 1: Once we have at least 8 bytes, parse the header length
@@ -833,23 +837,21 @@ impl AsyncTensorRedistributor {
                         "Failed to convert header length bytes to array",
                     ))
                 })?;
-                
+
                 header_length = Some(u64::from_le_bytes(header_length_bytes));
             }
 
             // Step 2: Once we know the header length, check if we have the complete header
             if let Some(len) = header_length {
                 let total_needed = 8 + len as usize; // 8 bytes for length + header JSON
-                
+
                 if buffer.len() >= total_needed {
                     // We have all the data we need, extract the header JSON and stop streaming
                     let header_bytes = &buffer[8..total_needed];
-                    
+
                     // Step 3: Parse the JSON as safetensors metadata
                     let metadata: Metadata = serde_json::from_slice(header_bytes)
-                        .map_err(|e| {
-                            RedistributorError::Json(e)
-                        })?;
+                        .map_err(|e| RedistributorError::Json(e))?;
 
                     return Ok(metadata);
                 }
