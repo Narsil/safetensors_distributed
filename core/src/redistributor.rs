@@ -623,6 +623,7 @@ impl AsyncTensorRedistributor {
             .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keep-alive timeout
             .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
             .tcp_keepalive(Duration::from_secs(60)) // TCP-level keep-alive
+            .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
             .build()
             .map_err(|e| {
                 RedistributorError::Io(std::io::Error::new(
