@@ -83,6 +83,16 @@ impl MmapWriteTask {
             }
         }
 
+        // Flush just the range we wrote asynchronously to avoid accumulating dirty pages
+        if let Err(e) = self.target_mmap.flush_async_range(
+            self.target_start as usize, 
+            target_length
+        ) {
+            error!("Async flush failed for range {}:{}: {}", 
+                   self.target_start, self.target_end, e);
+            // Don't fail the task, just log the error and continue
+        }
+
         Ok(())
     }
 }
