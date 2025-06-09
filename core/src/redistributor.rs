@@ -32,6 +32,7 @@ struct MmapWriteTask {
 impl MmapWriteTask {
     fn run(&self) -> Result<()> {
         let target_length = (self.target_end - self.target_start) as usize;
+        println!("Writing {target_length} to {}", self.target_file_index);
 
         // SAFETY: This is safe because:
         // 1. All write ranges are pre-calculated and guaranteed non-overlapping
@@ -276,6 +277,14 @@ impl AsyncTensorRedistributor {
         self.create_tasks(&tx).await?;
         drop(tx);
         handle.await?;
+
+        // Force flush all memory-mapped target files to ensure writes are committed
+        if let Some(ref target_mmaps) = self.target_mmaps {
+            for target_mmap in target_mmaps {
+                target_mmap.flush()?;
+            }
+        }
+
         progress.finish();
         println!("Tasks done {:?}", start.elapsed());
 
@@ -513,7 +522,7 @@ impl AsyncTensorRedistributor {
         // Get tensor properties
         let full_shape = source_info.shape();
         let dtype_size = source_info.dtype().size();
-        
+
         // Calculate strides for the full tensor
         let ndim = full_shape.len();
         let mut full_strides = vec![1; ndim];
@@ -527,21 +536,22 @@ impl AsyncTensorRedistributor {
         // Process each source chunk to see if it overlaps with our target
         for source_chunk in source_info.chunks() {
             let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
-            
+
             // Find intersection between source and target intervals
             let intersections = intersection(&source_intervals, &target_intervals);
-            
+
             if !intersections.is_empty() {
                 let source_file_index = source_chunk.filename_index();
-                
+
                 // Get source file metadata to calculate byte offsets
-                let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+                let (source_header_size, source_metadata) =
+                    &self.source.metadatas[source_file_index];
                 let source_tensors = source_metadata.tensors();
-                let source_tensor_info = source_tensors
-                    .get(tensor_name)
-                    .ok_or_else(|| RedistributorError::TensorNotFound {
+                let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+                    RedistributorError::TensorNotFound {
                         name: tensor_name.to_string(),
-                    })?;
+                    }
+                })?;
                 let source_data_offset = source_tensor_info.data_offsets.0;
 
                 // Convert intersection results to byte ranges
@@ -549,10 +559,11 @@ impl AsyncTensorRedistributor {
                 for (source_offset, _target_offset, length) in intersections {
                     let start_bytes = source_offset * dtype_size;
                     let end_bytes = (source_offset + length) * dtype_size;
-                    
-                    let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
+
+                    let source_start =
+                        (source_header_size + source_data_offset + start_bytes) as u64;
                     let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
-                    
+
                     source_ranges.push((source_start, source_end));
                     ranges_for_this_file += 1;
                 }
@@ -593,7 +604,7 @@ impl AsyncTensorRedistributor {
         // Get tensor properties
         let full_shape = source_info.shape();
         let dtype_size = source_info.dtype().size();
-        
+
         // Calculate strides for the full tensor
         let ndim = full_shape.len();
         let mut full_strides = vec![1; ndim];
@@ -606,15 +617,16 @@ impl AsyncTensorRedistributor {
 
         // Pick the first source file that contains this tensor (they're all identical for shared tensors)
         let source_file_index = source_info.filename_indices()[0];
-        
+
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
-        let source_tensor_info = source_tensors
-            .get(tensor_name)
-            .ok_or_else(|| RedistributorError::TensorNotFound {
-                name: tensor_name.to_string(),
-            })?;
+        let source_tensor_info =
+            source_tensors
+                .get(tensor_name)
+                .ok_or_else(|| RedistributorError::TensorNotFound {
+                    name: tensor_name.to_string(),
+                })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
         // Convert element intervals to byte ranges
@@ -622,10 +634,10 @@ impl AsyncTensorRedistributor {
         for (start_elem, end_elem) in target_intervals {
             let start_bytes = start_elem * dtype_size;
             let end_bytes = end_elem * dtype_size;
-            
+
             let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
             let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
-            
+
             source_ranges.push((source_start, source_end));
             ranges_for_this_file += 1;
         }
@@ -641,29 +653,121 @@ impl AsyncTensorRedistributor {
 
     fn collect_reads_shared_to_shared(
         &self,
-        _tensor_name: &str,
-        _source_info: &crate::topology::SharedInfo,
-        _target_info: &crate::topology::SharedInfo,
-        _target_file_index: usize,
-        _source_mmaps: &mut Vec<Arc<Mmap>>,
-        _source_ranges: &mut Vec<(u64, u64)>,
-        _ranges_per_file: &mut Vec<usize>,
+        tensor_name: &str,
+        source_info: &crate::topology::SharedInfo,
+        target_info: &crate::topology::SharedInfo,
+        target_file_index: usize,
+        source_mmaps: &mut Vec<Arc<Mmap>>,
+        source_ranges: &mut Vec<(u64, u64)>,
+        ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
-        // TODO: Implement shared -> shared reading
+        // Check if this target file should contain this shared tensor
+        if !target_info.filename_indices().contains(&target_file_index) {
+            // This target file doesn't need this tensor
+            return Ok(());
+        }
+
+        // Pick the first source file that contains this tensor (they're all identical for shared tensors)
+        let source_file_index = source_info.filename_indices()[0];
+        
+        // Get source file metadata to calculate byte offsets
+        let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
+        let source_tensors = source_metadata.tensors();
+        let source_tensor_info =
+            source_tensors
+                .get(tensor_name)
+                .ok_or_else(|| RedistributorError::TensorNotFound {
+                    name: tensor_name.to_string(),
+                })?;
+        let source_data_offset = source_tensor_info.data_offsets.0;
+
+        // For shared to shared, we just copy the entire tensor
+        let tensor_size_bytes = source_tensor_info.data_offsets.1 - source_tensor_info.data_offsets.0;
+        
+        let source_start = (source_header_size + source_data_offset) as u64;
+        let source_end = (source_header_size + source_data_offset + tensor_size_bytes) as u64;
+        
+        source_ranges.push((source_start, source_end));
+        source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+        ranges_per_file.push(1); // Single range for the complete tensor
+
         Ok(())
     }
 
     fn collect_reads_distributed_to_shared(
         &self,
-        _tensor_name: &str,
-        _source_info: &crate::topology::DistributedInfo,
-        _target_info: &crate::topology::SharedInfo,
-        _target_file_index: usize,
-        _source_mmaps: &mut Vec<Arc<Mmap>>,
-        _source_ranges: &mut Vec<(u64, u64)>,
-        _ranges_per_file: &mut Vec<usize>,
+        tensor_name: &str,
+        source_info: &crate::topology::DistributedInfo,
+        target_info: &crate::topology::SharedInfo,
+        target_file_index: usize,
+        source_mmaps: &mut Vec<Arc<Mmap>>,
+        source_ranges: &mut Vec<(u64, u64)>,
+        ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
-        // TODO: Implement distributed -> shared reading
+        // Check if this target file should contain this shared tensor
+        if !target_info.filename_indices().contains(&target_file_index) {
+            // This target file doesn't need this tensor
+            return Ok(());
+        }
+
+        // Get tensor properties
+        let full_shape = source_info.shape();
+        let dtype_size = source_info.dtype().size();
+
+        // Calculate strides for the full tensor
+        let ndim = full_shape.len();
+        let mut full_strides = vec![1; ndim];
+        for i in (0..ndim - 1).rev() {
+            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+        }
+
+        // For shared target, we need the complete tensor (all elements)
+        let total_elements: usize = full_shape.iter().product();
+        let target_intervals = vec![(0, total_elements)];
+
+        // Process each source chunk and collect all the pieces
+        for source_chunk in source_info.chunks() {
+            let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
+
+            // Find intersection between source chunk and the full target tensor
+            let intersections = intersection(&source_intervals, &target_intervals);
+
+            if !intersections.is_empty() {
+                let source_file_index = source_chunk.filename_index();
+
+                // Get source file metadata to calculate byte offsets
+                let (source_header_size, source_metadata) =
+                    &self.source.metadatas[source_file_index];
+                let source_tensors = source_metadata.tensors();
+                let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+                    RedistributorError::TensorNotFound {
+                        name: tensor_name.to_string(),
+                    }
+                })?;
+                let source_data_offset = source_tensor_info.data_offsets.0;
+
+                // Convert intersection results to byte ranges
+                let mut ranges_for_this_file = 0;
+                for (source_offset, _target_offset, length) in intersections {
+                    let start_bytes = source_offset * dtype_size;
+                    let end_bytes = (source_offset + length) * dtype_size;
+
+                    let source_start =
+                        (source_header_size + source_data_offset + start_bytes) as u64;
+                    let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
+
+                    source_ranges.push((source_start, source_end));
+                    ranges_for_this_file += 1;
+                }
+
+                // Add the source mmap and record how many ranges belong to this file
+                if ranges_for_this_file > 0 {
+                    source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
+                    ranges_per_file.push(ranges_for_this_file);
+                }
+            }
+        }
+
         Ok(())
     }
 

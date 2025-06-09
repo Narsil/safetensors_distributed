@@ -29,8 +29,8 @@ fn create_target_topology(
 
         // Determine the best dimension to split based on tensor name and shape
         let split_dim = determine_split_dimension(tensor_name, &shape);
-
-        if shape[split_dim] % target_world_size == 0 {
+        if let Some(split_dim) = split_dim {
+            assert_eq!(shape[split_dim] % target_world_size, 0);
             // Create distributed tensor
             let chunk_size_per_rank = shape[split_dim] / target_world_size;
             let mut chunks = Vec::new();
@@ -70,26 +70,27 @@ fn create_target_topology(
 }
 
 /// Determine the best dimension to split a tensor based on its name and shape
-fn determine_split_dimension(tensor_name: &str, shape: &[usize]) -> usize {
+fn determine_split_dimension(tensor_name: &str, shape: &[usize]) -> Option<usize> {
     // Use the same logic as the original GPT-2 splitting
-    if ["c_fc", "c_attn", "wpe", "wte"]
+    if [
+        "c_fc", "c_attn", "wpe", "wte", "lm_head", "q_proj", "k_proj", "v_proj", "up", "gate",
+    ]
+    .iter()
+    .any(|f| tensor_name.contains(f))
+        && !tensor_name.contains("bias")
+    {
+        Some(1) // Split along dimension 1
+    } else if ["c_attn", "c_proj", "o_proj", "down"]
         .iter()
         .any(|f| tensor_name.contains(f))
         && !tensor_name.contains("bias")
     {
-        1 // Split along dimension 1
-    } else if ["c_attn", "c_proj"].iter().any(|f| tensor_name.contains(f))
-        && !tensor_name.contains("bias")
-    {
-        0 // Split along dimension 0
+        Some(0) // Split along dimension 0
+    } else if ["norm"].iter().any(|f| tensor_name.contains(f)) {
+        None // This is a shared tensor across ranks
     } else {
         // Default: split along the largest dimension
-        shape
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, size)| *size)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
+        Some(0)
     }
 }
 
