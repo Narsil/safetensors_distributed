@@ -1,6 +1,7 @@
 use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
 use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
+use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
@@ -25,14 +26,14 @@ struct MmapWriteTask {
 
     // Source read info - multiple reads from potentially multiple files
     source_mmaps: Vec<Arc<Mmap>>, // All source mmaps we need to read from
-    source_ranges: Vec<(u64, u64)>, // Flat list of (start, end) byte ranges
+    source_ranges: Vec<(u64, u64, u64)>, // Flat list of (start, end, target_offset) byte ranges
     ranges_per_file: Vec<usize>,  // How many ranges belong to each source file
 }
 
 impl MmapWriteTask {
     fn run(&self) -> Result<()> {
         let target_length = (self.target_end - self.target_start) as usize;
-        println!("Writing {target_length} to {}", self.target_file_index);
+        trace!("Writing {target_length} to {}", self.target_file_index);
 
         // SAFETY: This is safe because:
         // 1. All write ranges are pre-calculated and guaranteed non-overlapping
@@ -43,32 +44,43 @@ impl MmapWriteTask {
             let target_ptr = self.target_mmap.as_ptr().add(self.target_start as usize) as *mut u8;
             let target_slice = std::slice::from_raw_parts_mut(target_ptr, target_length);
 
-            let mut target_offset = 0usize;
             let mut range_idx = 0usize;
+
+            trace!(
+                "  Executing {} source files, {} total ranges",
+                self.source_mmaps.len(),
+                self.source_ranges.len()
+            );
 
             // Process each source file
             for (file_idx, &num_ranges) in self.ranges_per_file.iter().enumerate() {
                 let source_mmap = &self.source_mmaps[file_idx];
+                trace!(
+                    "    Processing source file {}: {} ranges",
+                    file_idx, num_ranges
+                );
 
                 // Process all ranges for this source file
-                for _ in 0..num_ranges {
-                    let (source_start, source_end) = self.source_ranges[range_idx];
+                for range_num in 0..num_ranges {
+                    let (source_start, source_end, target_offset) = self.source_ranges[range_idx];
                     let range_length = (source_end - source_start) as usize;
+
+                    trace!(
+                        "      Range {}: source {}→{} ({} bytes) -> target offset {}",
+                        range_num, source_start, source_end, range_length, target_offset
+                    );
 
                     // Read from source
                     let source_slice = &source_mmap[source_start as usize..source_end as usize];
 
-                    // Write to target at current offset
-                    target_slice[target_offset..target_offset + range_length]
+                    // Write to target at specified offset (not sequential)
+                    let target_offset_usize = target_offset as usize;
+                    target_slice[target_offset_usize..target_offset_usize + range_length]
                         .copy_from_slice(source_slice);
 
-                    target_offset += range_length;
                     range_idx += 1;
                 }
             }
-
-            // Sanity check: we should have written exactly the target length
-            debug_assert_eq!(target_offset, target_length);
         }
 
         Ok(())
@@ -225,12 +237,12 @@ impl AsyncTensorRedistributor {
 
     /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
-        println!("Start");
+        trace!("Start");
         let start = Instant::now();
         tokio::fs::create_dir_all(&self.target.dir).await?;
 
         self.create_files_with_headers().await?;
-        println!("Created headers {:?}", start.elapsed());
+        trace!("Created headers {:?}", start.elapsed());
 
         // Initialize target memory maps now that files exist
         self.init_target_mmaps()?;
@@ -266,7 +278,7 @@ impl AsyncTensorRedistributor {
                 for task in batch.drain(..) {
                     let length = (task.target_end - task.target_start) as usize;
                     if let Err(e) = task.run() {
-                        eprintln!("Write task failed: {}", e);
+                        error!("Write task failed: {}", e);
                         // Continue with other tasks rather than failing completely
                     }
                     p.inc(length as u64);
@@ -286,7 +298,7 @@ impl AsyncTensorRedistributor {
         }
 
         progress.finish();
-        println!("Tasks done {:?}", start.elapsed());
+        trace!("Tasks done {:?}", start.elapsed());
 
         // Collect created safetensors files
         let mut created_files = Vec::new();
@@ -369,8 +381,15 @@ impl AsyncTensorRedistributor {
     }
 
     async fn create_tasks(&self, tx: &Sender<MmapWriteTask>) -> Result<()> {
+        trace!(
+            "Creating tasks for {} target files",
+            self.target.topology.filenames().len()
+        );
+
         // Process each target file in order
-        for (target_file_index, _filename) in self.target.topology.filenames().iter().enumerate() {
+        for (target_file_index, filename) in self.target.topology.filenames().iter().enumerate() {
+            trace!("Processing target file {}: {}", target_file_index, filename);
+
             // Get the metadata for this target file
             let (header_size, metadata) = &self.target.metadatas[target_file_index];
 
@@ -380,8 +399,19 @@ impl AsyncTensorRedistributor {
                 tensors.iter().map(|(k, v)| (k, *v)).collect();
             tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
+            trace!(
+                "  Found {} tensors in target file {}",
+                tensor_entries.len(),
+                target_file_index
+            );
+
             // Process each tensor in write order
             for (tensor_name, tensor_info) in tensor_entries {
+                trace!(
+                    "  Creating task for tensor '{}' (offset: {} -> {})",
+                    tensor_name, tensor_info.data_offsets.0, tensor_info.data_offsets.1
+                );
+
                 self.create_task_for_tensor(
                     tx,
                     target_file_index,
@@ -392,6 +422,7 @@ impl AsyncTensorRedistributor {
                 .await?;
             }
         }
+        trace!("Finished creating tasks");
         Ok(())
     }
 
@@ -434,6 +465,7 @@ impl AsyncTensorRedistributor {
 
         match (source_tensor, target_tensor) {
             (Tensor::Distributed(source_info), Tensor::Distributed(target_info)) => {
+                trace!("    Pattern: Distributed -> Distributed");
                 self.collect_reads_distributed_to_distributed(
                     tensor_name,
                     source_info,
@@ -445,6 +477,7 @@ impl AsyncTensorRedistributor {
                 )?;
             }
             (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
+                trace!("    Pattern: Shared -> Distributed");
                 self.collect_reads_shared_to_distributed(
                     tensor_name,
                     source_info,
@@ -456,6 +489,7 @@ impl AsyncTensorRedistributor {
                 )?;
             }
             (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
+                trace!("    Pattern: Shared -> Shared");
                 self.collect_reads_shared_to_shared(
                     tensor_name,
                     source_info,
@@ -467,6 +501,7 @@ impl AsyncTensorRedistributor {
                 )?;
             }
             (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
+                trace!("    Pattern: Distributed -> Shared");
                 self.collect_reads_distributed_to_shared(
                     tensor_name,
                     source_info,
@@ -481,6 +516,14 @@ impl AsyncTensorRedistributor {
 
         // Create and send the task if we have any reads to do
         if !source_ranges.is_empty() {
+            trace!(
+                "    Task created: {} source files, {} total ranges, writing {}->{}",
+                source_mmaps.len(),
+                source_ranges.len(),
+                target_start,
+                target_end
+            );
+
             let task = MmapWriteTask {
                 target_mmap,
                 target_start,
@@ -492,6 +535,8 @@ impl AsyncTensorRedistributor {
             };
 
             tx.send(task).await.unwrap();
+        } else {
+            trace!("    No task created (no source ranges)");
         }
 
         Ok(())
@@ -504,7 +549,7 @@ impl AsyncTensorRedistributor {
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
         source_mmaps: &mut Vec<Arc<Mmap>>,
-        source_ranges: &mut Vec<(u64, u64)>,
+        source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
         // Find the target chunk that belongs to this target file
@@ -556,20 +601,25 @@ impl AsyncTensorRedistributor {
 
                 // Convert intersection results to byte ranges
                 let mut ranges_for_this_file = 0;
-                for (source_offset, _target_offset, length) in intersections {
+                for (source_offset, target_offset, length) in intersections {
                     let start_bytes = source_offset * dtype_size;
                     let end_bytes = (source_offset + length) * dtype_size;
+                    let target_offset_bytes = target_offset * dtype_size;
 
                     let source_start =
                         (source_header_size + source_data_offset + start_bytes) as u64;
                     let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
 
-                    source_ranges.push((source_start, source_end));
+                    source_ranges.push((source_start, source_end, target_offset_bytes as u64));
                     ranges_for_this_file += 1;
                 }
 
                 // Add the source mmap and record how many ranges belong to this file
                 if ranges_for_this_file > 0 {
+                    trace!(
+                        "      Added {} ranges from source file {}",
+                        ranges_for_this_file, source_file_index
+                    );
                     source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
                     ranges_per_file.push(ranges_for_this_file);
                 }
@@ -586,7 +636,7 @@ impl AsyncTensorRedistributor {
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
         source_mmaps: &mut Vec<Arc<Mmap>>,
-        source_ranges: &mut Vec<(u64, u64)>,
+        source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
         // Find the target chunk that belongs to this target file
@@ -631,19 +681,26 @@ impl AsyncTensorRedistributor {
 
         // Convert element intervals to byte ranges
         let mut ranges_for_this_file = 0;
+        let mut target_offset_elements = 0;
         for (start_elem, end_elem) in target_intervals {
             let start_bytes = start_elem * dtype_size;
             let end_bytes = end_elem * dtype_size;
+            let target_offset_bytes = target_offset_elements * dtype_size;
 
             let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
             let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
 
-            source_ranges.push((source_start, source_end));
+            source_ranges.push((source_start, source_end, target_offset_bytes as u64));
             ranges_for_this_file += 1;
+            target_offset_elements += end_elem - start_elem;
         }
 
         // Add the source mmap and record how many ranges belong to this file
         if ranges_for_this_file > 0 {
+            trace!(
+                "      Added {} ranges from source file {}",
+                ranges_for_this_file, source_file_index
+            );
             source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
             ranges_per_file.push(ranges_for_this_file);
         }
@@ -658,7 +715,7 @@ impl AsyncTensorRedistributor {
         target_info: &crate::topology::SharedInfo,
         target_file_index: usize,
         source_mmaps: &mut Vec<Arc<Mmap>>,
-        source_ranges: &mut Vec<(u64, u64)>,
+        source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
         // Check if this target file should contain this shared tensor
@@ -669,7 +726,7 @@ impl AsyncTensorRedistributor {
 
         // Pick the first source file that contains this tensor (they're all identical for shared tensors)
         let source_file_index = source_info.filename_indices()[0];
-        
+
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) = &self.source.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
@@ -682,14 +739,20 @@ impl AsyncTensorRedistributor {
         let source_data_offset = source_tensor_info.data_offsets.0;
 
         // For shared to shared, we just copy the entire tensor
-        let tensor_size_bytes = source_tensor_info.data_offsets.1 - source_tensor_info.data_offsets.0;
-        
+        let tensor_size_bytes =
+            source_tensor_info.data_offsets.1 - source_tensor_info.data_offsets.0;
+
         let source_start = (source_header_size + source_data_offset) as u64;
         let source_end = (source_header_size + source_data_offset + tensor_size_bytes) as u64;
-        
-        source_ranges.push((source_start, source_end));
+
+        source_ranges.push((source_start, source_end, 0));
         source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
         ranges_per_file.push(1); // Single range for the complete tensor
+
+        trace!(
+            "      Added 1 range from source file {} (full tensor copy)",
+            source_file_index
+        );
 
         Ok(())
     }
@@ -701,7 +764,7 @@ impl AsyncTensorRedistributor {
         target_info: &crate::topology::SharedInfo,
         target_file_index: usize,
         source_mmaps: &mut Vec<Arc<Mmap>>,
-        source_ranges: &mut Vec<(u64, u64)>,
+        source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
         // Check if this target file should contain this shared tensor
@@ -748,20 +811,25 @@ impl AsyncTensorRedistributor {
 
                 // Convert intersection results to byte ranges
                 let mut ranges_for_this_file = 0;
-                for (source_offset, _target_offset, length) in intersections {
+                for (source_offset, target_offset, length) in intersections {
                     let start_bytes = source_offset * dtype_size;
                     let end_bytes = (source_offset + length) * dtype_size;
+                    let target_offset_bytes = target_offset * dtype_size;
 
                     let source_start =
                         (source_header_size + source_data_offset + start_bytes) as u64;
                     let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
 
-                    source_ranges.push((source_start, source_end));
+                    source_ranges.push((source_start, source_end, target_offset_bytes as u64));
                     ranges_for_this_file += 1;
                 }
 
                 // Add the source mmap and record how many ranges belong to this file
                 if ranges_for_this_file > 0 {
+                    trace!(
+                        "      Added {} ranges from source file {}",
+                        ranges_for_this_file, source_file_index
+                    );
                     source_mmaps.push(Arc::clone(&self.source_mmaps[source_file_index]));
                     ranges_per_file.push(ranges_for_this_file);
                 }
@@ -947,10 +1015,68 @@ mod tests {
 
     // Helper function to calculate SHA256 of a file
     async fn calculate_file_hash<P: AsRef<Path>>(path: P) -> String {
+        let path = path.as_ref();
         let contents = tokio::fs::read(path).await.unwrap();
+
+        trace!("\n=== FILE ANALYSIS: {} ===", path.display());
+        trace!("File size: {} bytes", contents.len());
+
+        if contents.len() >= 8 {
+            // Read the header size (first 8 bytes)
+            let header_size = u64::from_le_bytes([
+                contents[0],
+                contents[1],
+                contents[2],
+                contents[3],
+                contents[4],
+                contents[5],
+                contents[6],
+                contents[7],
+            ]) as usize;
+
+            trace!("Header size: {} bytes", header_size);
+
+            if contents.len() >= 8 + header_size {
+                // Extract and display the JSON header
+                let header_bytes = &contents[8..8 + header_size];
+                if let Ok(header_str) = std::str::from_utf8(header_bytes) {
+                    trace!("Header JSON: {}", header_str);
+                }
+
+                // Show some info about the data section
+                let data_start = 8 + header_size;
+                let data_size = contents.len() - data_start;
+                trace!(
+                    "Data section starts at byte {}, size: {} bytes",
+                    data_start, data_size
+                );
+
+                // Show first 32 bytes of data as hex
+                if data_size > 0 {
+                    let hex_bytes = std::cmp::min(32, data_size);
+                    let hex_str: String = contents[data_start..data_start + hex_bytes]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    trace!("First {} bytes of data: {}", hex_bytes, hex_str);
+                }
+            }
+        }
+
+        // Show entire file content as UTF-8 (lossy)
+        trace!("\n--- ENTIRE FILE CONTENT (UTF-8 lossy) ---");
+        let content_str = String::from_utf8_lossy(&contents);
+        trace!("{}", content_str);
+        trace!("--- END ENTIRE FILE CONTENT ---\n");
+
         let mut hasher = Sha256::new();
         hasher.update(&contents);
-        format!("{:x}", hasher.finalize())
+        let hash = format!("{:x}", hasher.finalize());
+        trace!("SHA256: {}", hash);
+        trace!("=== END FILE ANALYSIS ===\n");
+
+        hash
     }
 
     #[tokio::test]
@@ -985,7 +1111,7 @@ mod tests {
 
         // Calculate hash of original file
         let original_hash = calculate_file_hash(&original_path).await;
-        println!("Original file hash: {}", original_hash);
+        trace!("Original file hash: {}", original_hash);
 
         // Step 2: Create target topology for 2 ranks with different split dimensions
         let mut target_tensors = BTreeMap::new();
@@ -1035,7 +1161,7 @@ mod tests {
         .unwrap();
 
         let created_files = redistributor1.redistribute().await.unwrap();
-        println!("Created distributed files: {:?}", created_files);
+        trace!("Created distributed files: {:?}", created_files);
 
         // Verify distributed files exist
         assert!(distributed_dir.path().join("rank0.safetensors").exists());
@@ -1062,7 +1188,7 @@ mod tests {
                 .unwrap();
 
         let final_files = redistributor2.redistribute().await.unwrap();
-        println!("Created final files: {:?}", final_files);
+        trace!("Created final files: {:?}", final_files);
 
         // Verify final file exists
         let final_path = final_dir.path().join("model.safetensors");
@@ -1070,7 +1196,7 @@ mod tests {
 
         // Step 6: Calculate hash of final file and compare
         let final_hash = calculate_file_hash(&final_path).await;
-        println!("Final file hash: {}", final_hash);
+        trace!("Final file hash: {}", final_hash);
 
         // The files should be identical
         assert_eq!(
@@ -1106,7 +1232,7 @@ mod tests {
         };
         assert_eq!(final_tensor2_data, tensor2_data.as_slice());
 
-        println!("✅ Round-trip redistribution test passed!");
+        trace!("✅ Round-trip redistribution test passed!");
     }
 
     #[test]
