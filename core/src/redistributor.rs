@@ -3,9 +3,11 @@ use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
 use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
+use reqwest::{Client, header::HeaderMap};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,56 +17,145 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinError;
+use url::Url;
 
 /// Source data abstraction for tasks
 enum TaskSources {
     Local(Vec<Arc<Mmap>>),
-    Remote, // TODO: Implement remote source support
+    Remote {
+        client: Client,
+        base_url: Url,
+        auth_headers: HeaderMap,
+        file_paths: Vec<String>,
+    },
 }
 
 impl TaskSources {
     /// Read data from the specified file index and range
-    fn read(&self, file_index: usize, start: u64, end: u64) -> &[u8] {
+    async fn read(&self, file_index: usize, start: u64, end: u64) -> Result<Cow<'_, [u8]>> {
         match self {
             TaskSources::Local(mmaps) => {
                 let mmap = &mmaps[file_index];
-                &mmap[start as usize..end as usize]
+                Ok(Cow::Borrowed(&mmap[start as usize..end as usize]))
             }
-            TaskSources::Remote => {
-                unimplemented!("Remote source reading not yet implemented")
+            TaskSources::Remote {
+                client,
+                base_url,
+                auth_headers,
+                file_paths,
+            } => {
+                let url = base_url.join(&file_paths[file_index]).map_err(|e| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid URL: {}", e),
+                    ))
+                })?;
+
+                let range_header = format!("bytes={}-{}", start, end - 1);
+
+                let response = client
+                    .get(url)
+                    .headers(auth_headers.clone())
+                    .header("Range", range_header)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        RedistributorError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("HTTP request failed: {}", e),
+                        ))
+                    })?;
+
+                let bytes = response.bytes().await.map_err(|e| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to read response body: {}", e),
+                    ))
+                })?;
+
+                Ok(Cow::Owned(bytes.to_vec()))
             }
         }
     }
 }
 
 /// Builder for collecting task sources during task creation
-struct TaskSource {
-    mmaps: Vec<Arc<Mmap>>,
+enum TaskSource {
+    Local {
+        mmaps: Vec<Arc<Mmap>>,
+    },
+    Remote {
+        client: Client,
+        base_url: Url,
+        auth_headers: HeaderMap,
+        file_paths: Vec<String>,
+    },
 }
 
 impl TaskSource {
-    /// Create a new empty task source builder
-    fn new() -> Self {
-        Self {
-            mmaps: Vec::new(),
+    /// Create a new empty task source builder for local sources
+    fn new_local() -> Self {
+        Self::Local { mmaps: Vec::new() }
+    }
+
+    /// Create a new empty task source builder for remote sources
+    fn new_remote(client: Client, base_url: Url, auth_headers: HeaderMap) -> Self {
+        Self::Remote {
+            client,
+            base_url,
+            auth_headers,
+            file_paths: Vec::new(),
         }
     }
-    
+
     /// Add a source from the given location at the specified file index
     fn add_from_location(&mut self, location: &SourceLocation, file_index: usize) {
-        match location {
-            SourceLocation::Local { mmaps, .. } => {
-                self.mmaps.push(Arc::clone(&mmaps[file_index]));
+        match (self, location) {
+            (
+                TaskSource::Local { mmaps },
+                SourceLocation::Local {
+                    mmaps: source_mmaps,
+                },
+            ) => {
+                mmaps.push(Arc::clone(&source_mmaps[file_index]));
             }
-            SourceLocation::Remote { .. } => {
-                unimplemented!("Remote source support not yet implemented")
+            (
+                TaskSource::Remote { file_paths, .. },
+                SourceLocation::Remote {
+                    file_paths: source_paths,
+                    ..
+                },
+            ) => {
+                file_paths.push(source_paths[file_index].clone());
             }
+            _ => panic!("Mismatched task source and location types"),
         }
     }
-    
+
+    /// Get the number of source files in this task source
+    fn len(&self) -> usize {
+        match self {
+            TaskSource::Local { mmaps } => mmaps.len(),
+            TaskSource::Remote { file_paths, .. } => file_paths.len(),
+        }
+    }
+
     /// Convert into TaskSources for execution
     fn into_task_sources(self) -> TaskSources {
-        TaskSources::Local(self.mmaps)
+        match self {
+            TaskSource::Local { mmaps } => TaskSources::Local(mmaps),
+            TaskSource::Remote {
+                client,
+                base_url,
+                auth_headers,
+                file_paths,
+            } => TaskSources::Remote {
+                client,
+                base_url,
+                auth_headers,
+                file_paths,
+            },
+        }
     }
 }
 
@@ -79,11 +170,11 @@ struct MmapWriteTask {
     // Source read info - multiple reads from potentially multiple files
     source: TaskSources,
     source_ranges: Vec<(u64, u64, u64)>, // Flat list of (start, end, target_offset) byte ranges
-    ranges_per_file: Vec<usize>,  // How many ranges belong to each source file
+    ranges_per_file: Vec<usize>,         // How many ranges belong to each source file
 }
 
 impl MmapWriteTask {
-    fn run(&self) -> Result<()> {
+    async fn run(&self) -> Result<()> {
         let target_length = (self.target_end - self.target_start) as usize;
         trace!("Writing {target_length} to {}", self.target_file_index);
 
@@ -100,9 +191,9 @@ impl MmapWriteTask {
 
             let source_file_count = match &self.source {
                 TaskSources::Local(mmaps) => mmaps.len(),
-                TaskSources::Remote => 0, // TODO: Implement remote source file counting
+                TaskSources::Remote { file_paths, .. } => file_paths.len(),
             };
-            
+
             trace!(
                 "  Executing {} source files, {} total ranges",
                 source_file_count,
@@ -127,12 +218,12 @@ impl MmapWriteTask {
                     );
 
                     // Read from source using abstracted method
-                    let source_slice = self.source.read(file_idx, source_start, source_end);
+                    let source_data = self.source.read(file_idx, source_start, source_end).await?;
 
                     // Write to target at specified offset (not sequential)
                     let target_offset_usize = target_offset as usize;
                     target_slice[target_offset_usize..target_offset_usize + range_length]
-                        .copy_from_slice(source_slice);
+                        .copy_from_slice(&source_data);
 
                     range_idx += 1;
                 }
@@ -221,15 +312,15 @@ struct Layout {
 /// Source location for input files
 enum SourceLocation {
     Local {
-        dir: PathBuf,
         mmaps: Vec<Arc<Mmap>>,
     },
     Remote {
-        // TODO: Add remote source fields (base_url, auth, etc.)
+        client: Client,
+        base_url: Url,
+        auth_headers: HeaderMap,
+        file_paths: Vec<String>,
     },
 }
-
-
 
 /// Write location for target files
 struct WriteLocation {
@@ -242,16 +333,16 @@ impl WriteLocation {
     async fn init(&mut self, layout: &Layout) -> Result<()> {
         // Create directory
         tokio::fs::create_dir_all(&self.dir).await?;
-        
+
         // Create files with headers
         self.create_files_with_headers(layout).await?;
-        
+
         // Initialize memory maps
         self.init_target_mmaps(layout)?;
-        
+
         Ok(())
     }
-    
+
     /// Save/flush all memory-mapped files and write topology
     async fn save(&self, topology: &Topology) -> Result<()> {
         if let Some(ref target_mmaps) = self.mmaps {
@@ -262,7 +353,7 @@ impl WriteLocation {
         self.write_topology(topology).await?;
         Ok(())
     }
-    
+
     /// Create a write task for the specified file index and parameters
     fn create_write_task(
         &self,
@@ -274,7 +365,7 @@ impl WriteLocation {
         ranges_per_file: Vec<usize>,
     ) -> Option<MmapWriteTask> {
         let target_mmap = Arc::clone(self.mmaps.as_ref()?.get(target_file_index)?);
-        
+
         Some(MmapWriteTask {
             target_mmap,
             target_start,
@@ -285,7 +376,7 @@ impl WriteLocation {
             ranges_per_file,
         })
     }
-    
+
     /// Write topology.json file if needed
     async fn write_topology(&self, topology: &Topology) -> Result<()> {
         if topology.world_size() > 1 {
@@ -294,13 +385,10 @@ impl WriteLocation {
         }
         Ok(())
     }
-    
+
     /// Create all files with headers
     async fn create_files_with_headers(&self, layout: &Layout) -> Result<()> {
-        assert_eq!(
-            layout.topology.filenames().len(),
-            layout.metadatas.len()
-        );
+        assert_eq!(layout.topology.filenames().len(), layout.metadatas.len());
         let file_creation_futures: Vec<_> = layout
             .metadatas
             .iter()
@@ -337,7 +425,7 @@ impl WriteLocation {
 
         Ok(())
     }
-    
+
     /// Initialize target memory maps after files have been created
     fn init_target_mmaps(&mut self, layout: &Layout) -> Result<()> {
         if self.mmaps.is_some() {
@@ -382,8 +470,8 @@ pub struct AsyncTensorRedistributor {
 }
 
 impl AsyncTensorRedistributor {
-    /// Create a new redistributor for reconstruction from distributed files
-    pub fn new<P: AsRef<Path>>(
+    /// Create a new redistributor for reconstruction from local distributed files
+    pub fn from_local<P: AsRef<Path>>(
         source_dir: P,
         target_dir: P,
         target_topology: Topology,
@@ -426,7 +514,6 @@ impl AsyncTensorRedistributor {
             source: Source {
                 layout: source_layout,
                 location: SourceLocation::Local {
-                    dir: source_dir,
                     mmaps: source_mmaps,
                 },
             },
@@ -439,8 +526,6 @@ impl AsyncTensorRedistributor {
             },
         })
     }
-
-
 
     /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
@@ -455,11 +540,13 @@ impl AsyncTensorRedistributor {
         let mut total = 0u64;
         for (header_size, metadata) in &self.source.layout.metadatas {
             // Find the maximum data end offset in this file
-            let max_data_end = metadata.tensors().values()
+            let max_data_end = metadata
+                .tensors()
+                .values()
                 .map(|tensor_info| tensor_info.data_offsets.1)
                 .max()
                 .unwrap_or(0);
-            
+
             // Total file size = header + data section
             total += (header_size + max_data_end) as u64;
         }
@@ -486,7 +573,7 @@ impl AsyncTensorRedistributor {
                 // Execute batch in sorted order
                 for task in batch.drain(..) {
                     let length = (task.target_end - task.target_start) as usize;
-                    if let Err(e) = task.run() {
+                    if let Err(e) = task.run().await {
                         error!("Write task failed: {}", e);
                         // Continue with other tasks rather than failing completely
                     }
@@ -502,7 +589,10 @@ impl AsyncTensorRedistributor {
         progress.finish();
         println!("Done write, waiting for the kernel to sync on device...");
         // Force flush all memory-mapped target files and write topology
-        self.target.location.save(&self.target.layout.topology).await?;
+        self.target
+            .location
+            .save(&self.target.layout.topology)
+            .await?;
 
         trace!("Tasks done {:?}", start.elapsed());
 
@@ -591,7 +681,9 @@ impl AsyncTensorRedistributor {
         );
 
         // Process each target file in order
-        for (target_file_index, filename) in self.target.layout.topology.filenames().iter().enumerate() {
+        for (target_file_index, filename) in
+            self.target.layout.topology.filenames().iter().enumerate()
+        {
             trace!("Processing target file {}: {}", target_file_index, filename);
 
             // Get the metadata for this target file
@@ -664,7 +756,15 @@ impl AsyncTensorRedistributor {
         let target_end = (target_header_size + target_tensor_info.data_offsets.1) as u64;
 
         // Collect source reads needed to fulfill this target write
-        let mut task_source = TaskSource::new();
+        let mut task_source = match &self.source.location {
+            SourceLocation::Local { .. } => TaskSource::new_local(),
+            SourceLocation::Remote {
+                client,
+                base_url,
+                auth_headers,
+                ..
+            } => TaskSource::new_remote(client.clone(), base_url.clone(), auth_headers.clone()),
+        };
         let mut source_ranges = Vec::new();
         let mut ranges_per_file = Vec::new();
 
@@ -721,8 +821,8 @@ impl AsyncTensorRedistributor {
 
         // Create and send the task if we have any reads to do
         if !source_ranges.is_empty() {
-            let source_count = task_source.mmaps.len();
-            
+            let source_count = task_source.len();
+
             trace!(
                 "    Task created: {} source files, {} total ranges, writing {}->{}",
                 source_count,
@@ -875,7 +975,8 @@ impl AsyncTensorRedistributor {
         let source_file_index = source_info.filename_indices()[0];
 
         // Get source file metadata to calculate byte offsets
-        let (source_header_size, source_metadata) = &self.source.layout.metadatas[source_file_index];
+        let (source_header_size, source_metadata) =
+            &self.source.layout.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
         let source_tensor_info =
             source_tensors
@@ -934,7 +1035,8 @@ impl AsyncTensorRedistributor {
         let source_file_index = source_info.filename_indices()[0];
 
         // Get source file metadata to calculate byte offsets
-        let (source_header_size, source_metadata) = &self.source.layout.metadatas[source_file_index];
+        let (source_header_size, source_metadata) =
+            &self.source.layout.metadatas[source_file_index];
         let source_tensors = source_metadata.tensors();
         let source_tensor_info =
             source_tensors
@@ -1044,8 +1146,6 @@ impl AsyncTensorRedistributor {
 
         Ok(())
     }
-
-
 }
 
 /// Read safetensors file efficiently using memory mapping
