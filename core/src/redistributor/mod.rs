@@ -168,6 +168,45 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
             .map_err(RedistributorError::Topology);
     }
 
+    // Try model.safetensors.index.json (chunked safetensors case)
+    let index_path = dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        use std::collections::BTreeMap;
+        use std::collections::HashSet;
+        
+        let index_data = std::fs::read_to_string(&index_path)?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_data)?;
+        
+        // Get unique filenames
+        let filenames: HashSet<String> = index.weight_map.values().cloned().collect();
+        let mut filenames: Vec<String> = filenames.into_iter().collect();
+        filenames.sort();
+        
+        // Create shared tensors for all tensors using metadata from actual files
+        let mut tensors = BTreeMap::new();
+        for (tensor_name, file_name) in &index.weight_map {
+            let file_path = dir.join(file_name);
+            let (_, file_metadata) = safetensors_metadata(&file_path)?;
+            
+            if let Some(tensor_info) = file_metadata.tensors().get(tensor_name) {
+                // Find which file index this tensor belongs to
+                let file_index = filenames.iter().position(|f| f == file_name).unwrap();
+                
+                tensors.insert(
+                    tensor_name.clone(),
+                    crate::topology::Tensor::Shared(crate::topology::SharedInfo::new(
+                        tensor_info.shape.clone(),
+                        tensor_info.dtype,
+                        vec![file_index],
+                    )),
+                );
+            }
+        }
+        
+        return crate::topology::Topology::new(tensors, filenames, 1)
+            .map_err(RedistributorError::Topology);
+    }
+
     // Try model.safetensors
     let model_path = dir.join("model.safetensors");
     if model_path.exists() {
