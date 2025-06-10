@@ -1,15 +1,15 @@
 pub mod core;
+pub mod loader;
 pub mod location;
 pub mod task;
-pub mod loader;
 
+use crate::topology::{Topology, TopologyError};
+use indicatif::style::TemplateError;
+use safetensors::tensor::Metadata;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use safetensors::tensor::Metadata;
 use thiserror::Error;
-use crate::topology::{Topology, TopologyError};
-use indicatif::style::TemplateError;
 use tokio::task::JoinError;
 
 // Re-export main types
@@ -18,20 +18,15 @@ pub use core::AsyncTensorRedistributor;
 /// Strategy for ordering reads and writes during redistribution
 #[derive(Clone, Copy, Debug)]
 pub enum RedistributionStrategy {
-    /// Default behavior: create tasks per target chunk, no special ordering
-    Default,
     /// Read files sequentially, write tasks can execute unordered
     ReadSerialWriteUnordered,
     /// Read tasks can execute unordered, but write tasks execute serially  
     ReadUnorderedWriteSerial,
-    /// Read in large chunks (optimized for network), write unordered
-    /// chunk_size is in bytes - will coalesce nearby reads within this distance
-    ReadLargeChunksWriteUnordered { chunk_size: usize },
 }
 
 impl Default for RedistributionStrategy {
     fn default() -> Self {
-        Self::Default
+        Self::ReadUnorderedWriteSerial
     }
 }
 
@@ -100,7 +95,7 @@ pub type Result<T> = std::result::Result<T, RedistributorError>;
 pub fn safetensors_metadata<P: AsRef<std::path::Path>>(file_path: P) -> Result<(usize, Metadata)> {
     use std::fs::File;
     use std::io::{BufReader, Read};
-    
+
     let mut file = BufReader::new(File::open(file_path)?);
     let mut length_bytes = [0u8; 8];
     file.read_exact(&mut length_bytes)?;
@@ -115,7 +110,6 @@ pub fn safetensors_metadata<P: AsRef<std::path::Path>>(file_path: P) -> Result<(
 }
 
 pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topology> {
-    
     let dir = dir.as_ref();
     let topology_path = dir.join("topology.json");
 
@@ -144,11 +138,11 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
         use std::collections::BTreeMap;
         let mut tensors = BTreeMap::new();
         let mut filenames = Vec::new();
-        
+
         for (file_index, file_path) in rank_files.iter().enumerate() {
             let filename = file_path.file_name().unwrap().to_str().unwrap().to_string();
             filenames.push(filename);
-            
+
             let (_, metadata) = safetensors_metadata(file_path)?;
             for (tensor_name, tensor_info) in metadata.tensors() {
                 // For now, treat as shared tensors across ranks
@@ -163,7 +157,7 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
                 );
             }
         }
-        
+
         return crate::topology::Topology::new(tensors, filenames, rank_files.len())
             .map_err(RedistributorError::Topology);
     }
@@ -173,25 +167,25 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
     if index_path.exists() {
         use std::collections::BTreeMap;
         use std::collections::HashSet;
-        
+
         let index_data = std::fs::read_to_string(&index_path)?;
         let index: SafetensorsIndex = serde_json::from_str(&index_data)?;
-        
+
         // Get unique filenames
         let filenames: HashSet<String> = index.weight_map.values().cloned().collect();
         let mut filenames: Vec<String> = filenames.into_iter().collect();
         filenames.sort();
-        
+
         // Create shared tensors for all tensors using metadata from actual files
         let mut tensors = BTreeMap::new();
         for (tensor_name, file_name) in &index.weight_map {
             let file_path = dir.join(file_name);
             let (_, file_metadata) = safetensors_metadata(&file_path)?;
-            
+
             if let Some(tensor_info) = file_metadata.tensors().get(tensor_name) {
                 // Find which file index this tensor belongs to
                 let file_index = filenames.iter().position(|f| f == file_name).unwrap();
-                
+
                 tensors.insert(
                     tensor_name.clone(),
                     crate::topology::Tensor::Shared(crate::topology::SharedInfo::new(
@@ -202,7 +196,7 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
                 );
             }
         }
-        
+
         return crate::topology::Topology::new(tensors, filenames, 1)
             .map_err(RedistributorError::Topology);
     }
@@ -213,7 +207,7 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
         use std::collections::BTreeMap;
         let mut tensors = BTreeMap::new();
         let (_, metadata) = safetensors_metadata(&model_path)?;
-        
+
         for (tensor_name, tensor_info) in metadata.tensors() {
             tensors.insert(
                 tensor_name.clone(),
@@ -224,7 +218,7 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
                 )),
             );
         }
-        
+
         return crate::topology::Topology::new(tensors, vec!["model.safetensors".to_string()], 1)
             .map_err(RedistributorError::Topology);
     }
@@ -271,4 +265,5 @@ pub fn intersection(
     }
 
     result
-} 
+}
+

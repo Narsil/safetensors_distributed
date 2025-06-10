@@ -72,6 +72,17 @@ impl WriteLocation {
         Ok(())
     }
 
+    /// Get target mmap for the specified file index
+    pub fn get_mmap(&self, target_file_index: usize) -> Result<Arc<MmapMut>> {
+        if let Some(ref target_mmaps) = self.mmaps {
+            Ok(Arc::clone(&target_mmaps[target_file_index]))
+        } else {
+            Err(RedistributorError::InvalidDataSource {
+                message: "Target mmaps not initialized".to_string(),
+            })
+        }
+    }
+
     /// Create a write task for the specified file index and parameters
     pub fn create_write_task(
         &self,

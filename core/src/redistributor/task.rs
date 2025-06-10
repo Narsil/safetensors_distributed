@@ -217,6 +217,41 @@ impl TaskSource {
     }
 }
 
+/// Task type enum for different redistribution strategies
+pub enum Task {
+    /// Write-focused task: multiple reads → single write (for ReadUnorderedWriteSerial)
+    Write(MmapWriteTask),
+    /// Read-focused task: single read → multiple writes (for ReadSerialWriteUnordered) 
+    ReadSerial(ReadSerialTask),
+}
+
+/// Write operation for ReadSerialTask - one target write from read data
+#[derive(Debug, Clone)]
+pub struct WriteOperation {
+    /// Target file index
+    pub target_file_index: usize,
+    /// Target memory-mapped file
+    pub target_mmap: Arc<MmapMut>,
+    /// Start position in target file
+    pub target_start: u64,
+    /// End position in target file
+    pub target_end: u64,
+    /// Offset within the read data where this write's data starts
+    pub read_offset: usize,
+}
+
+/// Read-serial task type for ReadSerialWriteUnordered strategy
+pub struct ReadSerialTask {
+    // Source read info - single contiguous read
+    pub source: TaskSources,
+    pub source_file_index: usize,
+    pub source_start: u64,
+    pub source_end: u64,
+
+    // Target write info - multiple writes to potentially multiple files
+    pub writes: Vec<WriteOperation>,
+}
+
 // Memory-mapped task type for high performance file operations
 pub struct MmapWriteTask {
     // Target write info - single contiguous region
@@ -229,6 +264,61 @@ pub struct MmapWriteTask {
     pub source: TaskSources,
     pub source_ranges: Vec<(u64, u64, u64)>, // Flat list of (start, end, target_offset) byte ranges
     pub ranges_per_file: Vec<usize>,         // How many ranges belong to each source file
+}
+
+impl ReadSerialTask {
+    pub async fn run(&self) -> Result<()> {
+        let read_length = (self.source_end - self.source_start) as usize;
+        trace!("Reading {read_length} from source file {}", self.source_file_index);
+
+        // Read once from source - large sequential read
+        let source_data = self.source.read(0, self.source_start, self.source_end).await?;
+
+        trace!(
+            "  Executing {} target writes from single read",
+            self.writes.len()
+        );
+
+        // SAFETY: This is safe because:
+        // 1. All write ranges are pre-calculated and guaranteed non-overlapping
+        // 2. Each write operation writes to a unique byte range within memory-mapped files
+        // 3. No two writes will ever write to the same memory location
+        // 4. The topology calculation ensures mutually exclusive write regions
+        unsafe {
+            // Execute all writes from the read data
+            for (write_idx, write_op) in self.writes.iter().enumerate() {
+                let write_length = (write_op.target_end - write_op.target_start) as usize;
+                
+                trace!(
+                    "    Write {}: {} bytes to target file {} offset {}→{}",
+                    write_idx, write_length, write_op.target_file_index, 
+                    write_op.target_start, write_op.target_end
+                );
+
+                // Get write data from read buffer
+                let write_data = &source_data[write_op.read_offset..write_op.read_offset + write_length];
+
+                // Write to target at specified position
+                let target_ptr = write_op.target_mmap.as_ptr().add(write_op.target_start as usize) as *mut u8;
+                let target_slice = std::slice::from_raw_parts_mut(target_ptr, write_length);
+                target_slice.copy_from_slice(write_data);
+
+                // Flush this write range asynchronously
+                if let Err(e) = write_op
+                    .target_mmap
+                    .flush_async_range(write_op.target_start as usize, write_length)
+                {
+                    error!(
+                        "Async flush failed for range {}:{}: {}",
+                        write_op.target_start, write_op.target_end, e
+                    );
+                    // Don't fail the task, just log the error and continue
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl MmapWriteTask {

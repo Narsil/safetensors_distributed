@@ -4,9 +4,7 @@
 //! performance for different scenarios:
 //! 
 //! - ReadSerialWriteUnordered: Best for local storage with slow random reads
-//! - ReadUnorderedWriteSerial: Best for fast storage with slow random writes  
-//! - ReadLargeChunksWriteUnordered: Best for network sources
-//! - Default: Balanced approach
+//! - ReadUnorderedWriteSerial: Best for fast storage with slow random writes
 
 use safetensors_distributed::redistributor::AsyncTensorRedistributor;
 use safetensors_distributed::redistributor::RedistributionStrategy;
@@ -52,12 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test different strategies
     let strategies = vec![
-        ("Default", RedistributionStrategy::Default),
         ("ReadSerial+WriteUnordered", RedistributionStrategy::ReadSerialWriteUnordered),
         ("ReadUnordered+WriteSerial", RedistributionStrategy::ReadUnorderedWriteSerial),
-        ("LargeChunks", RedistributionStrategy::ReadLargeChunksWriteUnordered { 
-            chunk_size: 4 * 1024 * 1024 // 4MB chunks
-        }),
     ];
 
     for (name, strategy) in strategies {
