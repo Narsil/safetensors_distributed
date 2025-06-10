@@ -1,548 +1,21 @@
-use crate::topology::{SharedInfo, Tensor, Topology, TopologyError, get_intervals};
-use futures::future::join_all;
-use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle, style::TemplateError};
+use super::{Result, RedistributorError, Layout, intersection};
+use super::location::{Source, Target, SourceLocation, WriteLocation};
+use super::task::{TaskSource, MmapWriteTask};
+use crate::topology::{Topology, Tensor, get_intervals};
+// use futures::future::join_all; // Unused
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
-use memmap2::{Mmap, MmapMut};
-use reqwest::header::RANGE;
+use memmap2::Mmap;
 use reqwest::{Client, header::HeaderMap};
-use safetensors::SafeTensors;
 use safetensors::tensor::{Metadata, TensorInfo};
-use serde::Deserialize;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+// use std::collections::HashMap; // Unused
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use thiserror::Error;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::task::JoinError;
+use tokio::sync::Semaphore;
 use url::Url;
 
-/// Source data abstraction for tasks
-enum TaskSources {
-    Local(Vec<Arc<Mmap>>),
-    Remote {
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        file_paths: Vec<String>,
-        http_semaphore: Arc<Semaphore>, // Limit concurrent HTTP requests
-    },
-}
-
-impl TaskSources {
-    /// Read data from the specified file index and range
-    async fn read(&self, file_index: usize, start: u64, end: u64) -> Result<Cow<'_, [u8]>> {
-        match self {
-            TaskSources::Local(mmaps) => {
-                let mmap = &mmaps[file_index];
-                Ok(Cow::Borrowed(&mmap[start as usize..end as usize]))
-            }
-            TaskSources::Remote {
-                client,
-                base_url,
-                auth_headers,
-                file_paths,
-                http_semaphore,
-            } => {
-                // Acquire semaphore permit to limit concurrent HTTP requests
-                let _permit = http_semaphore.acquire().await.map_err(|_| {
-                    RedistributorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Failed to acquire HTTP semaphore permit",
-                    ))
-                })?;
-
-                let url = base_url.join(&file_paths[file_index]).map_err(|e| {
-                    RedistributorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid URL: {}", e),
-                    ))
-                })?;
-
-                let range_header = format!("bytes={}-{}", start, end - 1);
-                let expected_size = (end - start) as usize;
-
-                trace!("Fetching range {} from {}", range_header, url);
-
-                let response = client
-                    .get(url.clone())
-                    .headers(auth_headers.clone())
-                    .header(RANGE, range_header.clone())
-                    .timeout(Duration::from_secs(30)) // 30 second timeout
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        RedistributorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("HTTP request failed for {}: {}", url, e),
-                        ))
-                    })?;
-
-                if !response.status().is_success() {
-                    return Err(RedistributorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "HTTP request failed with status {} for {}",
-                            response.status(),
-                            url
-                        ),
-                    )));
-                }
-
-                // Stream the response chunk by chunk to avoid loading everything into memory
-                let mut stream = response.bytes_stream();
-                let mut buffer = Vec::with_capacity(expected_size);
-
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| {
-                        RedistributorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to read response chunk from {}: {}", url, e),
-                        ))
-                    })?;
-
-                    buffer.extend_from_slice(&chunk);
-
-                    // Safety check: if we're getting way more data than expected, stop
-                    if buffer.len() > expected_size * 2 {
-                        return Err(RedistributorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "Response size {} exceeds expected {} for range {}",
-                                buffer.len(),
-                                expected_size,
-                                range_header
-                            ),
-                        )));
-                    }
-                }
-
-                trace!(
-                    "Successfully fetched {} bytes (expected {})",
-                    buffer.len(),
-                    expected_size
-                );
-                Ok(Cow::Owned(buffer))
-                // _permit automatically dropped here, releasing semaphore
-            }
-        }
-    }
-}
-
-/// Builder for collecting task sources during task creation
-enum TaskSource {
-    Local {
-        mmaps: Vec<Arc<Mmap>>,
-    },
-    Remote {
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        file_paths: Vec<String>,
-        http_semaphore: Arc<Semaphore>,
-    },
-}
-
-impl TaskSource {
-    /// Create a new empty task source builder for local sources
-    fn new_local() -> Self {
-        Self::Local { mmaps: Vec::new() }
-    }
-
-    /// Create a new empty task source builder for remote sources
-    fn new_remote(
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        http_semaphore: Arc<Semaphore>,
-    ) -> Self {
-        Self::Remote {
-            client,
-            base_url,
-            auth_headers,
-            file_paths: Vec::new(),
-            http_semaphore,
-        }
-    }
-
-    /// Add a source from the given location at the specified file index
-    fn add_from_location(&mut self, location: &SourceLocation, file_index: usize) {
-        match (self, location) {
-            (
-                TaskSource::Local { mmaps },
-                SourceLocation::Local {
-                    mmaps: source_mmaps,
-                },
-            ) => {
-                mmaps.push(Arc::clone(&source_mmaps[file_index]));
-            }
-            (
-                TaskSource::Remote { file_paths, .. },
-                SourceLocation::Remote {
-                    file_paths: source_paths,
-                    ..
-                },
-            ) => {
-                file_paths.push(source_paths[file_index].clone());
-            }
-            _ => panic!("Mismatched task source and location types"),
-        }
-    }
-
-    /// Get the number of source files in this task source
-    fn len(&self) -> usize {
-        match self {
-            TaskSource::Local { mmaps } => mmaps.len(),
-            TaskSource::Remote { file_paths, .. } => file_paths.len(),
-        }
-    }
-
-    /// Convert into TaskSources for execution
-    fn into_task_sources(self) -> TaskSources {
-        match self {
-            TaskSource::Local { mmaps } => TaskSources::Local(mmaps),
-            TaskSource::Remote {
-                client,
-                base_url,
-                auth_headers,
-                file_paths,
-                http_semaphore,
-            } => TaskSources::Remote {
-                client,
-                base_url,
-                auth_headers,
-                file_paths,
-                http_semaphore,
-            },
-        }
-    }
-}
-
-// Memory-mapped task type for high performance file operations
-struct MmapWriteTask {
-    // Target write info - single contiguous region
-    target_mmap: Arc<MmapMut>,
-    target_start: u64,
-    target_end: u64,
-    target_file_index: usize,
-
-    // Source read info - multiple reads from potentially multiple files
-    source: TaskSources,
-    source_ranges: Vec<(u64, u64, u64)>, // Flat list of (start, end, target_offset) byte ranges
-    ranges_per_file: Vec<usize>,         // How many ranges belong to each source file
-}
-
-impl MmapWriteTask {
-    async fn run(&self) -> Result<()> {
-        let target_length = (self.target_end - self.target_start) as usize;
-        trace!("Writing {target_length} to {}", self.target_file_index);
-
-        // SAFETY: This is safe because:
-        // 1. All write ranges are pre-calculated and guaranteed non-overlapping
-        // 2. Each task writes to a unique byte range within the memory-mapped file
-        // 3. No two tasks will ever write to the same memory location
-        // 4. The topology calculation ensures mutually exclusive write regions
-        unsafe {
-            let target_ptr = self.target_mmap.as_ptr().add(self.target_start as usize) as *mut u8;
-            let target_slice = std::slice::from_raw_parts_mut(target_ptr, target_length);
-
-            let source_file_count = match &self.source {
-                TaskSources::Local(mmaps) => mmaps.len(),
-                TaskSources::Remote { file_paths, .. } => file_paths.len(),
-            };
-
-            trace!(
-                "  Executing {} source files, {} total ranges",
-                source_file_count,
-                self.source_ranges.len()
-            );
-
-            // Process each source file
-            let mut range_idx = 0usize;
-            for (file_idx, &num_ranges) in self.ranges_per_file.iter().enumerate() {
-                trace!(
-                    "    Processing source file {}: {} ranges",
-                    file_idx, num_ranges
-                );
-
-                // Process all ranges for this source file
-                for range_num in 0..num_ranges {
-                    let (source_start, source_end, target_offset) = self.source_ranges[range_idx];
-                    let range_length = (source_end - source_start) as usize;
-
-                    trace!(
-                        "      Range {}: source {}→{} ({} bytes) -> target offset {}",
-                        range_num, source_start, source_end, range_length, target_offset
-                    );
-
-                    // Read from source using abstracted method
-                    let source_data = self.source.read(file_idx, source_start, source_end).await?;
-
-                    // Write to target at specified offset (not sequential)
-                    let target_offset_usize = target_offset as usize;
-                    target_slice[target_offset_usize..target_offset_usize + range_length]
-                        .copy_from_slice(&source_data);
-
-                    range_idx += 1;
-                }
-            }
-        }
-
-        // Flush just the range we wrote asynchronously to avoid accumulating dirty pages
-        if let Err(e) = self
-            .target_mmap
-            .flush_async_range(self.target_start as usize, target_length)
-        {
-            error!(
-                "Async flush failed for range {}:{}: {}",
-                self.target_start, self.target_end, e
-            );
-            // Don't fail the task, just log the error and continue
-        }
-
-        Ok(())
-    }
-}
-
-/// Structure for deserializing model.safetensors.index.json
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndex {
-    /// Map of tensor names to their containing file
-    weight_map: HashMap<String, String>,
-}
-
-/// Error type for redistributor operations
-#[derive(Debug, Error)]
-pub enum RedistributorError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Safetensors error: {0}")]
-    Safetensors(#[from] safetensors::SafeTensorError),
-
-    #[error("JSON serialization error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    #[error("Topology error: {0}")]
-    Topology(#[from] TopologyError),
-
-    #[error("Invalid tensor data source: {message}")]
-    InvalidDataSource { message: String },
-
-    #[error("Tensor not found: {name}")]
-    TensorNotFound { name: String },
-
-    #[error("Invalid tensor dimension {dim} for tensor with shape {shape:?}")]
-    InvalidDimension { dim: usize, shape: Vec<usize> },
-
-    #[error("Invalid slice range [{start}, {end}) for dimension {dim} with size {size}")]
-    InvalidSliceRange {
-        start: usize,
-        end: usize,
-        dim: usize,
-        size: usize,
-    },
-
-    #[error(
-        "No valid input found in directory {path:?} (expected topology.json + rank*.safetensors OR model.safetensors OR model.safetensors.index.json + chunked files)"
-    )]
-    NoValidInput { path: PathBuf },
-
-    #[error("Failed to parse target world size: {input}")]
-    InvalidWorldSize { input: String },
-
-    #[error("Template error: {0}")]
-    Template(#[from] TemplateError),
-
-    #[error("Join error: {0}")]
-    Join(#[from] JoinError),
-}
-
-/// Result type for redistributor operations
-type Result<T> = std::result::Result<T, RedistributorError>;
-
-/// Data source for tensor redistribution
-struct Layout {
-    topology: Topology,
-    metadatas: Vec<(usize, Metadata)>,
-}
-
-/// Source location for input files
-enum SourceLocation {
-    Local {
-        mmaps: Vec<Arc<Mmap>>,
-    },
-    Remote {
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        file_paths: Vec<String>,
-        http_semaphore: Arc<Semaphore>,
-    },
-}
-
-/// Write location for target files
-struct WriteLocation {
-    dir: PathBuf,
-    mmaps: Option<Vec<Arc<MmapMut>>>,
-}
-
-impl WriteLocation {
-    /// Initialize target files and memory maps
-    async fn init(&mut self, layout: &Layout) -> Result<()> {
-        trace!("INIT: Starting target location initialization...");
-
-        // Create directory
-        trace!("INIT: Creating directory...");
-        let dir_start = Instant::now();
-        tokio::fs::create_dir_all(&self.dir).await?;
-        trace!("INIT: Directory created in {:?}", dir_start.elapsed());
-
-        // Create files with headers
-        trace!("INIT: Creating files with headers...");
-        let files_start = Instant::now();
-        self.create_files_with_headers(layout).await?;
-        trace!("INIT: Files created in {:?}", files_start.elapsed());
-
-        // Initialize memory maps
-        trace!("INIT: Initializing memory maps...");
-        let mmap_start = Instant::now();
-        self.init_target_mmaps(layout)?;
-        trace!(
-            "INIT: Memory maps initialized in {:?}",
-            mmap_start.elapsed()
-        );
-
-        trace!("INIT: Target location initialization complete");
-        Ok(())
-    }
-
-    /// Save/flush all memory-mapped files and write topology
-    async fn save(&self, topology: &Topology) -> Result<()> {
-        if let Some(ref target_mmaps) = self.mmaps {
-            for target_mmap in target_mmaps {
-                target_mmap.flush()?;
-            }
-        }
-        self.write_topology(topology).await?;
-        Ok(())
-    }
-
-    /// Create a write task for the specified file index and parameters
-    fn create_write_task(
-        &self,
-        target_file_index: usize,
-        target_start: u64,
-        target_end: u64,
-        source: TaskSources,
-        source_ranges: Vec<(u64, u64, u64)>,
-        ranges_per_file: Vec<usize>,
-    ) -> Option<MmapWriteTask> {
-        let target_mmap = Arc::clone(self.mmaps.as_ref()?.get(target_file_index)?);
-
-        Some(MmapWriteTask {
-            target_mmap,
-            target_start,
-            target_end,
-            target_file_index,
-            source,
-            source_ranges,
-            ranges_per_file,
-        })
-    }
-
-    /// Write topology.json file if needed
-    async fn write_topology(&self, topology: &Topology) -> Result<()> {
-        if topology.world_size() > 1 {
-            let topology_json = serde_json::to_vec_pretty(topology)?;
-            tokio::fs::write(self.dir.join("topology.json"), &topology_json).await?;
-        }
-        Ok(())
-    }
-
-    /// Create all files with headers
-    async fn create_files_with_headers(&self, layout: &Layout) -> Result<()> {
-        assert_eq!(layout.topology.filenames().len(), layout.metadatas.len());
-        let file_creation_futures: Vec<_> = layout
-            .metadatas
-            .iter()
-            .zip(layout.topology.filenames())
-            .map(|((_, metadata), filename)| async move {
-                let data_len = metadata.validate()?;
-                let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
-                // Force alignment to 8 bytes.
-                let extra = (8 - metadata_buf.len() % 8) % 8;
-                metadata_buf.extend(vec![b' '; extra]);
-
-                let n: u64 = metadata_buf.len() as u64;
-
-                let mut f = File::options()
-                    .write(true)
-                    .create(true)
-                    .open(self.dir.join(filename))
-                    .await?;
-                f.write_all(&n.to_le_bytes()).await?;
-                f.write_all(&metadata_buf).await?;
-                let total = data_len + metadata_buf.len() + 8;
-                f.set_len(total as u64).await?;
-                f.flush().await?;
-
-                Ok(())
-            })
-            .collect();
-
-        // Wait for all files to be created
-        let creation_results: Vec<Result<_>> = join_all(file_creation_futures).await;
-        for result in creation_results {
-            result?;
-        }
-
-        Ok(())
-    }
-
-    /// Initialize target memory maps after files have been created
-    fn init_target_mmaps(&mut self, layout: &Layout) -> Result<()> {
-        if self.mmaps.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let target_mmaps: Result<Vec<_>> = layout
-            .topology
-            .filenames()
-            .iter()
-            .map(|filename| {
-                let filepath = self.dir.join(filename);
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&filepath)?;
-                unsafe { Ok(Arc::new(MmapMut::map_mut(&file)?)) }
-            })
-            .collect();
-
-        self.mmaps = Some(target_mmaps?);
-        Ok(())
-    }
-}
-
-/// Source configuration
-struct Source {
-    layout: Layout,
-    location: SourceLocation,
-}
-
-/// Target configuration
-struct Target {
-    layout: Layout,
-    location: WriteLocation,
-}
-
-/// Async streaming tensor redistributor with parallel processing and pre-calculated offsets
 pub struct AsyncTensorRedistributor {
     source: Source,
     target: Target,
@@ -559,11 +32,11 @@ impl AsyncTensorRedistributor {
         let source_dir = source_dir.as_ref().to_path_buf();
         let target_dir = target_dir.as_ref().to_path_buf();
 
-        let source_topology = load_or_create_topology(&source_dir)?;
+        let source_topology = super::load_or_create_topology(&source_dir)?;
         let source_metadatas: Result<Vec<(usize, Metadata)>> = source_topology
             .filenames()
             .iter()
-            .map(|f| Ok(safetensors_metadata(source_dir.join(f))?))
+            .map(|f| Ok(super::safetensors_metadata(source_dir.join(f))?))
             .collect();
         let source_metadatas = source_metadatas?;
         let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
@@ -716,329 +189,6 @@ impl AsyncTensorRedistributor {
         })
     }
 
-    /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
-    /// Returns (topology, metadata_cache) to avoid duplicate metadata fetching
-    pub async fn load_or_create_remote_topology_with_cache(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<(Topology, HashMap<String, Metadata>)> {
-        let mut metadata_cache = HashMap::new();
-
-        // Optimized approach: Use HEAD requests to check file existence first to avoid unnecessary downloads
-        let topology_url = base_url.join("topology.json").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid topology URL: {}", e),
-            ))
-        })?;
-
-        let index_url = base_url.join("model.safetensors.index.json").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid index URL: {}", e),
-            ))
-        })?;
-
-        let model_url = base_url.join("model.safetensors").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid model URL: {}", e),
-            ))
-        })?;
-
-        // Use HEAD requests to quickly check which files exist
-        let topology_exists = Self::check_file_exists(client, &topology_url, auth_headers).await;
-        let index_exists = Self::check_file_exists(client, &index_url, auth_headers).await;
-        let model_exists = Self::check_file_exists(client, &model_url, auth_headers).await;
-
-        // Try distributed setup first (topology.json)
-        if topology_exists {
-            if let Ok(topology) =
-                Self::try_fetch_topology_json(client, base_url, auth_headers).await
-            {
-                return Ok((topology, metadata_cache));
-            }
-        }
-
-        // Try chunked setup (index.json)
-        if index_exists {
-            if let Ok(topology) = Self::try_fetch_index_json(client, base_url, auth_headers).await {
-                return Ok((topology, metadata_cache));
-            }
-        }
-
-        // Try single file setup (model.safetensors)
-        if model_exists {
-            if let Ok((topology, metadata)) =
-                Self::try_fetch_model_safetensors_with_cache(client, base_url, auth_headers).await
-            {
-                // Cache the metadata we just fetched to avoid redundant request
-                metadata_cache.insert("model.safetensors".to_string(), metadata);
-                return Ok((topology, metadata_cache));
-            }
-        }
-
-        Err(RedistributorError::NoValidInput {
-            path: PathBuf::from(base_url.as_str()),
-        })
-    }
-
-    /// Check if a file exists using a HEAD request (fast and lightweight)
-    async fn check_file_exists(client: &Client, url: &Url, auth_headers: &HeaderMap) -> bool {
-        match client
-            .head(url.clone())
-            .headers(auth_headers.clone())
-            .timeout(Duration::from_secs(5)) // Short timeout for existence checks
-            .send()
-            .await
-        {
-            Ok(response) => response.status().is_success(),
-            Err(_) => false,
-        }
-    }
-
-    /// Load topology from remote URL, equivalent of load_or_create_topology for remote sources
-    pub async fn load_or_create_remote_topology(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<Topology> {
-        let (topology, _) =
-            Self::load_or_create_remote_topology_with_cache(client, base_url, auth_headers).await?;
-        Ok(topology)
-    }
-
-    /// Try to fetch and parse topology.json
-    async fn try_fetch_topology_json(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<Topology> {
-        let topology_url = base_url.join("topology.json").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid topology URL: {}", e),
-            ))
-        })?;
-
-        let response = client
-            .get(topology_url)
-            .headers(auth_headers.clone())
-            .send()
-            .await
-            .map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to fetch topology.json: {}", e),
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            return Err(RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "topology.json not found",
-            )));
-        }
-
-        let topology_data = response.text().await.map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read topology.json: {}", e),
-            ))
-        })?;
-
-        let topology: Topology = serde_json::from_str(&topology_data)?;
-        Ok(topology)
-    }
-
-    /// Try to fetch and parse model.safetensors.index.json
-    async fn try_fetch_index_json(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<Topology> {
-        let index_url = base_url.join("model.safetensors.index.json").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid index URL: {}", e),
-            ))
-        })?;
-
-        let response = client
-            .get(index_url)
-            .headers(auth_headers.clone())
-            .send()
-            .await
-            .map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to fetch index.json: {}", e),
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            return Err(RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "model.safetensors.index.json not found",
-            )));
-        }
-
-        let index_data = response.text().await.map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read index.json: {}", e),
-            ))
-        })?;
-
-        let index: SafetensorsIndex = serde_json::from_str(&index_data)?;
-
-        // Group tensors by their chunk file and create topology
-        let mut filenames: HashSet<String> = HashSet::new();
-        for (_tensor_name, file_name) in &index.weight_map {
-            filenames.insert(file_name.clone());
-        }
-        let mut filenames = filenames.into_iter().collect::<Vec<_>>();
-        filenames.sort();
-
-        // Create a topology with shared tensors (chunked model)
-        let mut tensors = BTreeMap::new();
-
-        // TODO: We need to fetch metadata from each file to get tensor shapes and dtypes
-        // For now, create placeholder shared tensors
-        for (tensor_name, _file_name) in &index.weight_map {
-            tensors.insert(
-                tensor_name.clone(),
-                Tensor::Shared(SharedInfo::new(
-                    vec![1],                 // Placeholder shape
-                    safetensors::Dtype::F32, // Placeholder dtype
-                    vec![0],                 // Placeholder file indices
-                )),
-            );
-        }
-
-        let topology = Topology::new(tensors, filenames, 1)?;
-        Ok(topology)
-    }
-
-    /// Try to fetch and create topology from model.safetensors, returning metadata for caching
-    async fn try_fetch_model_safetensors_with_cache(
-        client: &Client,
-        base_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<(Topology, Metadata)> {
-        let model_url = base_url.join("model.safetensors").map_err(|e| {
-            RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid model URL: {}", e),
-            ))
-        })?;
-
-        // Try to fetch the metadata from the file
-        let metadata =
-            Self::fetch_remote_safetensors_metadata(client, &model_url, auth_headers).await?;
-
-        // Create a topology with shared tensors (single file model)
-        let mut tensors = BTreeMap::new();
-        for (tensor_name, tensor_info) in metadata.tensors() {
-            tensors.insert(
-                tensor_name,
-                Tensor::Shared(SharedInfo::new(
-                    tensor_info.shape.to_vec(),
-                    tensor_info.dtype,
-                    vec![0], // Single file at index 0
-                )),
-            );
-        }
-
-        let topology = Topology::new(tensors, vec!["model.safetensors".to_string()], 1)?;
-        Ok((topology, metadata))
-    }
-
-    /// Fetch safetensors metadata from remote file using streaming
-    async fn fetch_remote_safetensors_metadata(
-        client: &Client,
-        file_url: &Url,
-        auth_headers: &HeaderMap,
-    ) -> Result<Metadata> {
-        // Make a single request and stream the response, cutting it early once we have the header
-        let range_header = format!("bytes={}-{}", 0, 10 * 1024 * 1024);
-        let response = client
-            .get(file_url.clone())
-            .headers(auth_headers.clone())
-            .header(RANGE, range_header)
-            .send()
-            .await
-            .map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to fetch from {}: {}", file_url, e),
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            return Err(RedistributorError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "Failed to fetch from {}: status {}",
-                    file_url,
-                    response.status()
-                ),
-            )));
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
-        let mut header_length: Option<u64> = None;
-
-        // Stream chunks and process them
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to read chunk: {}", e),
-                ))
-            })?;
-
-            buffer.extend_from_slice(&chunk);
-
-            // Step 1: Once we have at least 8 bytes, parse the header length
-            if header_length.is_none() && buffer.len() >= 8 {
-                let header_length_bytes: [u8; 8] = buffer[..8].try_into().map_err(|_| {
-                    RedistributorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Failed to convert header length bytes to array",
-                    ))
-                })?;
-
-                header_length = Some(u64::from_le_bytes(header_length_bytes));
-            }
-
-            // Step 2: Once we know the header length, check if we have the complete header
-            if let Some(len) = header_length {
-                let total_needed = 8 + len as usize; // 8 bytes for length + header JSON
-
-                if buffer.len() >= total_needed {
-                    // We have all the data we need, extract the header JSON and stop streaming
-                    let header_bytes = &buffer[8..total_needed];
-
-                    // Step 3: Parse the JSON as safetensors metadata
-                    let metadata: Metadata = serde_json::from_slice(header_bytes)
-                        .map_err(|e| RedistributorError::Json(e))?;
-
-                    return Ok(metadata);
-                }
-            }
-        }
-
-        // If we get here, the stream ended before we got all the data we needed
-        Err(RedistributorError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Stream ended before complete header was received",
-        )))
-    }
-
-    /// Redistribute tensors to target directory and return list of created files
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         trace!("Start");
         let start = Instant::now();
@@ -1289,20 +439,22 @@ impl AsyncTensorRedistributor {
 
                 if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
                     trace!(
-                        "TASKS: Task created for tensor '{}' in {:?}",
-                        tensor_name,
+                        "TASKS: Tensor {}/{} completed in {:?}",
+                        i + 1,
+                        tensor_count,
                         tensor_start.elapsed()
                     );
                 }
             }
 
             trace!(
-                "TASKS: Completed target file {} in {:?}",
-                target_file_index,
+                "TASKS: Target file {}/{} completed in {:?}",
+                target_file_index + 1,
+                file_count,
                 file_start.elapsed()
             );
         }
-        trace!("Finished creating tasks");
+
         trace!("TASKS: All tasks created in {:?}", start.elapsed());
         Ok(())
     }
@@ -1610,20 +762,17 @@ impl AsyncTensorRedistributor {
         &self,
         tensor_name: &str,
         source_info: &crate::topology::SharedInfo,
-        target_info: &crate::topology::SharedInfo,
-        target_file_index: usize,
+        _target_info: &crate::topology::SharedInfo,
+        _target_file_index: usize,
         task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
-        // Check if this target file should contain this shared tensor
-        if !target_info.filename_indices().contains(&target_file_index) {
-            // This target file doesn't need this tensor
-            return Ok(());
-        }
-
-        // Pick the first source file that contains this tensor (they're all identical for shared tensors)
+        // Pick the first source file that contains this tensor
         let source_file_index = source_info.filename_indices()[0];
+
+        // Get tensor properties
+        let dtype_size = source_info.dtype().size();
 
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
@@ -1637,21 +786,19 @@ impl AsyncTensorRedistributor {
                 })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
-        // For shared to shared, we just copy the entire tensor
-        let tensor_size_bytes =
-            source_tensor_info.data_offsets.1 - source_tensor_info.data_offsets.0;
+        // For shared to shared, we copy the entire tensor
+        let total_elements = source_info.shape().iter().product::<usize>();
+        let total_bytes = total_elements * dtype_size;
 
         let source_start = (source_header_size + source_data_offset) as u64;
-        let source_end = (source_header_size + source_data_offset + tensor_size_bytes) as u64;
+        let source_end = (source_header_size + source_data_offset + total_bytes) as u64;
 
         source_ranges.push((source_start, source_end, 0));
-        task_source.add_from_location(&self.source.location, source_file_index);
-        ranges_per_file.push(1); // Single range for the complete tensor
 
-        trace!(
-            "      Added 1 range from source file {} (full tensor copy)",
-            source_file_index
-        );
+        // Add the source mmap and record how many ranges belong to this file
+        trace!("      Added 1 range from source file {}", source_file_index);
+        task_source.add_from_location(&self.source.location, source_file_index);
+        ranges_per_file.push(1);
 
         Ok(())
     }
@@ -1660,18 +807,12 @@ impl AsyncTensorRedistributor {
         &self,
         tensor_name: &str,
         source_info: &crate::topology::DistributedInfo,
-        target_info: &crate::topology::SharedInfo,
-        target_file_index: usize,
+        _target_info: &crate::topology::SharedInfo,
+        _target_file_index: usize,
         task_source: &mut TaskSource,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
-        // Check if this target file should contain this shared tensor
-        if !target_info.filename_indices().contains(&target_file_index) {
-            // This target file doesn't need this tensor
-            return Ok(());
-        }
-
         // Get tensor properties
         let full_shape = source_info.shape();
         let dtype_size = source_info.dtype().size();
@@ -1683,11 +824,11 @@ impl AsyncTensorRedistributor {
             full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
         }
 
-        // For shared target, we need the complete tensor (all elements)
-        let total_elements: usize = full_shape.iter().product();
+        // The target is the full tensor, so target intervals cover everything
+        let total_elements = full_shape.iter().product::<usize>();
         let target_intervals = vec![(0, total_elements)];
 
-        // Process each source chunk and collect all the pieces
+        // Process each source chunk
         for source_chunk in source_info.chunks() {
             let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
 
@@ -1739,119 +880,13 @@ impl AsyncTensorRedistributor {
     }
 }
 
-/// Read safetensors file efficiently using memory mapping
-fn safetensors_metadata<P: AsRef<Path>>(file_path: P) -> Result<(usize, Metadata)> {
-    let file_path = file_path.as_ref().to_path_buf();
-    let file = std::fs::File::open(&file_path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let (n, metadata) = SafeTensors::read_metadata(&mmap)?;
-    // n is the size of the header, but we need to account for the first 8 bytes.
-    Ok((n + 8, metadata))
-}
-
-/// Load topology from directory, or create a single-rank topology if topology.json doesn't exist
-pub fn load_or_create_topology<P: AsRef<Path>>(dir: P) -> Result<Topology> {
-    let dir = dir.as_ref();
-    let topology_path = dir.join("topology.json");
-    let model_path = dir.join("model.safetensors");
-    let index_path = dir.join("model.safetensors.index.json");
-
-    // Check if we have a distributed setup (topology.json + rank*.safetensors)
-    if topology_path.exists() {
-        // Load existing distributed topology
-        let topology_data = std::fs::read_to_string(&topology_path)?;
-        let topology: Topology = serde_json::from_str(&topology_data)?;
-        return Ok(topology);
-    }
-    let filenames = if index_path.exists() {
-        // Chunked safetensors case - read the index file to get tensor information
-        let index_data = std::fs::read_to_string(&index_path)?;
-        let index: SafetensorsIndex = serde_json::from_str(&index_data)?;
-
-        // Group tensors by their chunk file
-        let mut filenames: HashSet<String> = HashSet::new();
-        for (_tensor_name, file_name) in &index.weight_map {
-            filenames.insert(file_name.clone());
-        }
-        let mut filenames = filenames.into_iter().collect::<Vec<_>>();
-        filenames.sort();
-        filenames
-    } else if model_path.exists() {
-        vec!["model.safetensors".to_string()]
-    } else {
-        return Err(RedistributorError::NoValidInput {
-            path: dir.to_path_buf(),
-        });
-    };
-    // Create a topology with a single rank
-    let mut tensors = BTreeMap::new();
-
-    // Read each chunk file to get tensor information
-    for (file_index, file_name) in filenames.iter().enumerate() {
-        let file_path = dir.join(&file_name);
-        let (_, safetensors) = safetensors_metadata(&file_path)?;
-
-        for (tensor_name, tensor_info) in safetensors.tensors() {
-            tensors.insert(
-                tensor_name,
-                Tensor::Shared(SharedInfo::new(
-                    tensor_info.shape.to_vec(),
-                    tensor_info.dtype,
-                    vec![file_index], // Use the correct file index
-                )),
-            );
-        }
-    }
-
-    // Create topology with all chunk files
-    let topology = Topology::new(tensors, filenames, 1)?;
-    Ok(topology)
-}
-
-fn intersection(
-    source_intervals: &[(usize, usize)],
-    target_intervals: &[(usize, usize)],
-) -> Vec<(usize, usize, usize)> {
-    let mut result = Vec::new();
-
-    let mut soffset = 0;
-    let mut toffset = 0;
-    let mut sindex = 0;
-    let mut tindex = 0;
-
-    while sindex < source_intervals.len() && tindex < target_intervals.len() {
-        let (source_start, source_end) = &source_intervals[sindex];
-        let (target_start, target_end) = &target_intervals[tindex];
-        let intersection_start = (*source_start).max(*target_start);
-        let intersection_end = (*source_end).min(*target_end);
-
-        if intersection_start < intersection_end {
-            // There is an overlap
-            let source_offset = soffset + (intersection_start - source_start);
-            let target_offset = toffset + (intersection_start - target_start);
-            let length = intersection_end - intersection_start;
-
-            result.push((source_offset, target_offset, length));
-        }
-
-        if source_end < target_end {
-            sindex += 1;
-            soffset += source_end - source_start;
-        } else {
-            tindex += 1;
-            toffset += target_end - target_start;
-        }
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::topology::{Chunk, DistributedInfo, SharedInfo};
     use safetensors::{Dtype, serialize, tensor::TensorView};
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     // Helper function to convert f32 slice to little-endian bytes
@@ -1869,7 +904,7 @@ mod tests {
     }
 
     // Helper function to calculate SHA256 of a file
-    async fn calculate_file_hash<P: AsRef<Path>>(path: P) -> String {
+    async fn calculate_file_hash<P: AsRef<std::path::Path>>(path: P) -> String {
         let path = path.as_ref();
         let contents = tokio::fs::read(path).await.unwrap();
 
@@ -2064,7 +1099,7 @@ mod tests {
 
         // Step 7: Additional verification - load and compare tensor data
         let final_bytes = tokio::fs::read(&final_path).await.unwrap();
-        let final_safetensors = SafeTensors::deserialize(&final_bytes).unwrap();
+        let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
 
         // Verify tensor1
         let final_tensor1 = final_safetensors.tensor("tensor1").unwrap();
@@ -2205,4 +1240,4 @@ mod tests {
         let result = intersection(&source_intervals, &target_intervals);
         assert_eq!(result, expected);
     }
-}
+} 
