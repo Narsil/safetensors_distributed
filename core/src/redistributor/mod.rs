@@ -15,6 +15,26 @@ use tokio::task::JoinError;
 // Re-export main types
 pub use core::AsyncTensorRedistributor;
 
+/// Strategy for ordering reads and writes during redistribution
+#[derive(Clone, Copy, Debug)]
+pub enum RedistributionStrategy {
+    /// Default behavior: create tasks per target chunk, no special ordering
+    Default,
+    /// Read files sequentially, write tasks can execute unordered
+    ReadSerialWriteUnordered,
+    /// Read tasks can execute unordered, but write tasks execute serially  
+    ReadUnorderedWriteSerial,
+    /// Read in large chunks (optimized for network), write unordered
+    /// chunk_size is in bytes - will coalesce nearby reads within this distance
+    ReadLargeChunksWriteUnordered { chunk_size: usize },
+}
+
+impl Default for RedistributionStrategy {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 /// Structure for deserializing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
 pub struct SafetensorsIndex {

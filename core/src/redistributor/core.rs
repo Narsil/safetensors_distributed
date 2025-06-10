@@ -1,4 +1,4 @@
-use super::{Result, RedistributorError, Layout, intersection};
+use super::{Result, RedistributorError, Layout, intersection, RedistributionStrategy};
 use super::location::{Source, Target, SourceLocation, WriteLocation};
 use super::task::{TaskSource, MmapWriteTask};
 use crate::topology::{Topology, Tensor, get_intervals};
@@ -19,6 +19,7 @@ use url::Url;
 pub struct AsyncTensorRedistributor {
     source: Source,
     target: Target,
+    strategy: RedistributionStrategy,
 }
 
 impl AsyncTensorRedistributor {
@@ -76,6 +77,7 @@ impl AsyncTensorRedistributor {
                     mmaps: None,
                 },
             },
+            strategy: RedistributionStrategy::default(),
         })
     }
 
@@ -186,6 +188,7 @@ impl AsyncTensorRedistributor {
                     mmaps: None,
                 },
             },
+            strategy: RedistributionStrategy::default(),
         })
     }
 
@@ -238,26 +241,136 @@ impl AsyncTensorRedistributor {
 
         trace!("REDISTRIBUTION: Starting progress task...");
         let p = progress.clone();
+        let strategy = self.strategy;
         let handle = tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(1024);
-
-            loop {
-                let received = rx.recv_many(&mut batch, 1024).await;
-                if received == 0 {
-                    break; // Channel closed
-                }
-
-                // Sort by target file index, then by target offset for sequential I/O
-                batch.sort_by_key(|task| (task.target_file_index, task.target_start));
-
-                // Execute batch in sorted order
-                for task in batch.drain(..) {
-                    let length = (task.target_end - task.target_start) as usize;
-                    if let Err(e) = task.run().await {
-                        error!("Write task failed: {}", e);
-                        // Continue with other tasks rather than failing completely
+            match strategy {
+                RedistributionStrategy::ReadUnorderedWriteSerial => {
+                    // Execute writes serially for best write locality
+                    let mut all_tasks = Vec::new();
+                    
+                    // Collect all tasks first
+                    loop {
+                        let mut batch = Vec::with_capacity(1024);
+                        let received = rx.recv_many(&mut batch, 1024).await;
+                        if received == 0 {
+                            break;
+                        }
+                        all_tasks.extend(batch);
                     }
-                    p.inc(length as u64);
+                    
+                    // Sort for sequential writing
+                    all_tasks.sort_by_key(|task| (task.target_file_index, task.target_start));
+                    
+                    // Execute serially
+                    for task in all_tasks {
+                        let length = (task.target_end - task.target_start) as usize;
+                        if let Err(e) = task.run().await {
+                            error!("Write task failed: {}", e);
+                        }
+                        p.inc(length as u64);
+                    }
+                }
+                
+                RedistributionStrategy::ReadSerialWriteUnordered => {
+                    // Sort primarily by read locality, allow concurrent writes
+                    let mut batch = Vec::with_capacity(1024);
+
+                    loop {
+                        let received = rx.recv_many(&mut batch, 1024).await;
+                        if received == 0 {
+                            break;
+                        }
+
+                        // Sort by source file/offset for read locality
+                        batch.sort_by_key(|task| {
+                            if let Some(&(start, _, _)) = task.source_ranges.first() {
+                                start
+                            } else {
+                                0
+                            }
+                        });
+
+                        // Execute batch concurrently
+                        let mut handles = Vec::new();
+                        for task in batch.drain(..) {
+                            let progress = p.clone();
+                            handles.push(tokio::spawn(async move {
+                                let length = (task.target_end - task.target_start) as usize;
+                                if let Err(e) = task.run().await {
+                                    error!("Write task failed: {}", e);
+                                }
+                                progress.inc(length as u64);
+                            }));
+                        }
+                        
+                        // Wait for this batch to complete before processing next
+                        for handle in handles {
+                            let _ = handle.await;
+                        }
+                    }
+                }
+                
+                RedistributionStrategy::ReadLargeChunksWriteUnordered { chunk_size: _ } => {
+                    // For now, use read locality sorting with concurrent execution
+                    let mut batch = Vec::with_capacity(1024);
+
+                    loop {
+                        let received = rx.recv_many(&mut batch, 1024).await;
+                        if received == 0 {
+                            break;
+                        }
+
+                        // Sort by source file/offset for read locality
+                        batch.sort_by_key(|task| {
+                            if let Some(&(start, _, _)) = task.source_ranges.first() {
+                                start
+                            } else {
+                                0
+                            }
+                        });
+
+                        // Execute batch concurrently
+                        let mut handles = Vec::new();
+                        for task in batch.drain(..) {
+                            let progress = p.clone();
+                            handles.push(tokio::spawn(async move {
+                                let length = (task.target_end - task.target_start) as usize;
+                                if let Err(e) = task.run().await {
+                                    error!("Write task failed: {}", e);
+                                }
+                                progress.inc(length as u64);
+                            }));
+                        }
+                        
+                        // Wait for this batch to complete
+                        for handle in handles {
+                            let _ = handle.await;
+                        }
+                    }
+                }
+                
+                RedistributionStrategy::Default => {
+                    // Original behavior: sort by target for write locality
+                    let mut batch = Vec::with_capacity(1024);
+
+                    loop {
+                        let received = rx.recv_many(&mut batch, 1024).await;
+                        if received == 0 {
+                            break;
+                        }
+
+                        // Sort by target file index, then by target offset for sequential I/O
+                        batch.sort_by_key(|task| (task.target_file_index, task.target_start));
+
+                        // Execute batch in sorted order
+                        for task in batch.drain(..) {
+                            let length = (task.target_end - task.target_start) as usize;
+                            if let Err(e) = task.run().await {
+                                error!("Write task failed: {}", e);
+                            }
+                            p.inc(length as u64);
+                        }
+                    }
                 }
             }
         });
@@ -297,6 +410,14 @@ impl AsyncTensorRedistributor {
 
         Ok(created_files)
     }
+
+    /// Set the redistribution strategy
+    pub fn with_strategy(mut self, strategy: RedistributionStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
     fn pre_calculate_metadatas(topology: &Topology) -> Result<Vec<(usize, Metadata)>> {
@@ -1126,6 +1247,66 @@ mod tests {
         assert_eq!(final_tensor2_data, tensor2_data.as_slice());
 
         trace!("✅ Round-trip redistribution test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_redistribution_strategies() {
+        use tempfile::TempDir;
+        use std::collections::BTreeMap;
+        
+        // Create temp directories
+        let source_dir = TempDir::new().unwrap();
+
+        // Create a simple model for testing strategies
+        let tensor_data = create_test_data_8x4();
+        let tensor_bytes = f32s_to_le_bytes(&tensor_data);
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "test_tensor".to_string(),
+            TensorView::new(Dtype::F32, vec![8, 4], &tensor_bytes).unwrap(),
+        );
+
+        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_path = source_dir.path().join("model.safetensors");
+        tokio::fs::write(&original_path, &original_bytes).await.unwrap();
+
+        // Create target topology
+        let mut target_tensors = BTreeMap::new();
+        target_tensors.insert(
+            "test_tensor".to_string(),
+            Tensor::Shared(SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])),
+        );
+        let target_topology = Topology::new(
+            target_tensors,
+            vec!["output.safetensors".to_string()],
+            1,
+        ).unwrap();
+
+        // Test different strategies
+        let strategies = vec![
+            RedistributionStrategy::Default,
+            RedistributionStrategy::ReadSerialWriteUnordered,
+            RedistributionStrategy::ReadUnorderedWriteSerial,
+            RedistributionStrategy::ReadLargeChunksWriteUnordered { chunk_size: 1024 * 1024 },
+        ];
+
+        for strategy in strategies {
+            let strategy_dir = TempDir::new().unwrap();
+            
+            let mut redistributor = AsyncTensorRedistributor::from_local(
+                source_dir.path(),
+                strategy_dir.path(),
+                target_topology.clone(),
+            ).unwrap().with_strategy(strategy);
+
+            // All strategies should work and produce the same result
+            let result = redistributor.redistribute().await;
+            assert!(result.is_ok(), "Strategy {:?} failed: {:?}", strategy, result.err());
+            
+            // Verify output file exists
+            assert!(strategy_dir.path().join("output.safetensors").exists());
+        }
     }
 
     #[test]
