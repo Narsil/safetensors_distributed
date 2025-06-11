@@ -869,13 +869,13 @@ impl AsyncTensorRedistributor {
 
         // Process each source chunk to see if it overlaps with our target
         for source_chunk in source_info.chunks() {
+            let start = Instant::now();
             let source_file_index = source_chunk.filename_index();
 
             // Get source file metadata to calculate byte offsets
             let (source_header_size, source_metadata) =
                 &self.source.layout.metadatas[source_file_index];
-            let source_tensors = source_metadata.tensors();
-            let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+            let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
                 RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 }
@@ -905,6 +905,7 @@ impl AsyncTensorRedistributor {
                 task_source.add_from_location(&self.source.location, source_file_index);
                 ranges_per_file.push(ranges_for_this_file);
             }
+            // println!("Loop {:?}", start.elapsed());
         }
 
         Ok(())
@@ -949,10 +950,8 @@ impl AsyncTensorRedistributor {
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
             &self.source.layout.metadatas[source_file_index];
-        let source_tensors = source_metadata.tensors();
         let source_tensor_info =
-            source_tensors
-                .get(tensor_name)
+            source_metadata.info(tensor_name)
                 .ok_or_else(|| RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 })?;
@@ -1003,10 +1002,9 @@ impl AsyncTensorRedistributor {
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
             &self.source.layout.metadatas[source_file_index];
-        let source_tensors = source_metadata.tensors();
         let source_tensor_info =
-            source_tensors
-                .get(tensor_name)
+            source_metadata
+                .info(tensor_name)
                 .ok_or_else(|| RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 })?;
@@ -1061,8 +1059,7 @@ impl AsyncTensorRedistributor {
             // Get source file metadata to calculate byte offsets
             let (source_header_size, source_metadata) =
                 &self.source.layout.metadatas[source_file_index];
-            let source_tensors = source_metadata.tensors();
-            let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+            let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
                 RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 }
@@ -1136,8 +1133,7 @@ impl AsyncTensorRedistributor {
             // Get target file metadata to calculate byte offsets
             let (target_header_size, target_metadata) =
                 &self.target.layout.metadatas[target_file_index];
-            let target_tensors = target_metadata.tensors();
-            let target_tensor_info = target_tensors.get(tensor_name).ok_or_else(|| {
+            let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
                 RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 }
@@ -1201,8 +1197,7 @@ impl AsyncTensorRedistributor {
             // Get target file metadata to calculate byte offsets
             let (target_header_size, target_metadata) =
                 &self.target.layout.metadatas[target_file_index];
-            let target_tensors = target_metadata.tensors();
-            let target_tensor_info = target_tensors.get(tensor_name).ok_or_else(|| {
+            let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
                 RedistributorError::TensorNotFound {
                     name: tensor_name.to_string(),
                 }
@@ -1255,8 +1250,7 @@ impl AsyncTensorRedistributor {
         for (target_file_index, (target_header_size, target_metadata)) in
             self.target.layout.metadatas.iter().enumerate()
         {
-            let target_tensors = target_metadata.tensors();
-            if let Some(target_tensor_info) = target_tensors.get(tensor_name) {
+            if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
                 let target_data_offset = target_tensor_info.data_offsets.0;
                 let target_start = (target_header_size + target_data_offset) as u64;
                 let target_end = target_start + tensor_size as u64;
@@ -1312,8 +1306,7 @@ impl AsyncTensorRedistributor {
         for (target_file_index, (target_header_size, target_metadata)) in
             self.target.layout.metadatas.iter().enumerate()
         {
-            let target_tensors = target_metadata.tensors();
-            if let Some(target_tensor_info) = target_tensors.get(tensor_name) {
+            if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
                 let target_data_offset = target_tensor_info.data_offsets.0;
 
                 // Use optimized direct computation for distributed-to-shared
