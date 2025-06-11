@@ -1,7 +1,7 @@
 use super::location::{Source, SourceLocation, Target, WriteLocation};
 use super::task::{ReadSerialTask, Task, TaskSource, WriteOperation};
-use super::{Layout, RedistributionStrategy, RedistributorError, Result, intersection};
-use crate::topology::{Tensor, Topology, get_intervals};
+use super::{Layout, RedistributionStrategy, RedistributorError, Result, compute_shared_to_distributed_ranges, compute_distributed_to_shared_ranges, compute_write_ranges_direct, compute_distributed_to_shared_write_ranges, compute_shared_to_distributed_write_ranges};
+use crate::topology::{Tensor, Topology};
 // use futures::future::join_all; // Unused
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
@@ -867,54 +867,43 @@ impl AsyncTensorRedistributor {
             full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
         }
 
-        // Get the intervals (element ranges) for this target chunk
-        let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
-
         // Process each source chunk to see if it overlaps with our target
         for source_chunk in source_info.chunks() {
-            let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
+            let source_file_index = source_chunk.filename_index();
 
-            // Find intersection between source and target intervals
-            let intersections = intersection(&source_intervals, &target_intervals);
-
-            if !intersections.is_empty() {
-                let source_file_index = source_chunk.filename_index();
-
-                // Get source file metadata to calculate byte offsets
-                let (source_header_size, source_metadata) =
-                    &self.source.layout.metadatas[source_file_index];
-                let source_tensors = source_metadata.tensors();
-                let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
-                    RedistributorError::TensorNotFound {
-                        name: tensor_name.to_string(),
-                    }
-                })?;
-                let source_data_offset = source_tensor_info.data_offsets.0;
-
-                // Convert intersection results to byte ranges
-                let mut ranges_for_this_file = 0;
-                for (source_offset, target_offset, length) in intersections {
-                    let start_bytes = source_offset * dtype_size;
-                    let end_bytes = (source_offset + length) * dtype_size;
-                    let target_offset_bytes = target_offset * dtype_size;
-
-                    let source_start =
-                        (source_header_size + source_data_offset + start_bytes) as u64;
-                    let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
-
-                    source_ranges.push((source_start, source_end, target_offset_bytes as u64));
-                    ranges_for_this_file += 1;
+            // Get source file metadata to calculate byte offsets
+            let (source_header_size, source_metadata) =
+                &self.source.layout.metadatas[source_file_index];
+            let source_tensors = source_metadata.tensors();
+            let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+                RedistributorError::TensorNotFound {
+                    name: tensor_name.to_string(),
                 }
+            })?;
+            let source_data_offset = source_tensor_info.data_offsets.0;
+
+            // Use optimized direct computation instead of get_intervals + intersection
+            let byte_ranges = super::compute_read_ranges_direct(
+                source_chunk,
+                target_chunk,
+                *source_header_size,
+                source_data_offset,
+                dtype_size,
+                &full_strides,
+                full_shape,
+            );
+
+            if !byte_ranges.is_empty() {
+                let ranges_for_this_file = byte_ranges.len();
+                source_ranges.extend(byte_ranges);
 
                 // Add the source mmap and record how many ranges belong to this file
-                if ranges_for_this_file > 0 {
-                    trace!(
-                        "      Added {} ranges from source file {}",
-                        ranges_for_this_file, source_file_index
-                    );
-                    task_source.add_from_location(&self.source.location, source_file_index);
-                    ranges_per_file.push(ranges_for_this_file);
-                }
+                trace!(
+                    "      Added {} ranges from source file {}",
+                    ranges_for_this_file, source_file_index
+                );
+                task_source.add_from_location(&self.source.location, source_file_index);
+                ranges_per_file.push(ranges_for_this_file);
             }
         }
 
@@ -954,9 +943,6 @@ impl AsyncTensorRedistributor {
             full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
         }
 
-        // Get the intervals (element ranges) for this target chunk
-        let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
-
         // Pick the first source file that contains this tensor (they're all identical for shared tensors)
         let source_file_index = source_info.filename_indices()[0];
 
@@ -972,24 +958,21 @@ impl AsyncTensorRedistributor {
                 })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
-        // Convert element intervals to byte ranges
-        let mut ranges_for_this_file = 0;
-        let mut target_offset_elements = 0;
-        for (start_elem, end_elem) in target_intervals {
-            let start_bytes = start_elem * dtype_size;
-            let end_bytes = end_elem * dtype_size;
-            let target_offset_bytes = target_offset_elements * dtype_size;
+        // Use optimized direct computation for shared-to-distributed
+        let byte_ranges = compute_shared_to_distributed_ranges(
+            target_chunk,
+            *source_header_size,
+            source_data_offset,
+            dtype_size,
+            &full_strides,
+            full_shape,
+        );
 
-            let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
-            let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
+        if !byte_ranges.is_empty() {
+            let ranges_for_this_file = byte_ranges.len();
+            source_ranges.extend(byte_ranges);
 
-            source_ranges.push((source_start, source_end, target_offset_bytes as u64));
-            ranges_for_this_file += 1;
-            target_offset_elements += end_elem - start_elem;
-        }
-
-        // Add the source mmap and record how many ranges belong to this file
-        if ranges_for_this_file > 0 {
+            // Add the source mmap and record how many ranges belong to this file
             trace!(
                 "      Added {} ranges from source file {}",
                 ranges_for_this_file, source_file_index
@@ -1069,53 +1052,44 @@ impl AsyncTensorRedistributor {
 
         // The target is the full tensor, so target intervals cover everything
         let total_elements = full_shape.iter().product::<usize>();
-        let target_intervals = vec![(0, total_elements)];
+        let _target_intervals = vec![(0, total_elements)];
 
         // Process each source chunk
         for source_chunk in source_info.chunks() {
-            let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
+            let source_file_index = source_chunk.filename_index();
 
-            // Find intersection between source chunk and the full target tensor
-            let intersections = intersection(&source_intervals, &target_intervals);
-
-            if !intersections.is_empty() {
-                let source_file_index = source_chunk.filename_index();
-
-                // Get source file metadata to calculate byte offsets
-                let (source_header_size, source_metadata) =
-                    &self.source.layout.metadatas[source_file_index];
-                let source_tensors = source_metadata.tensors();
-                let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
-                    RedistributorError::TensorNotFound {
-                        name: tensor_name.to_string(),
-                    }
-                })?;
-                let source_data_offset = source_tensor_info.data_offsets.0;
-
-                // Convert intersection results to byte ranges
-                let mut ranges_for_this_file = 0;
-                for (source_offset, target_offset, length) in intersections {
-                    let start_bytes = source_offset * dtype_size;
-                    let end_bytes = (source_offset + length) * dtype_size;
-                    let target_offset_bytes = target_offset * dtype_size;
-
-                    let source_start =
-                        (source_header_size + source_data_offset + start_bytes) as u64;
-                    let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
-
-                    source_ranges.push((source_start, source_end, target_offset_bytes as u64));
-                    ranges_for_this_file += 1;
+            // Get source file metadata to calculate byte offsets
+            let (source_header_size, source_metadata) =
+                &self.source.layout.metadatas[source_file_index];
+            let source_tensors = source_metadata.tensors();
+            let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+                RedistributorError::TensorNotFound {
+                    name: tensor_name.to_string(),
                 }
+            })?;
+            let source_data_offset = source_tensor_info.data_offsets.0;
+
+            // Use optimized direct computation for distributed-to-shared
+            let byte_ranges = compute_distributed_to_shared_ranges(
+                source_chunk,
+                *source_header_size,
+                source_data_offset,
+                dtype_size,
+                &full_strides,
+                full_shape,
+            );
+
+            if !byte_ranges.is_empty() {
+                let ranges_for_this_file = byte_ranges.len();
+                source_ranges.extend(byte_ranges);
 
                 // Add the source mmap and record how many ranges belong to this file
-                if ranges_for_this_file > 0 {
-                    trace!(
-                        "      Added {} ranges from source file {}",
-                        ranges_for_this_file, source_file_index
-                    );
-                    task_source.add_from_location(&self.source.location, source_file_index);
-                    ranges_per_file.push(ranges_for_this_file);
-                }
+                trace!(
+                    "      Added {} ranges from source file {}",
+                    ranges_for_this_file, source_file_index
+                );
+                task_source.add_from_location(&self.source.location, source_file_index);
+                ranges_per_file.push(ranges_for_this_file);
             }
         }
 
@@ -1155,49 +1129,44 @@ impl AsyncTensorRedistributor {
             full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
         }
 
-        // Get the intervals (element ranges) for this source chunk
-        let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
-
         // Process each target chunk to see if it overlaps with our source
         for target_chunk in target_info.chunks() {
-            let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
+            let target_file_index = target_chunk.filename_index();
 
-            // Find intersection between source and target intervals
-            let intersections = intersection(&source_intervals, &target_intervals);
+            // Get target file metadata to calculate byte offsets
+            let (target_header_size, target_metadata) =
+                &self.target.layout.metadatas[target_file_index];
+            let target_tensors = target_metadata.tensors();
+            let target_tensor_info = target_tensors.get(tensor_name).ok_or_else(|| {
+                RedistributorError::TensorNotFound {
+                    name: tensor_name.to_string(),
+                }
+            })?;
+            let target_data_offset = target_tensor_info.data_offsets.0;
 
-            if !intersections.is_empty() {
-                let target_file_index = target_chunk.filename_index();
+            // Use optimized direct computation instead of get_intervals + intersection
+            let write_ranges = compute_write_ranges_direct(
+                source_chunk,
+                target_chunk,
+                *target_header_size,
+                target_data_offset,
+                dtype_size,
+                &full_strides,
+                full_shape,
+            );
 
-                // Get target file metadata to calculate byte offsets
-                let (target_header_size, target_metadata) =
-                    &self.target.layout.metadatas[target_file_index];
-                let target_tensors = target_metadata.tensors();
-                let target_tensor_info = target_tensors.get(tensor_name).ok_or_else(|| {
-                    RedistributorError::TensorNotFound {
-                        name: tensor_name.to_string(),
-                    }
-                })?;
-                let target_data_offset = target_tensor_info.data_offsets.0;
-
+            if !write_ranges.is_empty() {
                 // Get target mmap for writing
                 let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                // Convert intersection results to write operations
-                for (source_offset, target_offset, length) in intersections {
-                    let source_offset_bytes = source_offset * dtype_size;
-                    let target_start_bytes = target_offset * dtype_size;
-                    let length_bytes = length * dtype_size;
-
-                    let target_start =
-                        (target_header_size + target_data_offset + target_start_bytes) as u64;
-                    let target_end = target_start + length_bytes as u64;
-
+                // Convert write ranges to write operations
+                for write_range in write_ranges {
                     writes.push(WriteOperation {
                         target_file_index,
                         target_mmap: target_mmap.clone(),
-                        target_start,
-                        target_end,
-                        read_offset: source_offset_bytes,
+                        target_start: write_range.target_start,
+                        target_end: write_range.target_end,
+                        read_offset: write_range.source_offset,
                     });
                 }
             }
@@ -1227,7 +1196,6 @@ impl AsyncTensorRedistributor {
 
         // Process each target chunk
         for target_chunk in target_info.chunks() {
-            let target_intervals = get_intervals(target_chunk, &full_strides, full_shape);
             let target_file_index = target_chunk.filename_index();
 
             // Get target file metadata to calculate byte offsets
@@ -1241,29 +1209,30 @@ impl AsyncTensorRedistributor {
             })?;
             let target_data_offset = target_tensor_info.data_offsets.0;
 
-            // Get target mmap for writing
-            let target_mmap = self.target.location.get_mmap(target_file_index)?;
+            // Use optimized direct computation for shared-to-distributed
+            let write_ranges = compute_shared_to_distributed_write_ranges(
+                target_chunk,
+                *target_header_size,
+                target_data_offset,
+                dtype_size,
+                &full_strides,
+                full_shape,
+            );
 
-            // Convert element intervals to write operations
-            let mut target_offset_elements = 0;
-            for (start_elem, end_elem) in target_intervals {
-                let source_offset_bytes = start_elem * dtype_size;
-                let target_start_bytes = target_offset_elements * dtype_size;
-                let length_bytes = (end_elem - start_elem) * dtype_size;
+            if !write_ranges.is_empty() {
+                // Get target mmap for writing
+                let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                let target_start =
-                    (target_header_size + target_data_offset + target_start_bytes) as u64;
-                let target_end = target_start + length_bytes as u64;
-
-                writes.push(WriteOperation {
-                    target_file_index,
-                    target_mmap: target_mmap.clone(),
-                    target_start,
-                    target_end,
-                    read_offset: source_offset_bytes,
-                });
-
-                target_offset_elements += end_elem - start_elem;
+                // Convert write ranges to write operations
+                for write_range in write_ranges {
+                    writes.push(WriteOperation {
+                        target_file_index,
+                        target_mmap: target_mmap.clone(),
+                        target_start: write_range.target_start,
+                        target_end: write_range.target_end,
+                        read_offset: write_range.source_offset,
+                    });
+                }
             }
         }
 
@@ -1339,9 +1308,6 @@ impl AsyncTensorRedistributor {
             full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
         }
 
-        // Get the intervals (element ranges) for this source chunk
-        let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
-
         // Find all target files that contain this tensor (they should all get the same data)
         for (target_file_index, (target_header_size, target_metadata)) in
             self.target.layout.metadatas.iter().enumerate()
@@ -1350,29 +1316,30 @@ impl AsyncTensorRedistributor {
             if let Some(target_tensor_info) = target_tensors.get(tensor_name) {
                 let target_data_offset = target_tensor_info.data_offsets.0;
 
-                // Get target mmap for writing
-                let target_mmap = self.target.location.get_mmap(target_file_index)?;
+                // Use optimized direct computation for distributed-to-shared
+                let write_ranges = compute_distributed_to_shared_write_ranges(
+                    source_chunk,
+                    *target_header_size,
+                    target_data_offset,
+                    dtype_size,
+                    &full_strides,
+                    full_shape,
+                );
 
-                // Convert element intervals to write operations
-                let mut source_offset_elements = 0;
-                for (start_elem, end_elem) in source_intervals.iter() {
-                    let source_offset_bytes = source_offset_elements * dtype_size;
-                    let target_start_bytes = start_elem * dtype_size;
-                    let length_bytes = (end_elem - start_elem) * dtype_size;
+                if !write_ranges.is_empty() {
+                    // Get target mmap for writing
+                    let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                    let target_start =
-                        (target_header_size + target_data_offset + target_start_bytes) as u64;
-                    let target_end = target_start + length_bytes as u64;
-
-                    writes.push(WriteOperation {
-                        target_file_index,
-                        target_mmap: target_mmap.clone(),
-                        target_start,
-                        target_end,
-                        read_offset: source_offset_bytes,
-                    });
-
-                    source_offset_elements += end_elem - start_elem;
+                    // Convert write ranges to write operations
+                    for write_range in write_ranges {
+                        writes.push(WriteOperation {
+                            target_file_index,
+                            target_mmap: target_mmap.clone(),
+                            target_start: write_range.target_start,
+                            target_end: write_range.target_end,
+                            read_offset: write_range.source_offset,
+                        });
+                    }
                 }
             }
         }
@@ -1385,6 +1352,7 @@ impl AsyncTensorRedistributor {
 mod tests {
     use super::*;
     use crate::topology::{Chunk, DistributedInfo, SharedInfo};
+    use crate::redistributor::intersection;
     use safetensors::{Dtype, serialize, tensor::TensorView};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
