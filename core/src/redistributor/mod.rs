@@ -233,7 +233,9 @@ pub fn intersection(
     source_intervals: &[(usize, usize)],
     target_intervals: &[(usize, usize)],
 ) -> Vec<(usize, usize, usize)> {
-    let mut result = Vec::new();
+    // Pre-allocate with minimum capacity
+    let min_capacity = source_intervals.len().min(target_intervals.len());
+    let mut result = Vec::with_capacity(min_capacity);
 
     let mut soffset = 0;
     let mut toffset = 0;
@@ -241,10 +243,10 @@ pub fn intersection(
     let mut tindex = 0;
 
     while sindex < source_intervals.len() && tindex < target_intervals.len() {
-        let (source_start, source_end) = &source_intervals[sindex];
-        let (target_start, target_end) = &target_intervals[tindex];
-        let intersection_start = (*source_start).max(*target_start);
-        let intersection_end = (*source_end).min(*target_end);
+        let (source_start, source_end) = source_intervals[sindex];
+        let (target_start, target_end) = target_intervals[tindex];
+        let intersection_start = source_start.max(target_start);
+        let intersection_end = source_end.min(target_end);
 
         if intersection_start < intersection_end {
             // There is an overlap

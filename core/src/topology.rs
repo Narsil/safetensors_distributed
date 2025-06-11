@@ -238,7 +238,11 @@ fn check_overlapping_chunks(
 }
 
 pub fn get_intervals(chunk: &Chunk, strides: &[usize], shape: &[usize]) -> Vec<(usize, usize)> {
-    let mut intervals = Vec::new();
+    // Pre-allocate with estimated capacity
+    let estimated_capacity = chunk.shape.iter().product();
+    let mut intervals = Vec::with_capacity(estimated_capacity);
+    let mut buffer = Vec::with_capacity(estimated_capacity);
+    
     let mut span = 0;
     for ((i, d), total_d) in chunk.shape.iter().enumerate().rev().zip(shape.iter().rev()) {
         if d == total_d && span == 0 {
@@ -253,9 +257,12 @@ pub fn get_intervals(chunk: &Chunk, strides: &[usize], shape: &[usize]) -> Vec<(
             let stride = strides[i];
             let off = chunk.offsets[i];
 
-            let old: Vec<_> = intervals.drain(..).collect();
+            // Swap intervals and buffer instead of draining
+            std::mem::swap(&mut intervals, &mut buffer);
+            intervals.clear();
+
             for dd in 0..*d {
-                for (old_start, old_stop) in &old {
+                for (old_start, old_stop) in &buffer {
                     let new_start = (off + dd) * stride + old_start;
                     let new_stop = (off + dd) * stride + old_stop;
                     intervals.push((new_start, new_stop));
