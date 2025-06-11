@@ -1,10 +1,10 @@
-use super::{Result, RedistributorError, SafetensorsIndex};
-use crate::topology::{Topology, Tensor, SharedInfo};
+use super::{RedistributorError, Result, SafetensorsIndex};
+use crate::topology::{SharedInfo, Tensor, Topology};
+use log::trace;
 use reqwest::{Client, header::HeaderMap};
 use safetensors::tensor::Metadata;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeMap, HashMap};
 use url::Url;
-use log::trace;
 
 impl super::core::AsyncTensorRedistributor {
     pub async fn load_or_create_remote_topology_with_cache(
@@ -46,7 +46,8 @@ impl super::core::AsyncTensorRedistributor {
         base_url: &Url,
         auth_headers: &HeaderMap,
     ) -> Result<Topology> {
-        let (topology, _) = Self::load_or_create_remote_topology_with_cache(client, base_url, auth_headers).await?;
+        let (topology, _) =
+            Self::load_or_create_remote_topology_with_cache(client, base_url, auth_headers).await?;
         Ok(topology)
     }
 
@@ -123,7 +124,10 @@ impl super::core::AsyncTensorRedistributor {
         if !response.status().is_success() {
             return Err(RedistributorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("model.safetensors.index.json not found (status: {})", response.status()),
+                format!(
+                    "model.safetensors.index.json not found (status: {})",
+                    response.status()
+                ),
             )));
         }
 
@@ -169,7 +173,8 @@ impl super::core::AsyncTensorRedistributor {
 
         trace!("Fetching model metadata from: {}", model_url);
 
-        let metadata = Self::fetch_remote_safetensors_metadata(client, &model_url, auth_headers).await?;
+        let metadata =
+            Self::fetch_remote_safetensors_metadata(client, &model_url, auth_headers).await?;
 
         // Create shared tensors
         let mut tensors = BTreeMap::new();
@@ -206,7 +211,10 @@ impl super::core::AsyncTensorRedistributor {
         if !response.status().is_success() {
             return Err(RedistributorError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to fetch metadata header (status: {})", response.status()),
+                format!(
+                    "Failed to fetch metadata header (status: {})",
+                    response.status()
+                ),
             )));
         }
 
@@ -226,7 +234,7 @@ impl super::core::AsyncTensorRedistributor {
 
         let header_size = u64::from_le_bytes([
             header_bytes[0],
-            header_bytes[1], 
+            header_bytes[1],
             header_bytes[2],
             header_bytes[3],
             header_bytes[4],
@@ -267,4 +275,4 @@ impl super::core::AsyncTensorRedistributor {
         let metadata: Metadata = serde_json::from_slice(&metadata_bytes)?;
         Ok(metadata)
     }
-} 
+}

@@ -179,10 +179,10 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
     println!("Reading model from remote URL: {}", input_url);
 
     let base_url = input_url.clone();
-    
+
     // For now, use empty auth headers. In the future, this could be configurable
     let auth_headers = HeaderMap::new();
-    
+
     // Create a single HTTP client for connection pooling with aggressive connection reuse
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
@@ -214,9 +214,14 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
     );
 
     // Create and run the async redistributor from URL - pass the same client for connection reuse
-    let mut redistributor =
-        AsyncTensorRedistributor::from_url_with_client(client, base_url, auth_headers, output_dir, target_topology)
-            .await?;
+    let mut redistributor = AsyncTensorRedistributor::from_url_with_client(
+        client,
+        base_url,
+        auth_headers,
+        output_dir,
+        target_topology,
+    )
+    .await?;
     println!("Initiated");
 
     let _created_files = redistributor.redistribute().await?;
@@ -227,7 +232,7 @@ async fn redistribute_model_from_url<P: AsRef<Path>>(
 async fn main() -> Result<()> {
     // Initialize env_logger to see reqwest debug logs
     env_logger::init();
-    
+
     let args = Args::parse();
 
     // Validate that exactly one input source is provided

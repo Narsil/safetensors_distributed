@@ -15,19 +15,19 @@ impl TensorData {
     pub fn new(dtype: Dtype, shape: Vec<usize>, data: Vec<u8>) -> Self {
         Self { dtype, shape, data }
     }
-    
+
     /// Create an empty TensorData with zeros
     pub fn zeros(dtype: Dtype, shape: Vec<usize>) -> Self {
         let total_elements: usize = shape.iter().product();
         let data = vec![0u8; total_elements * dtype.size()];
         Self { dtype, shape, data }
     }
-    
+
     /// Get the number of elements in this tensor
     pub fn len(&self) -> usize {
         self.shape.iter().product()
     }
-    
+
     /// Check if the tensor is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -38,15 +38,15 @@ impl View for TensorData {
     fn data(&self) -> Cow<[u8]> {
         Cow::Borrowed(&self.data)
     }
-    
+
     fn dtype(&self) -> Dtype {
         self.dtype
     }
-    
+
     fn shape(&self) -> &[usize] {
         &self.shape
     }
-    
+
     fn data_len(&self) -> usize {
         self.data.len()
     }
@@ -60,4 +60,4 @@ impl<'a> From<safetensors::tensor::TensorView<'a>> for TensorData {
             data: tensor_view.data().to_vec(),
         }
     }
-} 
+}

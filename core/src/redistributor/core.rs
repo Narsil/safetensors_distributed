@@ -1,7 +1,7 @@
-use super::{Result, RedistributorError, Layout, intersection, RedistributionStrategy};
-use super::location::{Source, Target, SourceLocation, WriteLocation};
-use super::task::{Task, TaskSource, ReadSerialTask, WriteOperation};
-use crate::topology::{Topology, Tensor, get_intervals};
+use super::location::{Source, SourceLocation, Target, WriteLocation};
+use super::task::{ReadSerialTask, Task, TaskSource, WriteOperation};
+use super::{Layout, RedistributionStrategy, RedistributorError, Result, intersection};
+use crate::topology::{Tensor, Topology, get_intervals};
 // use futures::future::join_all; // Unused
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
@@ -12,8 +12,8 @@ use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{Sender, channel};
 use url::Url;
 
 pub struct AsyncTensorRedistributor {
@@ -245,73 +245,37 @@ impl AsyncTensorRedistributor {
         let handle = tokio::spawn(async move {
             match strategy {
                 RedistributionStrategy::ReadUnorderedWriteSerial => {
-                    // Execute write tasks serially for best write locality
-                    let mut all_write_tasks = Vec::new();
-                    
-                    // Collect all write tasks first
-                    loop {
-                        let mut batch = Vec::with_capacity(1024);
-                        let received = rx.recv_many(&mut batch, 1024).await;
-                        if received == 0 {
-                            break;
-                        }
-                        
-                        for task in batch {
-                            if let Task::Write(write_task) = task {
-                                all_write_tasks.push(write_task);
-                            } else {
-                                error!("ReadUnorderedWriteSerial strategy received unexpected ReadSerial task");
+                    // Execute write tasks as they come in
+                    while let Some(task) = rx.recv().await {
+                        if let Task::Write(write_task) = task {
+                            let length = (write_task.target_end - write_task.target_start) as usize;
+                            if let Err(e) = write_task.run().await {
+                                error!("Write task failed: {}", e);
                             }
+                            p.inc(length as u64);
+                        } else {
+                            error!("ReadUnorderedWriteSerial strategy received unexpected ReadSerial task");
                         }
-                    }
-                    
-                    // Sort for sequential writing
-                    all_write_tasks.sort_by_key(|task| (task.target_file_index, task.target_start));
-                    
-                    // Execute serially
-                    for task in all_write_tasks {
-                        let length = (task.target_end - task.target_start) as usize;
-                        if let Err(e) = task.run().await {
-                            error!("Write task failed: {}", e);
-                        }
-                        p.inc(length as u64);
                     }
                 }
-                
+
                 RedistributionStrategy::ReadSerialWriteUnordered => {
-                    // Execute read tasks serially, allowing concurrent writes within each read
-                    let mut all_read_tasks = Vec::new();
-                    
-                    // Collect all read tasks first
-                    loop {
-                        let mut batch = Vec::with_capacity(1024);
-                        let received = rx.recv_many(&mut batch, 1024).await;
-                        if received == 0 {
-                            break;
-                        }
-                        
-                        for task in batch {
-                            if let Task::ReadSerial(read_task) = task {
-                                all_read_tasks.push(read_task);
-                            } else {
-                                error!("ReadSerialWriteUnordered strategy received unexpected Write task");
+                    // Execute read tasks as they come in
+                    while let Some(task) = rx.recv().await {
+                        if let Task::ReadSerial(read_task) = task {
+                            let total_writes_length: u64 = read_task
+                                .writes
+                                .iter()
+                                .map(|w| w.target_end - w.target_start)
+                                .sum();
+
+                            if let Err(e) = read_task.run().await {
+                                error!("Read task failed: {}", e);
                             }
+                            p.inc(total_writes_length);
+                        } else {
+                            error!("ReadSerialWriteUnordered strategy received unexpected Write task");
                         }
-                    }
-                    
-                    // Sort by source file, then by source offset for read locality
-                    all_read_tasks.sort_by_key(|task| (task.source_file_index, task.source_start));
-                    
-                    // Execute reads serially (each read may trigger multiple concurrent writes)
-                    for task in all_read_tasks {
-                        let total_writes_length: u64 = task.writes.iter()
-                            .map(|w| w.target_end - w.target_start)
-                            .sum();
-                        
-                        if let Err(e) = task.run().await {
-                            error!("Read task failed: {}", e);
-                        }
-                        p.inc(total_writes_length);
                     }
                 }
             }
@@ -358,8 +322,6 @@ impl AsyncTensorRedistributor {
         self.strategy = strategy;
         self
     }
-
-
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
     fn pre_calculate_metadatas(topology: &Topology) -> Result<Vec<(usize, Metadata)>> {
@@ -427,12 +389,8 @@ impl AsyncTensorRedistributor {
 
     async fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
         match self.strategy {
-            RedistributionStrategy::ReadUnorderedWriteSerial => {
-                self.create_write_tasks(tx).await
-            }
-            RedistributionStrategy::ReadSerialWriteUnordered => {
-                self.create_read_tasks(tx).await
-            }
+            RedistributionStrategy::ReadUnorderedWriteSerial => self.create_write_tasks(tx).await,
+            RedistributionStrategy::ReadSerialWriteUnordered => self.create_read_tasks(tx).await,
         }
     }
 
@@ -857,9 +815,7 @@ impl AsyncTensorRedistributor {
 
             trace!(
                 "    Read task created: 1 source read, {} target writes, reading {}->{}",
-                write_count,
-                source_start,
-                source_end
+                write_count, source_start, source_end
             );
 
             let read_task = ReadSerialTask {
@@ -1163,7 +1119,7 @@ impl AsyncTensorRedistributor {
             }
         }
 
-                Ok(())
+        Ok(())
     }
 
     // Symmetric collect_writes_* methods for ReadSerial tasks
@@ -1295,7 +1251,8 @@ impl AsyncTensorRedistributor {
                 let target_start_bytes = target_offset_elements * dtype_size;
                 let length_bytes = (end_elem - start_elem) * dtype_size;
 
-                let target_start = (target_header_size + target_data_offset + target_start_bytes) as u64;
+                let target_start =
+                    (target_header_size + target_data_offset + target_start_bytes) as u64;
                 let target_end = target_start + length_bytes as u64;
 
                 writes.push(WriteOperation {
@@ -1326,8 +1283,8 @@ impl AsyncTensorRedistributor {
         let tensor_size = source_info.shape().iter().product::<usize>() * dtype_size;
 
         // Find all target files that contain this tensor
-        for (target_file_index, (target_header_size, target_metadata)) in 
-            self.target.layout.metadatas.iter().enumerate() 
+        for (target_file_index, (target_header_size, target_metadata)) in
+            self.target.layout.metadatas.iter().enumerate()
         {
             let target_tensors = target_metadata.tensors();
             if let Some(target_tensor_info) = target_tensors.get(tensor_name) {
@@ -1386,8 +1343,8 @@ impl AsyncTensorRedistributor {
         let source_intervals = get_intervals(source_chunk, &full_strides, full_shape);
 
         // Find all target files that contain this tensor (they should all get the same data)
-        for (target_file_index, (target_header_size, target_metadata)) in 
-            self.target.layout.metadatas.iter().enumerate() 
+        for (target_file_index, (target_header_size, target_metadata)) in
+            self.target.layout.metadatas.iter().enumerate()
         {
             let target_tensors = target_metadata.tensors();
             if let Some(target_tensor_info) = target_tensors.get(tensor_name) {
@@ -1403,7 +1360,8 @@ impl AsyncTensorRedistributor {
                     let target_start_bytes = start_elem * dtype_size;
                     let length_bytes = (end_elem - start_elem) * dtype_size;
 
-                    let target_start = (target_header_size + target_data_offset + target_start_bytes) as u64;
+                    let target_start =
+                        (target_header_size + target_data_offset + target_start_bytes) as u64;
                     let target_end = target_start + length_bytes as u64;
 
                     writes.push(WriteOperation {
@@ -1421,7 +1379,7 @@ impl AsyncTensorRedistributor {
 
         Ok(())
     }
-} 
+}
 
 #[cfg(test)]
 mod tests {
@@ -1672,10 +1630,11 @@ mod tests {
     }
 
     // Helper function to set up common test data and topologies
-    async fn setup_roundtrip_test_data() -> (TempDir, String, Topology, Topology, Vec<f32>, Vec<f32>) {
-        use tempfile::TempDir;
+    async fn setup_roundtrip_test_data() -> (TempDir, String, Topology, Topology, Vec<f32>, Vec<f32>)
+    {
         use std::collections::BTreeMap;
-        
+        use tempfile::TempDir;
+
         // Create temp directory for source data
         let source_dir = TempDir::new().unwrap();
 
@@ -1758,7 +1717,14 @@ mod tests {
         let final_topology =
             Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
 
-        (source_dir, original_hash, distributed_topology, final_topology, tensor1_data, tensor2_data)
+        (
+            source_dir,
+            original_hash,
+            distributed_topology,
+            final_topology,
+            tensor1_data,
+            tensor2_data,
+        )
     }
 
     // Helper function to run roundtrip test for a specific strategy
@@ -1773,9 +1739,9 @@ mod tests {
         tensor2_data: &[f32],
     ) {
         use tempfile::TempDir;
-        
+
         trace!("Testing strategy: {}", strategy_name);
-        
+
         // Create separate temp directories for this strategy
         let distributed_dir = TempDir::new().unwrap();
         let final_dir = TempDir::new().unwrap();
@@ -1789,18 +1755,32 @@ mod tests {
         .unwrap()
         .with_strategy(strategy.clone());
 
-        let created_files = redistributor1.redistribute().await
-            .expect(&format!("Strategy {} failed on distribute step", strategy_name));
-        
-        trace!("Strategy {}: Created distributed files: {:?}", strategy_name, created_files);
+        let created_files = redistributor1.redistribute().await.expect(&format!(
+            "Strategy {} failed on distribute step",
+            strategy_name
+        ));
+
+        trace!(
+            "Strategy {}: Created distributed files: {:?}",
+            strategy_name, created_files
+        );
 
         // Verify distributed files exist
-        assert!(distributed_dir.path().join("rank0.safetensors").exists(),
-            "Strategy {}: rank0.safetensors missing", strategy_name);
-        assert!(distributed_dir.path().join("rank1.safetensors").exists(), 
-            "Strategy {}: rank1.safetensors missing", strategy_name);
-        assert!(distributed_dir.path().join("topology.json").exists(),
-            "Strategy {}: topology.json missing", strategy_name);
+        assert!(
+            distributed_dir.path().join("rank0.safetensors").exists(),
+            "Strategy {}: rank0.safetensors missing",
+            strategy_name
+        );
+        assert!(
+            distributed_dir.path().join("rank1.safetensors").exists(),
+            "Strategy {}: rank1.safetensors missing",
+            strategy_name
+        );
+        assert!(
+            distributed_dir.path().join("topology.json").exists(),
+            "Strategy {}: topology.json missing",
+            strategy_name
+        );
 
         // Step B: Redistribute from 2 ranks back to single file using same strategy
         let mut redistributor2 = AsyncTensorRedistributor::from_local(
@@ -1811,24 +1791,36 @@ mod tests {
         .unwrap()
         .with_strategy(strategy);
 
-        let final_files = redistributor2.redistribute().await
-            .expect(&format!("Strategy {} failed on reconstruct step", strategy_name));
-        
-        trace!("Strategy {}: Created final files: {:?}", strategy_name, final_files);
+        let final_files = redistributor2.redistribute().await.expect(&format!(
+            "Strategy {} failed on reconstruct step",
+            strategy_name
+        ));
+
+        trace!(
+            "Strategy {}: Created final files: {:?}",
+            strategy_name, final_files
+        );
 
         // Verify final file exists
         let final_path = final_dir.path().join("model.safetensors");
-        assert!(final_path.exists(),
-            "Strategy {}: final model.safetensors missing", strategy_name);
+        assert!(
+            final_path.exists(),
+            "Strategy {}: final model.safetensors missing",
+            strategy_name
+        );
 
         // Step C: Calculate hash of final file and compare
         let final_hash = calculate_file_hash(&final_path).await;
-        trace!("Strategy {}: Original hash: {}, Final hash: {}", strategy_name, original_hash, final_hash);
+        trace!(
+            "Strategy {}: Original hash: {}, Final hash: {}",
+            strategy_name, original_hash, final_hash
+        );
 
         // The files should be identical regardless of strategy
         assert_eq!(
             original_hash, final_hash,
-            "Strategy {}: Round-trip redistribution should preserve file integrity", strategy_name
+            "Strategy {}: Round-trip redistribution should preserve file integrity",
+            strategy_name
         );
 
         // Step D: Additional verification - load and compare tensor data
@@ -1837,43 +1829,69 @@ mod tests {
 
         // Verify tensor1
         let final_tensor1 = final_safetensors.tensor("tensor1").unwrap();
-        assert_eq!(final_tensor1.shape(), vec![8, 4], 
-            "Strategy {}: tensor1 shape mismatch", strategy_name);
-        assert_eq!(final_tensor1.dtype(), Dtype::F32,
-            "Strategy {}: tensor1 dtype mismatch", strategy_name);
+        assert_eq!(
+            final_tensor1.shape(),
+            vec![8, 4],
+            "Strategy {}: tensor1 shape mismatch",
+            strategy_name
+        );
+        assert_eq!(
+            final_tensor1.dtype(),
+            Dtype::F32,
+            "Strategy {}: tensor1 dtype mismatch",
+            strategy_name
+        );
         let final_tensor1_data: &[f32] = unsafe {
             std::slice::from_raw_parts(
                 final_tensor1.data().as_ptr() as *const f32,
                 final_tensor1.data().len() / 4,
             )
         };
-        assert_eq!(final_tensor1_data, tensor1_data,
-            "Strategy {}: tensor1 data mismatch", strategy_name);
+        assert_eq!(
+            final_tensor1_data, tensor1_data,
+            "Strategy {}: tensor1 data mismatch",
+            strategy_name
+        );
 
         // Verify tensor2
         let final_tensor2 = final_safetensors.tensor("tensor2").unwrap();
-        assert_eq!(final_tensor2.shape(), vec![4, 8],
-            "Strategy {}: tensor2 shape mismatch", strategy_name);
-        assert_eq!(final_tensor2.dtype(), Dtype::F32,
-            "Strategy {}: tensor2 dtype mismatch", strategy_name);
+        assert_eq!(
+            final_tensor2.shape(),
+            vec![4, 8],
+            "Strategy {}: tensor2 shape mismatch",
+            strategy_name
+        );
+        assert_eq!(
+            final_tensor2.dtype(),
+            Dtype::F32,
+            "Strategy {}: tensor2 dtype mismatch",
+            strategy_name
+        );
         let final_tensor2_data: &[f32] = unsafe {
             std::slice::from_raw_parts(
                 final_tensor2.data().as_ptr() as *const f32,
                 final_tensor2.data().len() / 4,
             )
         };
-        assert_eq!(final_tensor2_data, tensor2_data,
-            "Strategy {}: tensor2 data mismatch", strategy_name);
+        assert_eq!(
+            final_tensor2_data, tensor2_data,
+            "Strategy {}: tensor2 data mismatch",
+            strategy_name
+        );
 
         trace!("✅ Strategy {} round-trip test passed!", strategy_name);
     }
 
-
-
     #[tokio::test]
     async fn test_redistribution_read_serial_write_unordered_strategy_roundtrip() {
-        let (source_dir, original_hash, distributed_topology, final_topology, tensor1_data, tensor2_data) = 
-            setup_roundtrip_test_data().await;
+        let (
+            source_dir,
+            original_hash,
+            distributed_topology,
+            final_topology,
+            tensor1_data,
+            tensor2_data,
+        ) = setup_roundtrip_test_data().await;
 
         run_strategy_roundtrip_test(
             RedistributionStrategy::ReadSerialWriteUnordered,
@@ -1884,13 +1902,20 @@ mod tests {
             &final_topology,
             &tensor1_data,
             &tensor2_data,
-        ).await;
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_redistribution_read_unordered_write_serial_strategy_roundtrip() {
-        let (source_dir, original_hash, distributed_topology, final_topology, tensor1_data, tensor2_data) = 
-            setup_roundtrip_test_data().await;
+        let (
+            source_dir,
+            original_hash,
+            distributed_topology,
+            final_topology,
+            tensor1_data,
+            tensor2_data,
+        ) = setup_roundtrip_test_data().await;
 
         run_strategy_roundtrip_test(
             RedistributionStrategy::ReadUnorderedWriteSerial,
@@ -1901,10 +1926,9 @@ mod tests {
             &final_topology,
             &tensor1_data,
             &tensor2_data,
-        ).await;
+        )
+        .await;
     }
-
-
 
     #[test]
     fn test_intersection_function() {
@@ -2018,4 +2042,4 @@ mod tests {
         let result = intersection(&source_intervals, &target_intervals);
         assert_eq!(result, expected);
     }
-} 
+}

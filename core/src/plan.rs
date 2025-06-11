@@ -2,9 +2,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use safetensors::tensor::Metadata;
 use safetensors::{Dtype, slice::TensorIndexer};
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::Bound;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::loader::{Error, Loader};

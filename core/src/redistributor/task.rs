@@ -1,15 +1,15 @@
-use super::{Result, RedistributorError};
 use super::location::SourceLocation;
+use super::{RedistributorError, Result};
+use futures_util::StreamExt;
+use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
+use reqwest::header::RANGE;
 use reqwest::{Client, header::HeaderMap};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use futures_util::StreamExt;
-use log::{error, trace};
-use url::Url;
-use reqwest::header::RANGE;
 use tokio::sync::Semaphore;
+use url::Url;
 
 /// Source data abstraction for tasks
 pub enum TaskSources {
@@ -221,7 +221,7 @@ impl TaskSource {
 pub enum Task {
     /// Write-focused task: multiple reads → single write (for ReadUnorderedWriteSerial)
     Write(MmapWriteTask),
-    /// Read-focused task: single read → multiple writes (for ReadSerialWriteUnordered) 
+    /// Read-focused task: single read → multiple writes (for ReadSerialWriteUnordered)
     ReadSerial(ReadSerialTask),
 }
 
@@ -269,10 +269,16 @@ pub struct MmapWriteTask {
 impl ReadSerialTask {
     pub async fn run(&self) -> Result<()> {
         let read_length = (self.source_end - self.source_start) as usize;
-        trace!("Reading {read_length} from source file {}", self.source_file_index);
+        trace!(
+            "Reading {read_length} from source file {}",
+            self.source_file_index
+        );
 
         // Read once from source - large sequential read
-        let source_data = self.source.read(0, self.source_start, self.source_end).await?;
+        let source_data = self
+            .source
+            .read(0, self.source_start, self.source_end)
+            .await?;
 
         trace!(
             "  Executing {} target writes from single read",
@@ -288,18 +294,26 @@ impl ReadSerialTask {
             // Execute all writes from the read data
             for (write_idx, write_op) in self.writes.iter().enumerate() {
                 let write_length = (write_op.target_end - write_op.target_start) as usize;
-                
+
                 trace!(
                     "    Write {}: {} bytes to target file {} offset {}→{}",
-                    write_idx, write_length, write_op.target_file_index, 
-                    write_op.target_start, write_op.target_end
+                    write_idx,
+                    write_length,
+                    write_op.target_file_index,
+                    write_op.target_start,
+                    write_op.target_end
                 );
 
                 // Get write data from read buffer
-                let write_data = &source_data[write_op.read_offset..write_op.read_offset + write_length];
+                let write_data =
+                    &source_data[write_op.read_offset..write_op.read_offset + write_length];
 
                 // Write to target at specified position
-                let target_ptr = write_op.target_mmap.as_ptr().add(write_op.target_start as usize) as *mut u8;
+                let target_ptr = write_op
+                    .target_mmap
+                    .as_ptr()
+                    .add(write_op.target_start as usize)
+                    as *mut u8;
                 let target_slice = std::slice::from_raw_parts_mut(target_ptr, write_length);
                 target_slice.copy_from_slice(write_data);
 
@@ -391,4 +405,4 @@ impl MmapWriteTask {
 
         Ok(())
     }
-} 
+}

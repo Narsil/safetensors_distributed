@@ -266,4 +266,3 @@ pub fn intersection(
 
     result
 }
-

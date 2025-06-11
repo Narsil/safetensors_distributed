@@ -1,7 +1,8 @@
-use super::{Result, RedistributorError, Layout};
-use super::task::{TaskSources, MmapWriteTask};
+use super::task::{MmapWriteTask, TaskSources};
+use super::{Layout, RedistributorError, Result};
 use crate::topology::Topology;
 use futures::future::join_all;
+use log::trace;
 use memmap2::{Mmap, MmapMut};
 use reqwest::{Client, header::HeaderMap};
 use std::path::PathBuf;
@@ -11,7 +12,6 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use url::Url;
-use log::trace;
 
 pub enum SourceLocation {
     Local {
@@ -170,14 +170,12 @@ impl WriteLocation {
                 .open(self.dir.join(filename))?;
 
             let mmap = unsafe {
-                MmapOptions::new()
-                    .map_mut(&file)
-                    .map_err(|e| {
-                        RedistributorError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to create memory map for {}: {}", filename, e),
-                        ))
-                    })?
+                MmapOptions::new().map_mut(&file).map_err(|e| {
+                    RedistributorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create memory map for {}: {}", filename, e),
+                    ))
+                })?
             };
 
             target_mmaps.push(Arc::new(mmap));
@@ -196,4 +194,4 @@ pub struct Source {
 pub struct Target {
     pub layout: Layout,
     pub location: WriteLocation,
-} 
+}
