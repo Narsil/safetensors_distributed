@@ -948,7 +948,6 @@ fn compute_byte_ranges_from_intersection(
     dtype_size: usize,
     strides: &[usize],
 ) -> Vec<(u64, u64, u64)> {
-    let ndim = intersect_start.len();
     let mut ranges = Vec::new();
 
     // Calculate total intersection volume
@@ -996,7 +995,6 @@ fn compute_write_ranges_from_intersection(
     dtype_size: usize,
     strides: &[usize],
 ) -> Vec<WriteRange> {
-    let ndim = intersect_start.len();
     let mut ranges = Vec::new();
 
     // Calculate total intersection volume
@@ -1138,7 +1136,7 @@ fn generate_blocks_recursive(
         let block_length: usize = intersect_size[dim_idx..].iter().product();
 
         // Calculate current coordinates
-        let mut coords = intersect_start.to_vec();
+        let coords = intersect_start;
 
         let source_offset = calculate_chunk_offset(&coords, source_chunk, strides);
         let target_offset = calculate_chunk_offset(&coords, target_chunk, strides);

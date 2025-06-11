@@ -2,13 +2,11 @@ use super::location::{Source, SourceLocation, Target, WriteLocation};
 use super::task::{ReadSerialTask, Task, TaskSource, WriteOperation};
 use super::{Layout, RedistributionStrategy, RedistributorError, Result, compute_shared_to_distributed_ranges, compute_distributed_to_shared_ranges, compute_write_ranges_direct, compute_distributed_to_shared_write_ranges, compute_shared_to_distributed_write_ranges};
 use crate::topology::{Tensor, Topology};
-// use futures::future::join_all; // Unused
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
 use memmap2::Mmap;
 use reqwest::{Client, header::HeaderMap};
 use safetensors::tensor::{Metadata, TensorInfo};
-// use std::collections::HashMap; // Unused
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -869,7 +867,6 @@ impl AsyncTensorRedistributor {
 
         // Process each source chunk to see if it overlaps with our target
         for source_chunk in source_info.chunks() {
-            let start = Instant::now();
             let source_file_index = source_chunk.filename_index();
 
             // Get source file metadata to calculate byte offsets

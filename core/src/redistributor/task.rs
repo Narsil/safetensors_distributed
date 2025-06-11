@@ -307,6 +307,7 @@ impl ReadSerialTask {
                 // Get write data from read buffer
                 let write_data =
                     &source_data[write_op.read_offset..write_op.read_offset + write_length];
+                
 
                 // Write to target at specified position
                 let target_ptr = write_op
