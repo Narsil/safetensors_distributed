@@ -108,7 +108,9 @@ impl Redistributor {
         let progress = ProgressBar::new(total);
         progress.set_style(
             ProgressStyle::default_bar()
-                .template("[{eta_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .template(
+                    "[{eta_precise}] {msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                )
                 .unwrap(),
         );
 
@@ -131,14 +133,15 @@ impl Redistributor {
 
         drop(tx);
         handle.await??;
+        progress.set_message("Done, kernel flush...");
 
-        progress.finish();
-        println!("Done write, waiting for the kernel to sync on device...");
-        // Force flush all memory-mapped target files and write topology
         self.target
             .location
             .save(&self.target.layout.topology)
             .await?;
+
+        progress.finish_with_message("Done");
+        // Force flush all memory-mapped target files and write topology
 
         // Collect created safetensors files
         let mut created_files = Vec::new();

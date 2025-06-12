@@ -23,30 +23,28 @@
         in
         with pkgs;
         {
-          default =
-            mkShell {
-              nativeBuildInputs = [ pkg-config ];
-              buildInputs = [
-                rustup
-                openssl
-                python3Packages.python
-                python3Packages.venvShellHook
-                cloc
-              ] ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [ cudaPackages.cudatoolkit ]);
-              venvDir = "./.venv";
-              postVenvCreation = ''
-                unset SOURCE_DATE_EPOCH
-              '';
-              postShellHook = ''
-                unset SOURCE_DATE_EPOCH
-              '';
-            }
-            // (pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-              LD_LIBRARY_PATH = "${stdenv.cc.cc.lib}/lib:${cudaPackages.cudatoolkit}/lib:/run/opengl-driver/lib";
-            })
-            // (pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-              LD_LIBRARY_PATH = "${stdenv.cc.cc.lib}/lib";
-            });
+          default = mkShell {
+            nativeBuildInputs = [ pkg-config ];
+            buildInputs = [
+              rustup
+              openssl
+              python3Packages.python
+              python3Packages.venvShellHook
+              cloc
+            ] ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [ cudaPackages.cudatoolkit ]);
+            venvDir = "./.venv";
+            postVenvCreation = ''
+              unset SOURCE_DATE_EPOCH
+            '';
+            postShellHook = ''
+              unset SOURCE_DATE_EPOCH
+            '';
+            LD_LIBRARY_PATH =
+              if stdenv.isDarwin then
+                "${stdenv.cc.cc.lib}/lib"
+              else
+                "${stdenv.cc.cc.lib}/lib:${cudaPackages.cudatoolkit}/lib:/run/opengl-driver/lib";
+          };
 
         }
       );
