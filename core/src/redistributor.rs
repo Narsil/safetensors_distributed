@@ -1628,13 +1628,11 @@ impl AsyncTensorRedistributor {
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
             &self.source.layout.metadatas[source_file_index];
-        let source_tensors = source_metadata.tensors();
-        let source_tensor_info =
-            source_tensors
-                .get(tensor_name)
-                .ok_or_else(|| RedistributorError::TensorNotFound {
-                    name: tensor_name.to_string(),
-                })?;
+        let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
+            RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            }
+        })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
         // For shared to shared, we just copy the entire tensor
@@ -1700,8 +1698,7 @@ impl AsyncTensorRedistributor {
                 // Get source file metadata to calculate byte offsets
                 let (source_header_size, source_metadata) =
                     &self.source.layout.metadatas[source_file_index];
-                let source_tensors = source_metadata.tensors();
-                let source_tensor_info = source_tensors.get(tensor_name).ok_or_else(|| {
+                let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
                     RedistributorError::TensorNotFound {
                         name: tensor_name.to_string(),
                     }
