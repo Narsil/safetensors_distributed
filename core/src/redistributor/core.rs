@@ -14,13 +14,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::{Sender, channel};
 
-pub struct AsyncTensorRedistributor {
+pub struct Redistributor {
     source: Source,
     target: Target,
-    // strategy: RedistributionStrategy,
 }
 
-impl AsyncTensorRedistributor {
+impl Redistributor {
     /// Create a new redistributor for reconstruction from local distributed files
     pub fn from_local<P: AsRef<Path>>(
         source_dir: P,
@@ -1409,7 +1408,7 @@ mod tests {
         .unwrap();
 
         // Step 3: Redistribute from single file to 2 ranks
-        let mut redistributor1 = AsyncTensorRedistributor::from_local(
+        let mut redistributor1 = Redistributor::from_local(
             source_dir.path(),
             distributed_dir.path(),
             distributed_topology,
@@ -1439,12 +1438,9 @@ mod tests {
             Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
 
         // Step 5: Redistribute from 2 ranks back to single file
-        let mut redistributor2 = AsyncTensorRedistributor::from_local(
-            distributed_dir.path(),
-            final_dir.path(),
-            final_topology,
-        )
-        .unwrap();
+        let mut redistributor2 =
+            Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
+                .unwrap();
 
         let final_files = redistributor2.redistribute().await.unwrap();
         trace!("Created final files: {:?}", final_files);

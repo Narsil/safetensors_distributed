@@ -1,5 +1,4 @@
 pub mod core;
-pub mod loader;
 pub mod location;
 pub mod task;
 
@@ -13,7 +12,7 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 // Re-export main types
-pub use core::AsyncTensorRedistributor;
+pub use core::Redistributor;
 
 /// Structure for deserializing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
