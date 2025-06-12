@@ -1,4 +1,4 @@
-use super::task::{MmapWriteTask, TaskSources};
+use super::task::{Task, TaskSources};
 use super::{Layout, RedistributorError, Result};
 use crate::topology::Topology;
 use futures::future::join_all;
@@ -92,9 +92,9 @@ impl WriteLocation {
         source: TaskSources,
         source_ranges: Vec<(u64, u64, u64)>,
         ranges_per_file: Vec<usize>,
-    ) -> Option<MmapWriteTask> {
+    ) -> Option<Task> {
         if let Some(ref target_mmaps) = self.mmaps {
-            Some(MmapWriteTask {
+            Some(Task {
                 target_mmap: Arc::clone(&target_mmaps[target_file_index]),
                 target_start,
                 target_end,

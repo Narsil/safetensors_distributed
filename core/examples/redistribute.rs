@@ -1,12 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use reqwest::Client;
-use reqwest::header::HeaderMap;
 use safetensors_distributed::redistributor::{AsyncTensorRedistributor, load_or_create_topology};
 use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
 use url::Url;
 
 #[derive(Parser)]
@@ -168,65 +165,65 @@ async fn redistribute_model_from_local<P: AsRef<Path>>(
     Ok(())
 }
 
-/// Main redistribution function for remote input using async parallel approach
-async fn redistribute_model_from_url<P: AsRef<Path>>(
-    input_url: &Url,
-    output_dir: P,
-    target_world_size: usize,
-) -> Result<()> {
-    let output_dir = output_dir.as_ref();
-
-    println!("Reading model from remote URL: {}", input_url);
-
-    let base_url = input_url.clone();
-
-    // For now, use empty auth headers. In the future, this could be configurable
-    let auth_headers = HeaderMap::new();
-
-    // Create a single HTTP client for connection pooling with aggressive connection reuse
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(30))
-        .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive much longer (5 minutes)
-        .pool_max_idle_per_host(8) // Fewer connections but longer lived
-        .http2_keep_alive_interval(Duration::from_secs(10)) // More frequent HTTP/2 keep-alive
-        .http2_keep_alive_timeout(Duration::from_secs(30)) // Longer HTTP/2 keep-alive timeout
-        .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
-        .tcp_keepalive(Duration::from_secs(30)) // More frequent TCP-level keep-alive
-        .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
-        .build()
-        .expect("Failed to create HTTP client");
-
-    // Load the source topology from the remote URL first
-    println!("Loading remote topology...");
-    let source_topology =
-        AsyncTensorRedistributor::load_or_create_remote_topology(&client, &base_url, &auth_headers)
-            .await?;
-
-    let source_ranks = source_topology.world_size();
-    println!("Source topology has {} ranks", source_ranks);
-
-    // Create target topology from the source topology (same logic as local)
-    let target_topology = create_target_topology(&source_topology, target_world_size)?;
-    println!(
-        "Target topology will have {} ranks",
-        target_topology.world_size()
-    );
-
-    // Create and run the async redistributor from URL - pass the same client for connection reuse
-    let mut redistributor = AsyncTensorRedistributor::from_url_with_client(
-        client,
-        base_url,
-        auth_headers,
-        output_dir,
-        target_topology,
-    )
-    .await?;
-    println!("Initiated");
-
-    let _created_files = redistributor.redistribute().await?;
-    Ok(())
-}
+// /// Main redistribution function for remote input using async parallel approach
+// async fn redistribute_model_from_url<P: AsRef<Path>>(
+//     input_url: &Url,
+//     output_dir: P,
+//     target_world_size: usize,
+// ) -> Result<()> {
+//     let output_dir = output_dir.as_ref();
+//
+//     println!("Reading model from remote URL: {}", input_url);
+//
+//     let base_url = input_url.clone();
+//
+//     // For now, use empty auth headers. In the future, this could be configurable
+//     let auth_headers = HeaderMap::new();
+//
+//     // Create a single HTTP client for connection pooling with aggressive connection reuse
+//     let client = Client::builder()
+//         .timeout(Duration::from_secs(120))
+//         .connect_timeout(Duration::from_secs(30))
+//         .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive much longer (5 minutes)
+//         .pool_max_idle_per_host(8) // Fewer connections but longer lived
+//         .http2_keep_alive_interval(Duration::from_secs(10)) // More frequent HTTP/2 keep-alive
+//         .http2_keep_alive_timeout(Duration::from_secs(30)) // Longer HTTP/2 keep-alive timeout
+//         .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
+//         .tcp_keepalive(Duration::from_secs(30)) // More frequent TCP-level keep-alive
+//         .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
+//         .build()
+//         .expect("Failed to create HTTP client");
+//
+//     // Load the source topology from the remote URL first
+//     println!("Loading remote topology...");
+//     let source_topology =
+//         AsyncTensorRedistributor::load_or_create_remote_topology(&client, &base_url, &auth_headers)
+//             .await?;
+//
+//     let source_ranks = source_topology.world_size();
+//     println!("Source topology has {} ranks", source_ranks);
+//
+//     // Create target topology from the source topology (same logic as local)
+//     let target_topology = create_target_topology(&source_topology, target_world_size)?;
+//     println!(
+//         "Target topology will have {} ranks",
+//         target_topology.world_size()
+//     );
+//
+//     // Create and run the async redistributor from URL - pass the same client for connection reuse
+//     let mut redistributor = AsyncTensorRedistributor::from_url_with_client(
+//         client,
+//         base_url,
+//         auth_headers,
+//         output_dir,
+//         target_topology,
+//     )
+//     .await?;
+//     println!("Initiated");
+//
+//     let _created_files = redistributor.redistribute().await?;
+//     Ok(())
+// }
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -243,10 +240,10 @@ async fn main() -> Result<()> {
             redistribute_model_from_local(input_dir, &args.output_dir, args.target_world_size)
                 .await?;
         }
-        (None, Some(input_url)) => {
-            redistribute_model_from_url(input_url, &args.output_dir, args.target_world_size)
-                .await?;
-        }
+        // (None, Some(input_url)) => {
+        //     redistribute_model_from_url(input_url, &args.output_dir, args.target_world_size)
+        //         .await?;
+        // }
         _ => unreachable!("Validation should have caught this case"),
     }
 

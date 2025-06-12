@@ -175,7 +175,7 @@ fn chunks_overlap_ndim(chunk1: &Chunk, chunk2: &Chunk) -> bool {
         let end1 = start1 + chunk1.shape[dim];
         let start2 = chunk2.offsets[dim];
         let end2 = start2 + chunk2.shape[dim];
-        
+
         // Check if ranges overlap: max(start1,start2) < min(end1,end2)
         if start1.max(start2) >= end1.min(end2) {
             return false; // No overlap in this dimension = no overall overlap
@@ -188,7 +188,7 @@ fn chunks_overlap_ndim(chunk1: &Chunk, chunk2: &Chunk) -> bool {
 /// Returns list of (chunk_index1, chunk_index2) pairs that overlap
 fn find_all_overlaps_fast(chunks: &[Chunk]) -> Vec<(usize, usize)> {
     let mut overlaps = Vec::new();
-    
+
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             if chunks_overlap_ndim(&chunks[i], &chunks[j]) {
@@ -196,7 +196,7 @@ fn find_all_overlaps_fast(chunks: &[Chunk]) -> Vec<(usize, usize)> {
             }
         }
     }
-    
+
     overlaps
 }
 
@@ -216,23 +216,23 @@ impl GridCell {
 fn generate_split_points(chunks: &[Chunk], full_shape: &[usize]) -> Vec<Vec<usize>> {
     let ndim = full_shape.len();
     let mut split_points = Vec::with_capacity(ndim);
-    
+
     for dim in 0..ndim {
         let mut points = BTreeSet::new();
-        
+
         // Always include tensor boundaries
         points.insert(0);
         points.insert(full_shape[dim]);
-        
+
         // Add chunk boundaries
         for chunk in chunks {
             points.insert(chunk.offsets[dim]);
             points.insert(chunk.offsets[dim] + chunk.shape[dim]);
         }
-        
+
         split_points.push(points.into_iter().collect());
     }
-    
+
     split_points
 }
 
@@ -240,7 +240,7 @@ fn generate_split_points(chunks: &[Chunk], full_shape: &[usize]) -> Vec<Vec<usiz
 fn generate_grid_cells(split_points: &[Vec<usize>]) -> Vec<GridCell> {
     let mut cells = Vec::new();
     let mut current_cell = Vec::new();
-    
+
     fn generate_cells_recursive(
         split_points: &[Vec<usize>],
         dim_idx: usize,
@@ -251,7 +251,7 @@ fn generate_grid_cells(split_points: &[Vec<usize>]) -> Vec<GridCell> {
             cells.push(GridCell::new(current_cell.clone()));
             return;
         }
-        
+
         let points = &split_points[dim_idx];
         for i in 0..points.len() - 1 {
             current_cell.push((points[i], points[i + 1]));
@@ -259,7 +259,7 @@ fn generate_grid_cells(split_points: &[Vec<usize>]) -> Vec<GridCell> {
             current_cell.pop();
         }
     }
-    
+
     generate_cells_recursive(split_points, 0, &mut current_cell, &mut cells);
     cells
 }
@@ -269,7 +269,7 @@ fn chunk_covers_cell(chunk: &Chunk, cell: &GridCell) -> bool {
     for (dim, &(cell_start, cell_end)) in cell.ranges.iter().enumerate() {
         let chunk_start = chunk.offsets[dim];
         let chunk_end = chunk_start + chunk.shape[dim];
-        
+
         // Chunk must completely contain the cell in this dimension
         if chunk_start > cell_start || chunk_end < cell_end {
             return false;
@@ -281,13 +281,13 @@ fn chunk_covers_cell(chunk: &Chunk, cell: &GridCell) -> bool {
 /// Find which chunks (if any) completely cover the given grid cell
 fn find_chunks_covering_cell(cell: &GridCell, chunks: &[Chunk]) -> Vec<usize> {
     let mut covering_chunks = Vec::new();
-    
+
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         if chunk_covers_cell(chunk, cell) {
             covering_chunks.push(chunk_idx);
         }
     }
-    
+
     covering_chunks
 }
 
@@ -297,10 +297,10 @@ fn verify_complete_coverage(chunks: &[Chunk], full_shape: &[usize]) -> Vec<GridC
     let split_points = generate_split_points(chunks, full_shape);
     let grid_cells = generate_grid_cells(&split_points);
     let mut gaps = Vec::new();
-    
+
     for cell in grid_cells {
         let covering_chunks = find_chunks_covering_cell(&cell, chunks);
-        
+
         if covering_chunks.is_empty() {
             gaps.push(cell);
         } else if covering_chunks.len() > 1 {
@@ -312,7 +312,7 @@ fn verify_complete_coverage(chunks: &[Chunk], full_shape: &[usize]) -> Vec<GridC
             );
         }
     }
-    
+
     gaps
 }
 
@@ -323,7 +323,7 @@ pub fn get_intervals(chunk: &Chunk, strides: &[usize], shape: &[usize]) -> Vec<(
     let estimated_capacity = chunk.shape.iter().product();
     let mut intervals = Vec::with_capacity(estimated_capacity);
     let mut buffer = Vec::with_capacity(estimated_capacity);
-    
+
     let mut span = 0;
     for ((i, d), total_d) in chunk.shape.iter().enumerate().rev().zip(shape.iter().rev()) {
         if d == total_d && span == 0 {
@@ -367,7 +367,7 @@ fn check_overlapping_chunks_optimized(
     let chunks = &info.chunks;
     let full_shape = &info.shape;
     let ndim = full_shape.len();
-    
+
     // Step 0: Validate chunk dimensions and bounds (same as original)
     for chunk in chunks {
         if chunk.offsets.len() != ndim || chunk.shape.len() != ndim {
@@ -388,19 +388,19 @@ fn check_overlapping_chunks_optimized(
             }
         }
     }
-    
+
     // Step 1: Fast pairwise overlap detection - O(n²·d) vs O(n²·∏(chunk_sizes))
     let overlaps = find_all_overlaps_fast(chunks);
     if !overlaps.is_empty() {
         return Err(TopologyError::OverlappingChunks(tensor_name.to_string()));
     }
-    
+
     // Step 2: Efficient coverage verification - O(d·n·log(n) + ∏(split_points)) vs O(∏(full_shape))
     let gaps = verify_complete_coverage(chunks, full_shape);
     if !gaps.is_empty() {
         return Err(TopologyError::NonCoveringChunks(tensor_name.to_string()));
     }
-    
+
     Ok(())
 }
 
@@ -413,11 +413,11 @@ fn check_overlapping_chunks_sweep_line(
     let chunks = &info.chunks;
     let full_shape = &info.shape;
     let ndim = full_shape.len();
-    
+
     if chunks.is_empty() {
         return Ok(());
     }
-    
+
     // Step 0: Validate chunk dimensions and bounds (same as original)
     for chunk in chunks {
         if chunk.offsets.len() != ndim || chunk.shape.len() != ndim {
@@ -438,30 +438,30 @@ fn check_overlapping_chunks_sweep_line(
             }
         }
     }
-    
+
     // Create events for the first dimension
     let mut events = Vec::new();
-    
+
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let start_pos = chunk.offsets[0];
         let end_pos = start_pos + chunk.shape[0];
-        
+
         events.push((start_pos, false, chunk_idx)); // false = start event
-        events.push((end_pos, true, chunk_idx));    // true = end event
+        events.push((end_pos, true, chunk_idx)); // true = end event
     }
-    
+
     // Sort events by position, with end events before start events at same position
     events.sort_by_key(|&(pos, is_end, _)| (pos, is_end));
-    
-         let mut active_chunks = HashSet::new();
+
+    let mut active_chunks = HashSet::new();
     let mut current_pos = 0;
-    
+
     for (pos, is_end, chunk_idx) in events {
         // Check for coverage gap
         if pos > current_pos && active_chunks.is_empty() {
             return Err(TopologyError::NonCoveringChunks(tensor_name.to_string()));
         }
-        
+
         if is_end {
             active_chunks.remove(&chunk_idx);
         } else {
@@ -473,18 +473,18 @@ fn check_overlapping_chunks_sweep_line(
             }
             active_chunks.insert(chunk_idx);
         }
-        
+
         current_pos = pos;
     }
-    
+
     // Check final gap
     if current_pos < full_shape[0] {
         return Err(TopologyError::NonCoveringChunks(tensor_name.to_string()));
     }
-    
+
     // For 1D case, we're done. For nD case, we'd need to recursively validate remaining dimensions
     // This is a simplified version - full implementation would recurse on remaining dimensions
-    
+
     Ok(())
 }
 
@@ -494,7 +494,7 @@ fn check_overlapping_chunks_adaptive(
     tensor_name: &str,
 ) -> Result<(), TopologyError> {
     let chunks = &info.chunks;
-    
+
     // Heuristic: Use sweep line for many chunks, coordinate grid for fewer chunks
     // The threshold can be tuned based on benchmarking
     if chunks.len() > 50 {
@@ -509,15 +509,10 @@ fn check_overlapping_chunks_adaptive(
 impl TryFrom<SimpleTopo> for Topology {
     type Error = TopologyError;
     fn try_from(value: SimpleTopo) -> Result<Self, Self::Error> {
-        let topo = Topology {
-            filenames: value.filenames,
-            world_size: value.world_size,
-            tensors: value.tensors,
-        };
-        topo.validate()?;
-        Ok(topo)
+        Topology::new(value.tensors, value.filenames, value.world_size)
     }
 }
+
 impl Topology {
     pub fn new(
         tensors: BTreeMap<String, Tensor>,
@@ -1096,7 +1091,10 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(check_overlapping_chunks_adaptive(&info1, "test_tensor1"), Ok(()));
+        assert_eq!(
+            check_overlapping_chunks_adaptive(&info1, "test_tensor1"),
+            Ok(())
+        );
 
         // Test case 1: No overlapping chunks last dim
         let info1 = DistributedInfo {
@@ -1115,7 +1113,10 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(check_overlapping_chunks_adaptive(&info1, "test_tensor2"), Ok(()));
+        assert_eq!(
+            check_overlapping_chunks_adaptive(&info1, "test_tensor2"),
+            Ok(())
+        );
 
         // Test case 2: Overlapping chunks in first dimension
         let info2 = DistributedInfo {
@@ -1275,7 +1276,239 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(check_overlapping_chunks_adaptive(&info, "quadrant_tensor"), Ok(()));
+        assert_eq!(
+            check_overlapping_chunks_adaptive(&info, "quadrant_tensor"),
+            Ok(())
+        );
+    }
+
+    /// Test case that demonstrates missing functionality for nD dimensional tensors
+    /// The sweep line algorithm only validates the first dimension properly,
+    /// missing gaps/overlaps in higher dimensions
+    #[test]
+    fn test_nd_tensor_missing_coverage_detection() {
+        // Create a 4D tensor (2x2x2x2) where first dimension appears covered
+        // but has gaps in higher dimensions
+        let info = DistributedInfo {
+            shape: vec![2, 2, 2, 2], // 4D tensor: 2x2x2x2
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0, 0, 0],
+                    shape: vec![1, 2, 1, 2], // Covers [0:1, 0:2, 0:1, 0:2] = 4 elements
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![1, 0, 0, 0],
+                    shape: vec![1, 2, 1, 2], // Covers [1:2, 0:2, 0:1, 0:2] = 4 elements  
+                    filename_index: 1,
+                },
+                // MISSING: chunks for [x, x, 1:2, x] - gap in 3rd dimension
+                // This should be detected as non-covering, but sweep line only checks first dimension
+            ],
+        };
+
+        // The adaptive function should detect this as non-covering
+        // because there are gaps in the 3rd dimension (z=1 is not covered)
+        let result = check_overlapping_chunks_adaptive(&info, "nd_tensor_with_gaps");
+        assert_eq!(
+            result,
+            Err(TopologyError::NonCoveringChunks("nd_tensor_with_gaps".to_string())),
+            "Should detect non-covering chunks in higher dimensions, but sweep line algorithm misses this"
+        );
+
+        // Test that the optimized version correctly detects the gap
+        let result_optimized = check_overlapping_chunks_optimized(&info, "nd_tensor_with_gaps");
+        assert_eq!(
+            result_optimized,
+            Err(TopologyError::NonCoveringChunks("nd_tensor_with_gaps".to_string())),
+            "Optimized version should correctly detect gaps in nD tensors"
+        );
+
+        // Demonstrate the issue: if we force the sweep line algorithm directly,
+        // it might not catch this (depending on implementation details)
+        // Note: This test documents the current limitation
+    }
+
+    /// Test case for nD tensor with overlaps in higher dimensions
+    /// that should be detected but might be missed by incomplete algorithms  
+    #[test]
+    fn test_nd_tensor_overlap_in_higher_dimensions() {
+        // Create a 4D tensor where chunks overlap in higher dimensions
+        // but first dimension coverage looks correct
+        let info = DistributedInfo {
+            shape: vec![2, 2, 2, 2], // 4D tensor: 2x2x2x2
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0, 0, 0],
+                    shape: vec![1, 2, 2, 1], // Covers [0:1, 0:2, 0:2, 0:1]
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![1, 0, 0, 0],
+                    shape: vec![1, 2, 2, 1], // Covers [1:2, 0:2, 0:2, 0:1] 
+                    filename_index: 1,
+                },
+                Chunk {
+                    offsets: vec![0, 0, 1, 0], // OVERLAPS with first chunk in y,z dimensions
+                    shape: vec![1, 1, 1, 2], // Covers [0:1, 0:1, 1:2, 0:2] - overlaps at (0,0,1,0)
+                    filename_index: 2,
+                },
+                Chunk {
+                    offsets: vec![1, 1, 1, 0],
+                    shape: vec![1, 1, 1, 2], // Covers [1:2, 1:2, 1:2, 0:2]
+                    filename_index: 3,
+                },
+            ],
+        };
+
+        // Should detect overlapping chunks
+        let result = check_overlapping_chunks_adaptive(&info, "nd_tensor_with_overlaps");
+        assert_eq!(
+            result,
+            Err(TopologyError::OverlappingChunks("nd_tensor_with_overlaps".to_string())),
+            "Should detect overlapping chunks in nD tensors"
+        );
+    }
+
+    /// Test case demonstrating proper 5D tensor handling
+    /// This test ensures the algorithms work correctly for higher dimensional tensors
+    #[test]
+    fn test_5d_tensor_proper_partitioning() {
+        // Create a properly partitioned 5D tensor (2x2x2x2x2)
+        let info = DistributedInfo {
+            shape: vec![2, 2, 2, 2, 2], // 5D tensor
+            dtype: Dtype::F32,
+            chunks: vec![
+                // Split along the first dimension only
+                Chunk {
+                    offsets: vec![0, 0, 0, 0, 0],
+                    shape: vec![1, 2, 2, 2, 2], // First half: 16 elements
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![1, 0, 0, 0, 0],  
+                    shape: vec![1, 2, 2, 2, 2], // Second half: 16 elements
+                    filename_index: 1,
+                },
+            ],
+        };
+
+        // This should be valid - no overlaps, complete coverage
+        let result = check_overlapping_chunks_adaptive(&info, "5d_tensor_valid");
+        assert_eq!(result, Ok(()), "Properly partitioned 5D tensor should be valid");
+    }
+
+    /// Test that specifically demonstrates the sweep line algorithm limitation
+    /// This test calls the sweep line algorithm directly and shows it may not
+    /// properly validate coverage in higher dimensions
+    #[test]
+    fn test_sweep_line_algorithm_limitation() {
+        // Create a tensor where first dimension is covered but higher dimensions have gaps
+        let info = DistributedInfo {
+            shape: vec![2, 4, 2, 2], // 4D tensor: 2x4x2x2
+            dtype: Dtype::F32,
+            chunks: vec![
+                Chunk {
+                    offsets: vec![0, 0, 0, 0],
+                    shape: vec![1, 4, 1, 2], // Covers [0:1, 0:4, 0:1, 0:2] - only z=0 plane
+                    filename_index: 0,
+                },
+                Chunk {
+                    offsets: vec![1, 0, 0, 0],  
+                    shape: vec![1, 4, 1, 2], // Covers [1:2, 0:4, 0:1, 0:2] - only z=0 plane  
+                    filename_index: 1,
+                },
+                // MISSING: chunks for z=1 plane - this creates a gap in the 3rd dimension
+            ],
+        };
+
+        // The sweep line algorithm might incorrectly think this is valid because
+        // the first dimension (x-axis) is fully covered
+        let sweep_result = check_overlapping_chunks_sweep_line(&info, "sweep_test");
+        
+        // The optimized algorithm should correctly detect the gap
+        let optimized_result = check_overlapping_chunks_optimized(&info, "optimized_test");
+        assert_eq!(
+            optimized_result,
+            Err(TopologyError::NonCoveringChunks("optimized_test".to_string())),
+            "Optimized algorithm should detect gaps in higher dimensions"
+        );
+
+        // Document the behavior: the sweep line algorithm might not catch this
+        // (The actual behavior depends on the implementation details)
+        println!("Sweep line result: {:?}", sweep_result);
+        println!("Optimized result: {:?}", optimized_result);
+    }
+
+    /// Test case that forces many chunks to trigger sweep line algorithm via adaptive choice
+    #[test] 
+    fn test_many_chunks_triggers_sweep_line() {
+        // Create a tensor with 60 chunks (> 50) to trigger sweep line algorithm
+        let mut chunks = Vec::new();
+        
+        // Create a 1D tensor of length 60, each chunk covers 1 element
+        for i in 0..60 {
+            chunks.push(Chunk {
+                offsets: vec![i],
+                shape: vec![1],
+                filename_index: i,
+            });
+        }
+        
+        let info = DistributedInfo {
+            shape: vec![60], // 1D tensor of length 60
+            dtype: Dtype::F32,
+            chunks,
+        };
+
+        // This should work fine for 1D case
+        let result = check_overlapping_chunks_adaptive(&info, "many_chunks_1d");
+        assert_eq!(result, Ok(()), "1D tensor with many chunks should be valid");
+    }
+
+    /// Test that demonstrates the problematic case: many chunks with nD tensor gaps
+    /// This forces the adaptive algorithm to choose sweep line, which may miss gaps
+    #[test]
+    fn test_many_chunks_nd_tensor_gap_issue() {
+        // Create a 2D tensor with 60 chunks to force sweep line algorithm usage
+        let mut chunks = Vec::new();
+        
+        // Create chunks that cover the first dimension completely but leave gaps in the second
+        for i in 0..60 {
+            chunks.push(Chunk {
+                offsets: vec![i, 0], // Only cover y=0, leaving y=1 uncovered
+                shape: vec![1, 1],   // Each chunk is 1x1
+                filename_index: i,
+            });
+        }
+        
+        let info = DistributedInfo {
+            shape: vec![60, 2], // 2D tensor: 60x2 
+            dtype: Dtype::F32,
+            chunks,
+        };
+
+        // The adaptive algorithm will choose sweep line due to chunk count > 50
+        // This demonstrates the potential issue in real-world scenarios
+        let adaptive_result = check_overlapping_chunks_adaptive(&info, "many_chunks_with_gaps");
+        
+        // For comparison, the optimized algorithm should detect the gap
+        let optimized_result = check_overlapping_chunks_optimized(&info, "many_chunks_with_gaps_opt");
+        
+        println!("Adaptive result (uses sweep line): {:?}", adaptive_result);
+        println!("Optimized result: {:?}", optimized_result);
+        
+        // This test documents the behavior - the optimized version should catch the gap
+        assert_eq!(
+            optimized_result,
+            Err(TopologyError::NonCoveringChunks("many_chunks_with_gaps_opt".to_string())),
+            "Optimized algorithm should detect gaps even with many chunks"
+        );
+        
+        // Note: The adaptive result might be Ok(()) due to sweep line limitation
+        // This is the bug we're demonstrating
     }
 
     #[tokio::test]

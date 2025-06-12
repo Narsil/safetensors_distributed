@@ -1,23 +1,23 @@
 use super::location::{Source, SourceLocation, Target, WriteLocation};
-use super::task::{ReadSerialTask, Task, TaskSource, WriteOperation};
-use super::{Layout, RedistributionStrategy, RedistributorError, Result, compute_shared_to_distributed_ranges, compute_distributed_to_shared_ranges, compute_write_ranges_direct, compute_distributed_to_shared_write_ranges, compute_shared_to_distributed_write_ranges};
+use super::task::{Task, TaskSource};
+use super::{
+    Layout, RedistributorError, Result, compute_distributed_to_shared_ranges,
+    compute_shared_to_distributed_ranges,
+};
 use crate::topology::{Tensor, Topology};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, trace};
 use memmap2::Mmap;
-use reqwest::{Client, header::HeaderMap};
 use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use std::time::Instant;
 use tokio::sync::mpsc::{Sender, channel};
-use url::Url;
 
 pub struct AsyncTensorRedistributor {
     source: Source,
     target: Target,
-    strategy: RedistributionStrategy,
+    // strategy: RedistributionStrategy,
 }
 
 impl AsyncTensorRedistributor {
@@ -75,118 +75,7 @@ impl AsyncTensorRedistributor {
                     mmaps: None,
                 },
             },
-            strategy: RedistributionStrategy::default(),
-        })
-    }
-
-    /// Create a new redistributor for reconstruction from remote distributed files
-    pub async fn from_url<P: AsRef<Path>>(
-        base_url: Url,
-        auth_headers: HeaderMap,
-        target_dir: P,
-        target_topology: Topology,
-    ) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120)) // Longer overall timeout
-            .connect_timeout(Duration::from_secs(30)) // Longer connection timeout
-            .pool_idle_timeout(Duration::from_secs(300)) // Keep connections alive much longer (5 minutes)
-            .pool_max_idle_per_host(8) // Fewer connections but longer lived
-            .http2_keep_alive_interval(Duration::from_secs(10)) // More frequent HTTP/2 keep-alive
-            .http2_keep_alive_timeout(Duration::from_secs(30)) // Longer HTTP/2 keep-alive timeout
-            .http2_keep_alive_while_idle(true) // Keep connections alive even when idle
-            .tcp_keepalive(Duration::from_secs(30)) // More frequent TCP-level keep-alive
-            .redirect(reqwest::redirect::Policy::default()) // Follow redirects (up to 10)
-            .build()
-            .map_err(|e| {
-                RedistributorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to create HTTP client: {}", e),
-                ))
-            })?;
-
-        Self::from_url_with_client(client, base_url, auth_headers, target_dir, target_topology)
-            .await
-    }
-
-    /// Create redistributor from remote URL with provided HTTP client (for connection pooling)
-    pub async fn from_url_with_client<P: AsRef<Path>>(
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        target_dir: P,
-        target_topology: Topology,
-    ) -> Result<Self> {
-        let target_dir = target_dir.as_ref().to_path_buf();
-        let target_metadatas = Self::pre_calculate_metadatas(&target_topology)?;
-
-        let target_layout = Layout {
-            topology: target_topology,
-            metadatas: target_metadatas,
-        };
-
-        // Create semaphore with few permits for batched concurrent reads
-        let http_semaphore = Arc::new(Semaphore::new(5));
-
-        // Discover remote topology and metadata WITH CACHING to avoid duplicate requests
-        let (source_topology, metadata_cache) =
-            Self::load_or_create_remote_topology_with_cache(&client, &base_url, &auth_headers)
-                .await?;
-        let file_paths = source_topology.filenames().to_vec();
-
-        // Fetch metadata for each remote file, using cache when available
-        let mut source_metadatas = Vec::new();
-        for file_path in &file_paths {
-            if let Some(cached_metadata) = metadata_cache.get(file_path) {
-                // Use cached metadata (avoids redundant request)
-                trace!("Using cached metadata for {}", file_path);
-                let metadata_buf = serde_json::to_string(cached_metadata)?.into_bytes();
-                let extra = (8 - metadata_buf.len() % 8) % 8;
-                let header_size = metadata_buf.len() + 8 + extra;
-                source_metadatas.push((header_size, cached_metadata.clone()));
-            } else {
-                // Fetch metadata if not cached
-                let file_url = base_url.join(file_path).map_err(|e| {
-                    RedistributorError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid file URL: {}", e),
-                    ))
-                })?;
-
-                let metadata =
-                    Self::fetch_remote_safetensors_metadata(&client, &file_url, &auth_headers)
-                        .await?;
-
-                let metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
-                let extra = (8 - metadata_buf.len() % 8) % 8;
-                let header_size = metadata_buf.len() + 8 + extra;
-                source_metadatas.push((header_size, metadata));
-            }
-        }
-
-        let source_layout = Layout {
-            topology: source_topology,
-            metadatas: source_metadatas,
-        };
-
-        Ok(Self {
-            source: Source {
-                layout: source_layout,
-                location: SourceLocation::Remote {
-                    client,
-                    base_url,
-                    auth_headers,
-                    file_paths: file_paths.to_vec(),
-                    http_semaphore: http_semaphore.clone(),
-                },
-            },
-            target: Target {
-                layout: target_layout,
-                location: WriteLocation {
-                    dir: target_dir,
-                    mmaps: None,
-                },
-            },
-            strategy: RedistributionStrategy::default(),
+            // strategy: RedistributionStrategy::default(),
         })
     }
 
@@ -239,44 +128,46 @@ impl AsyncTensorRedistributor {
 
         trace!("REDISTRIBUTION: Starting progress task...");
         let p = progress.clone();
-        let strategy = self.strategy;
+        // let strategy = self.strategy;
         let handle = tokio::spawn(async move {
-            match strategy {
-                RedistributionStrategy::ReadUnorderedWriteSerial => {
-                    // Execute write tasks as they come in
-                    while let Some(task) = rx.recv().await {
-                        if let Task::Write(write_task) = task {
-                            let length = (write_task.target_end - write_task.target_start) as usize;
-                            if let Err(e) = write_task.run().await {
-                                error!("Write task failed: {}", e);
-                            }
-                            p.inc(length as u64);
-                        } else {
-                            error!("ReadUnorderedWriteSerial strategy received unexpected ReadSerial task");
-                        }
-                    }
+            // match strategy {
+            //     RedistributionStrategy::ReadUnorderedWriteSerial => {
+            // Execute write tasks as they come in
+            while let Some(task) = rx.recv().await {
+                // if let Task::Write(write_task) = task {
+                let length = (task.target_end - task.target_start) as usize;
+                if let Err(e) = task.run().await {
+                    error!("Write task failed: {}", e);
                 }
-
-                RedistributionStrategy::ReadSerialWriteUnordered => {
-                    // Execute read tasks as they come in
-                    while let Some(task) = rx.recv().await {
-                        if let Task::ReadSerial(read_task) = task {
-                            let total_writes_length: u64 = read_task
-                                .writes
-                                .iter()
-                                .map(|w| w.target_end - w.target_start)
-                                .sum();
-
-                            if let Err(e) = read_task.run().await {
-                                error!("Read task failed: {}", e);
-                            }
-                            p.inc(total_writes_length);
-                        } else {
-                            error!("ReadSerialWriteUnordered strategy received unexpected Write task");
-                        }
-                    }
-                }
+                p.inc(length as u64);
+                // } else {
+                //     error!("ReadUnorderedWriteSerial strategy received unexpected ReadSerial task");
+                // }
             }
+            // }
+
+            // RedistributionStrategy::ReadSerialWriteUnordered => {
+            //     // Execute read tasks as they come in
+            //     while let Some(task) = rx.recv().await {
+            //         if let Task::ReadSerial(read_task) = task {
+            //             let total_writes_length: u64 = read_task
+            //                 .writes
+            //                 .iter()
+            //                 .map(|w| w.target_end - w.target_start)
+            //                 .sum();
+
+            //             if let Err(e) = read_task.run().await {
+            //                 error!("Read task failed: {}", e);
+            //             }
+            //             p.inc(total_writes_length);
+            //         } else {
+            //             error!(
+            //                 "ReadSerialWriteUnordered strategy received unexpected Write task"
+            //             );
+            //         }
+            //     }
+            // }
+            // }
         });
 
         trace!("REDISTRIBUTION: Creating tasks...");
@@ -315,11 +206,11 @@ impl AsyncTensorRedistributor {
         Ok(created_files)
     }
 
-    /// Set the redistribution strategy
-    pub fn with_strategy(mut self, strategy: RedistributionStrategy) -> Self {
-        self.strategy = strategy;
-        self
-    }
+    // /// Set the redistribution strategy
+    // pub fn with_strategy(mut self, strategy: RedistributionStrategy) -> Self {
+    //     self.strategy = strategy;
+    //     self
+    // }
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
     fn pre_calculate_metadatas(topology: &Topology) -> Result<Vec<(usize, Metadata)>> {
@@ -386,10 +277,11 @@ impl AsyncTensorRedistributor {
     }
 
     async fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
-        match self.strategy {
-            RedistributionStrategy::ReadUnorderedWriteSerial => self.create_write_tasks(tx).await,
-            RedistributionStrategy::ReadSerialWriteUnordered => self.create_read_tasks(tx).await,
-        }
+        self.create_write_tasks(tx).await
+        // match self.strategy {
+        //     RedistributionStrategy::ReadUnorderedWriteSerial => self.create_write_tasks(tx).await,
+        //     RedistributionStrategy::ReadSerialWriteUnordered => self.create_read_tasks(tx).await,
+        // }
     }
 
     /// Create write-focused tasks for ReadUnorderedWriteSerial strategy
@@ -491,91 +383,91 @@ impl AsyncTensorRedistributor {
         Ok(())
     }
 
-    /// Create read-focused tasks for ReadSerialWriteUnordered strategy  
-    /// Iterates source files → source tensors by data_offset (new symmetric logic)
-    async fn create_read_tasks(&self, tx: &Sender<Task>) -> Result<()> {
-        trace!("TASKS: Starting read task creation...");
-        let start = Instant::now();
+    // /// Create read-focused tasks for ReadSerialWriteUnordered strategy
+    // /// Iterates source files → source tensors by data_offset (new symmetric logic)
+    // async fn create_read_tasks(&self, tx: &Sender<Task>) -> Result<()> {
+    //     trace!("TASKS: Starting read task creation...");
+    //     let start = Instant::now();
 
-        trace!(
-            "Creating read tasks for {} source files",
-            self.source.layout.topology.filenames().len()
-        );
+    //     trace!(
+    //         "Creating read tasks for {} source files",
+    //         self.source.layout.topology.filenames().len()
+    //     );
 
-        let file_count = self.source.layout.topology.filenames().len();
-        trace!("TASKS: Processing {} source files", file_count);
+    //     let file_count = self.source.layout.topology.filenames().len();
+    //     trace!("TASKS: Processing {} source files", file_count);
 
-        // Process each source file in order
-        for (source_file_index, filename) in
-            self.source.layout.topology.filenames().iter().enumerate()
-        {
-            let file_start = Instant::now();
-            trace!(
-                "TASKS: Processing source file {}/{}: {}",
-                source_file_index + 1,
-                file_count,
-                filename
-            );
+    //     // Process each source file in order
+    //     for (source_file_index, filename) in
+    //         self.source.layout.topology.filenames().iter().enumerate()
+    //     {
+    //         let file_start = Instant::now();
+    //         trace!(
+    //             "TASKS: Processing source file {}/{}: {}",
+    //             source_file_index + 1,
+    //             file_count,
+    //             filename
+    //         );
 
-            // Get the metadata for this source file
-            let (header_size, metadata) = &self.source.layout.metadatas[source_file_index];
+    //         // Get the metadata for this source file
+    //         let (header_size, metadata) = &self.source.layout.metadatas[source_file_index];
 
-            // Collect tensors and sort by data offset for sequential reads
-            let tensors = metadata.tensors();
-            let mut tensor_entries: Vec<(&String, &TensorInfo)> =
-                tensors.iter().map(|(k, v)| (k, *v)).collect();
-            tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
+    //         // Collect tensors and sort by data offset for sequential reads
+    //         let tensors = metadata.tensors();
+    //         let mut tensor_entries: Vec<(&String, &TensorInfo)> =
+    //             tensors.iter().map(|(k, v)| (k, *v)).collect();
+    //         tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
-            let tensor_count = tensor_entries.len();
-            trace!(
-                "TASKS: Found {} tensors in source file {}",
-                tensor_count, source_file_index
-            );
+    //         let tensor_count = tensor_entries.len();
+    //         trace!(
+    //             "TASKS: Found {} tensors in source file {}",
+    //             tensor_count, source_file_index
+    //         );
 
-            // Process each tensor in read order
-            for (i, (tensor_name, tensor_info)) in tensor_entries.iter().enumerate() {
-                let tensor_start = Instant::now();
-                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
-                    trace!(
-                        "TASKS: Creating read task for tensor {}/{}: '{}' (offset: {} -> {})",
-                        i + 1,
-                        tensor_count,
-                        tensor_name,
-                        tensor_info.data_offsets.0,
-                        tensor_info.data_offsets.1
-                    );
-                }
+    //         // Process each tensor in read order
+    //         for (i, (tensor_name, tensor_info)) in tensor_entries.iter().enumerate() {
+    //             let tensor_start = Instant::now();
+    //             if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
+    //                 trace!(
+    //                     "TASKS: Creating read task for tensor {}/{}: '{}' (offset: {} -> {})",
+    //                     i + 1,
+    //                     tensor_count,
+    //                     tensor_name,
+    //                     tensor_info.data_offsets.0,
+    //                     tensor_info.data_offsets.1
+    //                 );
+    //             }
 
-                self.create_read_task_for_tensor(
-                    tx,
-                    source_file_index,
-                    *header_size,
-                    tensor_name,
-                    tensor_info,
-                )
-                .await?;
+    //             self.create_read_task_for_tensor(
+    //                 tx,
+    //                 source_file_index,
+    //                 *header_size,
+    //                 tensor_name,
+    //                 tensor_info,
+    //             )
+    //             .await?;
 
-                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
-                    trace!(
-                        "TASKS: Tensor {}/{} completed in {:?}",
-                        i + 1,
-                        tensor_count,
-                        tensor_start.elapsed()
-                    );
-                }
-            }
+    //             if i < 5 || i % 20 == 0 || i == tensor_count - 1 {
+    //                 trace!(
+    //                     "TASKS: Tensor {}/{} completed in {:?}",
+    //                     i + 1,
+    //                     tensor_count,
+    //                     tensor_start.elapsed()
+    //                 );
+    //             }
+    //         }
 
-            trace!(
-                "TASKS: Source file {}/{} completed in {:?}",
-                source_file_index + 1,
-                file_count,
-                file_start.elapsed()
-            );
-        }
+    //         trace!(
+    //             "TASKS: Source file {}/{} completed in {:?}",
+    //             source_file_index + 1,
+    //             file_count,
+    //             file_start.elapsed()
+    //         );
+    //     }
 
-        trace!("TASKS: All read tasks created in {:?}", start.elapsed());
-        Ok(())
-    }
+    //     trace!("TASKS: All read tasks created in {:?}", start.elapsed());
+    //     Ok(())
+    // }
 
     async fn create_write_task_for_tensor(
         &self,
@@ -700,7 +592,8 @@ impl AsyncTensorRedistributor {
                 source_ranges,
                 ranges_per_file,
             ) {
-                tx.send(Task::Write(write_task)).await.unwrap();
+                // tx.send(Task::Write(write_task)).await.unwrap();
+                tx.send(write_task).await.unwrap();
             }
         } else {
             trace!("    No task created (no source ranges)");
@@ -709,128 +602,128 @@ impl AsyncTensorRedistributor {
         Ok(())
     }
 
-    async fn create_read_task_for_tensor(
-        &self,
-        tx: &Sender<Task>,
-        source_file_index: usize,
-        source_header_size: usize,
-        tensor_name: &str,
-        source_tensor_info: &TensorInfo,
-    ) -> Result<()> {
-        trace!(
-            "    Creating read task for '{}' from source file {}",
-            tensor_name, source_file_index
-        );
+    // async fn create_read_task_for_tensor(
+    //     &self,
+    //     tx: &Sender<Task>,
+    //     source_file_index: usize,
+    //     source_header_size: usize,
+    //     tensor_name: &str,
+    //     source_tensor_info: &TensorInfo,
+    // ) -> Result<()> {
+    //     trace!(
+    //         "    Creating read task for '{}' from source file {}",
+    //         tensor_name, source_file_index
+    //     );
 
-        // Look up the tensor in target topology
-        let target_tensor = self
-            .target
-            .layout
-            .topology
-            .tensors()
-            .get(tensor_name)
-            .ok_or_else(|| RedistributorError::TensorNotFound {
-                name: tensor_name.to_string(),
-            })?;
+    //     // Look up the tensor in target topology
+    //     let target_tensor = self
+    //         .target
+    //         .layout
+    //         .topology
+    //         .tensors()
+    //         .get(tensor_name)
+    //         .ok_or_else(|| RedistributorError::TensorNotFound {
+    //             name: tensor_name.to_string(),
+    //         })?;
 
-        // Look up the tensor in source topology
-        let source_tensor = self
-            .source
-            .layout
-            .topology
-            .tensors()
-            .get(tensor_name)
-            .ok_or_else(|| RedistributorError::TensorNotFound {
-                name: tensor_name.to_string(),
-            })?;
+    //     // Look up the tensor in source topology
+    //     let source_tensor = self
+    //         .source
+    //         .layout
+    //         .topology
+    //         .tensors()
+    //         .get(tensor_name)
+    //         .ok_or_else(|| RedistributorError::TensorNotFound {
+    //             name: tensor_name.to_string(),
+    //         })?;
 
-        let source_start = (source_header_size + source_tensor_info.data_offsets.0) as u64;
-        let source_end = (source_header_size + source_tensor_info.data_offsets.1) as u64;
+    //     let source_start = (source_header_size + source_tensor_info.data_offsets.0) as u64;
+    //     let source_end = (source_header_size + source_tensor_info.data_offsets.1) as u64;
 
-        // Collect all writes that need data from this source tensor
-        let mut writes = Vec::new();
+    //     // Collect all writes that need data from this source tensor
+    //     let mut writes = Vec::new();
 
-        // Create single task source for this read
-        let mut task_source = match &self.source.location {
-            SourceLocation::Local { .. } => TaskSource::new_local(),
-            SourceLocation::Remote {
-                client,
-                base_url,
-                auth_headers,
-                http_semaphore,
-                ..
-            } => TaskSource::new_remote(
-                client.clone(),
-                base_url.clone(),
-                auth_headers.clone(),
-                http_semaphore.clone(),
-            ),
-        };
-        task_source.add_from_location(&self.source.location, source_file_index);
+    //     // Create single task source for this read
+    //     let mut task_source = match &self.source.location {
+    //         SourceLocation::Local { .. } => TaskSource::new_local(),
+    //         SourceLocation::Remote {
+    //             client,
+    //             base_url,
+    //             auth_headers,
+    //             http_semaphore,
+    //             ..
+    //         } => TaskSource::new_remote(
+    //             client.clone(),
+    //             base_url.clone(),
+    //             auth_headers.clone(),
+    //             http_semaphore.clone(),
+    //         ),
+    //     };
+    //     task_source.add_from_location(&self.source.location, source_file_index);
 
-        match (source_tensor, target_tensor) {
-            (Tensor::Distributed(source_info), Tensor::Distributed(target_info)) => {
-                self.collect_writes_distributed_to_distributed(
-                    tensor_name,
-                    source_info,
-                    target_info,
-                    source_file_index,
-                    &mut writes,
-                )?;
-            }
-            (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
-                self.collect_writes_shared_to_distributed(
-                    tensor_name,
-                    source_info,
-                    target_info,
-                    source_file_index,
-                    &mut writes,
-                )?;
-            }
-            (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
-                self.collect_writes_shared_to_shared(
-                    tensor_name,
-                    source_info,
-                    target_info,
-                    source_file_index,
-                    &mut writes,
-                )?;
-            }
-            (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
-                self.collect_writes_distributed_to_shared(
-                    tensor_name,
-                    source_info,
-                    target_info,
-                    source_file_index,
-                    &mut writes,
-                )?;
-            }
-        }
+    //     match (source_tensor, target_tensor) {
+    //         (Tensor::Distributed(source_info), Tensor::Distributed(target_info)) => {
+    //             self.collect_writes_distributed_to_distributed(
+    //                 tensor_name,
+    //                 source_info,
+    //                 target_info,
+    //                 source_file_index,
+    //                 &mut writes,
+    //             )?;
+    //         }
+    //         (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
+    //             self.collect_writes_shared_to_distributed(
+    //                 tensor_name,
+    //                 source_info,
+    //                 target_info,
+    //                 source_file_index,
+    //                 &mut writes,
+    //             )?;
+    //         }
+    //         (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
+    //             self.collect_writes_shared_to_shared(
+    //                 tensor_name,
+    //                 source_info,
+    //                 target_info,
+    //                 source_file_index,
+    //                 &mut writes,
+    //             )?;
+    //         }
+    //         (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
+    //             self.collect_writes_distributed_to_shared(
+    //                 tensor_name,
+    //                 source_info,
+    //                 target_info,
+    //                 source_file_index,
+    //                 &mut writes,
+    //             )?;
+    //         }
+    //     }
 
-        // Create and send the read task if we have any writes to do
-        if !writes.is_empty() {
-            let write_count = writes.len();
+    //     // Create and send the read task if we have any writes to do
+    //     if !writes.is_empty() {
+    //         let write_count = writes.len();
 
-            trace!(
-                "    Read task created: 1 source read, {} target writes, reading {}->{}",
-                write_count, source_start, source_end
-            );
+    //         trace!(
+    //             "    Read task created: 1 source read, {} target writes, reading {}->{}",
+    //             write_count, source_start, source_end
+    //         );
 
-            let read_task = ReadSerialTask {
-                source: task_source.into_task_sources(),
-                source_file_index,
-                source_start,
-                source_end,
-                writes,
-            };
+    //         let read_task = ReadSerialTask {
+    //             source: task_source.into_task_sources(),
+    //             source_file_index,
+    //             source_start,
+    //             source_end,
+    //             writes,
+    //         };
 
-            tx.send(Task::ReadSerial(read_task)).await.unwrap();
-        } else {
-            trace!("    No read task created (no target writes)");
-        }
+    //         tx.send(Task::ReadSerial(read_task)).await.unwrap();
+    //     } else {
+    //         trace!("    No read task created (no target writes)");
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     fn collect_reads_distributed_to_distributed(
         &self,
@@ -947,11 +840,11 @@ impl AsyncTensorRedistributor {
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
             &self.source.layout.metadatas[source_file_index];
-        let source_tensor_info =
-            source_metadata.info(tensor_name)
-                .ok_or_else(|| RedistributorError::TensorNotFound {
-                    name: tensor_name.to_string(),
-                })?;
+        let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
+            RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            }
+        })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
         // Use optimized direct computation for shared-to-distributed
@@ -999,12 +892,11 @@ impl AsyncTensorRedistributor {
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
             &self.source.layout.metadatas[source_file_index];
-        let source_tensor_info =
-            source_metadata
-                .info(tensor_name)
-                .ok_or_else(|| RedistributorError::TensorNotFound {
-                    name: tensor_name.to_string(),
-                })?;
+        let source_tensor_info = source_metadata.info(tensor_name).ok_or_else(|| {
+            RedistributorError::TensorNotFound {
+                name: tensor_name.to_string(),
+            }
+        })?;
         let source_data_offset = source_tensor_info.data_offsets.0;
 
         // For shared to shared, we copy the entire tensor
@@ -1090,259 +982,259 @@ impl AsyncTensorRedistributor {
         Ok(())
     }
 
-    // Symmetric collect_writes_* methods for ReadSerial tasks
+    // // Symmetric collect_writes_* methods for ReadSerial tasks
 
-    fn collect_writes_distributed_to_distributed(
-        &self,
-        tensor_name: &str,
-        source_info: &crate::topology::DistributedInfo,
-        target_info: &crate::topology::DistributedInfo,
-        source_file_index: usize,
-        writes: &mut Vec<WriteOperation>,
-    ) -> Result<()> {
-        // Find the source chunk that belongs to this source file
-        let source_chunk = source_info
-            .chunks()
-            .iter()
-            .find(|chunk| chunk.filename_index() == source_file_index)
-            .ok_or_else(|| RedistributorError::InvalidDataSource {
-                message: format!(
-                    "No chunk found for source file {} in tensor {}",
-                    source_file_index, tensor_name
-                ),
-            })?;
+    // fn collect_writes_distributed_to_distributed(
+    //     &self,
+    //     tensor_name: &str,
+    //     source_info: &crate::topology::DistributedInfo,
+    //     target_info: &crate::topology::DistributedInfo,
+    //     source_file_index: usize,
+    //     writes: &mut Vec<WriteOperation>,
+    // ) -> Result<()> {
+    //     // Find the source chunk that belongs to this source file
+    //     let source_chunk = source_info
+    //         .chunks()
+    //         .iter()
+    //         .find(|chunk| chunk.filename_index() == source_file_index)
+    //         .ok_or_else(|| RedistributorError::InvalidDataSource {
+    //             message: format!(
+    //                 "No chunk found for source file {} in tensor {}",
+    //                 source_file_index, tensor_name
+    //             ),
+    //         })?;
 
-        // Get tensor properties
-        let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+    //     // Get tensor properties
+    //     let full_shape = source_info.shape();
+    //     let dtype_size = source_info.dtype().size();
 
-        // Calculate strides for the full tensor
-        let ndim = full_shape.len();
-        let mut full_strides = vec![1; ndim];
-        for i in (0..ndim - 1).rev() {
-            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-        }
+    //     // Calculate strides for the full tensor
+    //     let ndim = full_shape.len();
+    //     let mut full_strides = vec![1; ndim];
+    //     for i in (0..ndim - 1).rev() {
+    //         full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+    //     }
 
-        // Process each target chunk to see if it overlaps with our source
-        for target_chunk in target_info.chunks() {
-            let target_file_index = target_chunk.filename_index();
+    //     // Process each target chunk to see if it overlaps with our source
+    //     for target_chunk in target_info.chunks() {
+    //         let target_file_index = target_chunk.filename_index();
 
-            // Get target file metadata to calculate byte offsets
-            let (target_header_size, target_metadata) =
-                &self.target.layout.metadatas[target_file_index];
-            let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
-                RedistributorError::TensorNotFound {
-                    name: tensor_name.to_string(),
-                }
-            })?;
-            let target_data_offset = target_tensor_info.data_offsets.0;
+    //         // Get target file metadata to calculate byte offsets
+    //         let (target_header_size, target_metadata) =
+    //             &self.target.layout.metadatas[target_file_index];
+    //         let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
+    //             RedistributorError::TensorNotFound {
+    //                 name: tensor_name.to_string(),
+    //             }
+    //         })?;
+    //         let target_data_offset = target_tensor_info.data_offsets.0;
 
-            // Use optimized direct computation instead of get_intervals + intersection
-            let write_ranges = compute_write_ranges_direct(
-                source_chunk,
-                target_chunk,
-                *target_header_size,
-                target_data_offset,
-                dtype_size,
-                &full_strides,
-                full_shape,
-            );
+    //         // Use optimized direct computation instead of get_intervals + intersection
+    //         let write_ranges = compute_write_ranges_direct(
+    //             source_chunk,
+    //             target_chunk,
+    //             *target_header_size,
+    //             target_data_offset,
+    //             dtype_size,
+    //             &full_strides,
+    //             full_shape,
+    //         );
 
-            if !write_ranges.is_empty() {
-                // Get target mmap for writing
-                let target_mmap = self.target.location.get_mmap(target_file_index)?;
+    //         if !write_ranges.is_empty() {
+    //             // Get target mmap for writing
+    //             let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                // Convert write ranges to write operations
-                for write_range in write_ranges {
-                    writes.push(WriteOperation {
-                        target_file_index,
-                        target_mmap: target_mmap.clone(),
-                        target_start: write_range.target_start,
-                        target_end: write_range.target_end,
-                        read_offset: write_range.source_offset,
-                    });
-                }
-            }
-        }
+    //             // Convert write ranges to write operations
+    //             for write_range in write_ranges {
+    //                 writes.push(WriteOperation {
+    //                     target_file_index,
+    //                     target_mmap: target_mmap.clone(),
+    //                     target_start: write_range.target_start,
+    //                     target_end: write_range.target_end,
+    //                     read_offset: write_range.source_offset,
+    //                 });
+    //             }
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn collect_writes_shared_to_distributed(
-        &self,
-        tensor_name: &str,
-        source_info: &crate::topology::SharedInfo,
-        target_info: &crate::topology::DistributedInfo,
-        _source_file_index: usize,
-        writes: &mut Vec<WriteOperation>,
-    ) -> Result<()> {
-        // Get tensor properties
-        let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+    // fn collect_writes_shared_to_distributed(
+    //     &self,
+    //     tensor_name: &str,
+    //     source_info: &crate::topology::SharedInfo,
+    //     target_info: &crate::topology::DistributedInfo,
+    //     _source_file_index: usize,
+    //     writes: &mut Vec<WriteOperation>,
+    // ) -> Result<()> {
+    //     // Get tensor properties
+    //     let full_shape = source_info.shape();
+    //     let dtype_size = source_info.dtype().size();
 
-        // Calculate strides for the full tensor
-        let ndim = full_shape.len();
-        let mut full_strides = vec![1; ndim];
-        for i in (0..ndim - 1).rev() {
-            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-        }
+    //     // Calculate strides for the full tensor
+    //     let ndim = full_shape.len();
+    //     let mut full_strides = vec![1; ndim];
+    //     for i in (0..ndim - 1).rev() {
+    //         full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+    //     }
 
-        // Process each target chunk
-        for target_chunk in target_info.chunks() {
-            let target_file_index = target_chunk.filename_index();
+    //     // Process each target chunk
+    //     for target_chunk in target_info.chunks() {
+    //         let target_file_index = target_chunk.filename_index();
 
-            // Get target file metadata to calculate byte offsets
-            let (target_header_size, target_metadata) =
-                &self.target.layout.metadatas[target_file_index];
-            let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
-                RedistributorError::TensorNotFound {
-                    name: tensor_name.to_string(),
-                }
-            })?;
-            let target_data_offset = target_tensor_info.data_offsets.0;
+    //         // Get target file metadata to calculate byte offsets
+    //         let (target_header_size, target_metadata) =
+    //             &self.target.layout.metadatas[target_file_index];
+    //         let target_tensor_info = target_metadata.info(tensor_name).ok_or_else(|| {
+    //             RedistributorError::TensorNotFound {
+    //                 name: tensor_name.to_string(),
+    //             }
+    //         })?;
+    //         let target_data_offset = target_tensor_info.data_offsets.0;
 
-            // Use optimized direct computation for shared-to-distributed
-            let write_ranges = compute_shared_to_distributed_write_ranges(
-                target_chunk,
-                *target_header_size,
-                target_data_offset,
-                dtype_size,
-                &full_strides,
-                full_shape,
-            );
+    //         // Use optimized direct computation for shared-to-distributed
+    //         let write_ranges = compute_shared_to_distributed_write_ranges(
+    //             target_chunk,
+    //             *target_header_size,
+    //             target_data_offset,
+    //             dtype_size,
+    //             &full_strides,
+    //             full_shape,
+    //         );
 
-            if !write_ranges.is_empty() {
-                // Get target mmap for writing
-                let target_mmap = self.target.location.get_mmap(target_file_index)?;
+    //         if !write_ranges.is_empty() {
+    //             // Get target mmap for writing
+    //             let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                // Convert write ranges to write operations
-                for write_range in write_ranges {
-                    writes.push(WriteOperation {
-                        target_file_index,
-                        target_mmap: target_mmap.clone(),
-                        target_start: write_range.target_start,
-                        target_end: write_range.target_end,
-                        read_offset: write_range.source_offset,
-                    });
-                }
-            }
-        }
+    //             // Convert write ranges to write operations
+    //             for write_range in write_ranges {
+    //                 writes.push(WriteOperation {
+    //                     target_file_index,
+    //                     target_mmap: target_mmap.clone(),
+    //                     target_start: write_range.target_start,
+    //                     target_end: write_range.target_end,
+    //                     read_offset: write_range.source_offset,
+    //                 });
+    //             }
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn collect_writes_shared_to_shared(
-        &self,
-        tensor_name: &str,
-        source_info: &crate::topology::SharedInfo,
-        _target_info: &crate::topology::SharedInfo,
-        _source_file_index: usize,
-        writes: &mut Vec<WriteOperation>,
-    ) -> Result<()> {
-        // For shared to shared, copy the entire tensor to all target files that contain it
-        let dtype_size = source_info.dtype().size();
-        let tensor_size = source_info.shape().iter().product::<usize>() * dtype_size;
+    // fn collect_writes_shared_to_shared(
+    //     &self,
+    //     tensor_name: &str,
+    //     source_info: &crate::topology::SharedInfo,
+    //     _target_info: &crate::topology::SharedInfo,
+    //     _source_file_index: usize,
+    //     writes: &mut Vec<WriteOperation>,
+    // ) -> Result<()> {
+    //     // For shared to shared, copy the entire tensor to all target files that contain it
+    //     let dtype_size = source_info.dtype().size();
+    //     let tensor_size = source_info.shape().iter().product::<usize>() * dtype_size;
 
-        // Find all target files that contain this tensor
-        for (target_file_index, (target_header_size, target_metadata)) in
-            self.target.layout.metadatas.iter().enumerate()
-        {
-            if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
-                let target_data_offset = target_tensor_info.data_offsets.0;
-                let target_start = (target_header_size + target_data_offset) as u64;
-                let target_end = target_start + tensor_size as u64;
+    //     // Find all target files that contain this tensor
+    //     for (target_file_index, (target_header_size, target_metadata)) in
+    //         self.target.layout.metadatas.iter().enumerate()
+    //     {
+    //         if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
+    //             let target_data_offset = target_tensor_info.data_offsets.0;
+    //             let target_start = (target_header_size + target_data_offset) as u64;
+    //             let target_end = target_start + tensor_size as u64;
 
-                // Get target mmap for writing
-                let target_mmap = self.target.location.get_mmap(target_file_index)?;
+    //             // Get target mmap for writing
+    //             let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                writes.push(WriteOperation {
-                    target_file_index,
-                    target_mmap: target_mmap.clone(),
-                    target_start,
-                    target_end,
-                    read_offset: 0, // Read entire tensor from beginning
-                });
-            }
-        }
+    //             writes.push(WriteOperation {
+    //                 target_file_index,
+    //                 target_mmap: target_mmap.clone(),
+    //                 target_start,
+    //                 target_end,
+    //                 read_offset: 0, // Read entire tensor from beginning
+    //             });
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn collect_writes_distributed_to_shared(
-        &self,
-        tensor_name: &str,
-        source_info: &crate::topology::DistributedInfo,
-        _target_info: &crate::topology::SharedInfo,
-        source_file_index: usize,
-        writes: &mut Vec<WriteOperation>,
-    ) -> Result<()> {
-        // Find the source chunk that belongs to this source file
-        let source_chunk = source_info
-            .chunks()
-            .iter()
-            .find(|chunk| chunk.filename_index() == source_file_index)
-            .ok_or_else(|| RedistributorError::InvalidDataSource {
-                message: format!(
-                    "No chunk found for source file {} in tensor {}",
-                    source_file_index, tensor_name
-                ),
-            })?;
+    // fn collect_writes_distributed_to_shared(
+    //     &self,
+    //     tensor_name: &str,
+    //     source_info: &crate::topology::DistributedInfo,
+    //     _target_info: &crate::topology::SharedInfo,
+    //     source_file_index: usize,
+    //     writes: &mut Vec<WriteOperation>,
+    // ) -> Result<()> {
+    //     // Find the source chunk that belongs to this source file
+    //     let source_chunk = source_info
+    //         .chunks()
+    //         .iter()
+    //         .find(|chunk| chunk.filename_index() == source_file_index)
+    //         .ok_or_else(|| RedistributorError::InvalidDataSource {
+    //             message: format!(
+    //                 "No chunk found for source file {} in tensor {}",
+    //                 source_file_index, tensor_name
+    //             ),
+    //         })?;
 
-        // Get tensor properties
-        let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+    //     // Get tensor properties
+    //     let full_shape = source_info.shape();
+    //     let dtype_size = source_info.dtype().size();
 
-        // Calculate strides for the full tensor
-        let ndim = full_shape.len();
-        let mut full_strides = vec![1; ndim];
-        for i in (0..ndim - 1).rev() {
-            full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
-        }
+    //     // Calculate strides for the full tensor
+    //     let ndim = full_shape.len();
+    //     let mut full_strides = vec![1; ndim];
+    //     for i in (0..ndim - 1).rev() {
+    //         full_strides[i] = full_strides[i + 1] * full_shape[i + 1];
+    //     }
 
-        // Find all target files that contain this tensor (they should all get the same data)
-        for (target_file_index, (target_header_size, target_metadata)) in
-            self.target.layout.metadatas.iter().enumerate()
-        {
-            if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
-                let target_data_offset = target_tensor_info.data_offsets.0;
+    //     // Find all target files that contain this tensor (they should all get the same data)
+    //     for (target_file_index, (target_header_size, target_metadata)) in
+    //         self.target.layout.metadatas.iter().enumerate()
+    //     {
+    //         if let Some(target_tensor_info) = target_metadata.info(tensor_name) {
+    //             let target_data_offset = target_tensor_info.data_offsets.0;
 
-                // Use optimized direct computation for distributed-to-shared
-                let write_ranges = compute_distributed_to_shared_write_ranges(
-                    source_chunk,
-                    *target_header_size,
-                    target_data_offset,
-                    dtype_size,
-                    &full_strides,
-                    full_shape,
-                );
+    //             // Use optimized direct computation for distributed-to-shared
+    //             let write_ranges = compute_distributed_to_shared_write_ranges(
+    //                 source_chunk,
+    //                 *target_header_size,
+    //                 target_data_offset,
+    //                 dtype_size,
+    //                 &full_strides,
+    //                 full_shape,
+    //             );
 
-                if !write_ranges.is_empty() {
-                    // Get target mmap for writing
-                    let target_mmap = self.target.location.get_mmap(target_file_index)?;
+    //             if !write_ranges.is_empty() {
+    //                 // Get target mmap for writing
+    //                 let target_mmap = self.target.location.get_mmap(target_file_index)?;
 
-                    // Convert write ranges to write operations
-                    for write_range in write_ranges {
-                        writes.push(WriteOperation {
-                            target_file_index,
-                            target_mmap: target_mmap.clone(),
-                            target_start: write_range.target_start,
-                            target_end: write_range.target_end,
-                            read_offset: write_range.source_offset,
-                        });
-                    }
-                }
-            }
-        }
+    //                 // Convert write ranges to write operations
+    //                 for write_range in write_ranges {
+    //                     writes.push(WriteOperation {
+    //                         target_file_index,
+    //                         target_mmap: target_mmap.clone(),
+    //                         target_start: write_range.target_start,
+    //                         target_end: write_range.target_end,
+    //                         read_offset: write_range.source_offset,
+    //                     });
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{Chunk, DistributedInfo, SharedInfo};
     use crate::redistributor::intersection;
+    use crate::topology::{Chunk, DistributedInfo, SharedInfo};
     use safetensors::{Dtype, serialize, tensor::TensorView};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1683,209 +1575,6 @@ mod tests {
             tensor1_data,
             tensor2_data,
         )
-    }
-
-    // Helper function to run roundtrip test for a specific strategy
-    async fn run_strategy_roundtrip_test(
-        strategy: RedistributionStrategy,
-        strategy_name: &str,
-        source_dir: &std::path::Path,
-        original_hash: &str,
-        distributed_topology: &Topology,
-        final_topology: &Topology,
-        tensor1_data: &[f32],
-        tensor2_data: &[f32],
-    ) {
-        use tempfile::TempDir;
-
-        trace!("Testing strategy: {}", strategy_name);
-
-        // Create separate temp directories for this strategy
-        let distributed_dir = TempDir::new().unwrap();
-        let final_dir = TempDir::new().unwrap();
-
-        // Step A: Redistribute from single file to 2 ranks using this strategy
-        let mut redistributor1 = AsyncTensorRedistributor::from_local(
-            source_dir,
-            distributed_dir.path(),
-            distributed_topology.clone(),
-        )
-        .unwrap()
-        .with_strategy(strategy.clone());
-
-        let created_files = redistributor1.redistribute().await.expect(&format!(
-            "Strategy {} failed on distribute step",
-            strategy_name
-        ));
-
-        trace!(
-            "Strategy {}: Created distributed files: {:?}",
-            strategy_name, created_files
-        );
-
-        // Verify distributed files exist
-        assert!(
-            distributed_dir.path().join("rank0.safetensors").exists(),
-            "Strategy {}: rank0.safetensors missing",
-            strategy_name
-        );
-        assert!(
-            distributed_dir.path().join("rank1.safetensors").exists(),
-            "Strategy {}: rank1.safetensors missing",
-            strategy_name
-        );
-        assert!(
-            distributed_dir.path().join("topology.json").exists(),
-            "Strategy {}: topology.json missing",
-            strategy_name
-        );
-
-        // Step B: Redistribute from 2 ranks back to single file using same strategy
-        let mut redistributor2 = AsyncTensorRedistributor::from_local(
-            distributed_dir.path(),
-            final_dir.path(),
-            final_topology.clone(),
-        )
-        .unwrap()
-        .with_strategy(strategy);
-
-        let final_files = redistributor2.redistribute().await.expect(&format!(
-            "Strategy {} failed on reconstruct step",
-            strategy_name
-        ));
-
-        trace!(
-            "Strategy {}: Created final files: {:?}",
-            strategy_name, final_files
-        );
-
-        // Verify final file exists
-        let final_path = final_dir.path().join("model.safetensors");
-        assert!(
-            final_path.exists(),
-            "Strategy {}: final model.safetensors missing",
-            strategy_name
-        );
-
-        // Step C: Calculate hash of final file and compare
-        let final_hash = calculate_file_hash(&final_path).await;
-        trace!(
-            "Strategy {}: Original hash: {}, Final hash: {}",
-            strategy_name, original_hash, final_hash
-        );
-
-        // The files should be identical regardless of strategy
-        assert_eq!(
-            original_hash, final_hash,
-            "Strategy {}: Round-trip redistribution should preserve file integrity",
-            strategy_name
-        );
-
-        // Step D: Additional verification - load and compare tensor data
-        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
-        let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
-
-        // Verify tensor1
-        let final_tensor1 = final_safetensors.tensor("tensor1").unwrap();
-        assert_eq!(
-            final_tensor1.shape(),
-            vec![8, 4],
-            "Strategy {}: tensor1 shape mismatch",
-            strategy_name
-        );
-        assert_eq!(
-            final_tensor1.dtype(),
-            Dtype::F32,
-            "Strategy {}: tensor1 dtype mismatch",
-            strategy_name
-        );
-        let final_tensor1_data: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                final_tensor1.data().as_ptr() as *const f32,
-                final_tensor1.data().len() / 4,
-            )
-        };
-        assert_eq!(
-            final_tensor1_data, tensor1_data,
-            "Strategy {}: tensor1 data mismatch",
-            strategy_name
-        );
-
-        // Verify tensor2
-        let final_tensor2 = final_safetensors.tensor("tensor2").unwrap();
-        assert_eq!(
-            final_tensor2.shape(),
-            vec![4, 8],
-            "Strategy {}: tensor2 shape mismatch",
-            strategy_name
-        );
-        assert_eq!(
-            final_tensor2.dtype(),
-            Dtype::F32,
-            "Strategy {}: tensor2 dtype mismatch",
-            strategy_name
-        );
-        let final_tensor2_data: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                final_tensor2.data().as_ptr() as *const f32,
-                final_tensor2.data().len() / 4,
-            )
-        };
-        assert_eq!(
-            final_tensor2_data, tensor2_data,
-            "Strategy {}: tensor2 data mismatch",
-            strategy_name
-        );
-
-        trace!("✅ Strategy {} round-trip test passed!", strategy_name);
-    }
-
-    #[tokio::test]
-    async fn test_redistribution_read_serial_write_unordered_strategy_roundtrip() {
-        let (
-            source_dir,
-            original_hash,
-            distributed_topology,
-            final_topology,
-            tensor1_data,
-            tensor2_data,
-        ) = setup_roundtrip_test_data().await;
-
-        run_strategy_roundtrip_test(
-            RedistributionStrategy::ReadSerialWriteUnordered,
-            "ReadSerialWriteUnordered",
-            source_dir.path(),
-            &original_hash,
-            &distributed_topology,
-            &final_topology,
-            &tensor1_data,
-            &tensor2_data,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_redistribution_read_unordered_write_serial_strategy_roundtrip() {
-        let (
-            source_dir,
-            original_hash,
-            distributed_topology,
-            final_topology,
-            tensor1_data,
-            tensor2_data,
-        ) = setup_roundtrip_test_data().await;
-
-        run_strategy_roundtrip_test(
-            RedistributionStrategy::ReadUnorderedWriteSerial,
-            "ReadUnorderedWriteSerial",
-            source_dir.path(),
-            &original_hash,
-            &distributed_topology,
-            &final_topology,
-            &tensor1_data,
-            &tensor2_data,
-        )
-        .await;
     }
 
     #[test]

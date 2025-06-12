@@ -15,20 +15,20 @@ use tokio::task::JoinError;
 // Re-export main types
 pub use core::AsyncTensorRedistributor;
 
-/// Strategy for ordering reads and writes during redistribution
-#[derive(Clone, Copy, Debug)]
-pub enum RedistributionStrategy {
-    /// Read files sequentially, write tasks can execute unordered
-    ReadSerialWriteUnordered,
-    /// Read tasks can execute unordered, but write tasks execute serially  
-    ReadUnorderedWriteSerial,
-}
+// /// Strategy for ordering reads and writes during redistribution
+// #[derive(Clone, Copy, Debug)]
+// pub enum RedistributionStrategy {
+//     /// Read files sequentially, write tasks can execute unordered
+//     ReadSerialWriteUnordered,
+//     /// Read tasks can execute unordered, but write tasks execute serially
+//     ReadUnorderedWriteSerial,
+// }
 
-impl Default for RedistributionStrategy {
-    fn default() -> Self {
-        Self::ReadUnorderedWriteSerial
-    }
-}
+// impl Default for RedistributionStrategy {
+//     fn default() -> Self {
+//         Self::ReadUnorderedWriteSerial
+//     }
+// }
 
 /// Structure for deserializing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
@@ -118,48 +118,6 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
         let content = std::fs::read_to_string(topology_path)?;
         let topology: Topology = serde_json::from_str(&content)?;
         return Ok(topology);
-    }
-
-    // Try to detect from rank files
-    let mut rank_files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("rank") && name.ends_with(".safetensors") {
-                rank_files.push(path);
-            }
-        }
-    }
-
-    if !rank_files.is_empty() {
-        rank_files.sort();
-        // Load topology from rank files - create a distributed topology
-        use std::collections::BTreeMap;
-        let mut tensors = BTreeMap::new();
-        let mut filenames = Vec::new();
-
-        for (file_index, file_path) in rank_files.iter().enumerate() {
-            let filename = file_path.file_name().unwrap().to_str().unwrap().to_string();
-            filenames.push(filename);
-
-            let (_, metadata) = safetensors_metadata(file_path)?;
-            for (tensor_name, tensor_info) in metadata.tensors() {
-                // For now, treat as shared tensors across ranks
-                // TODO: This should be improved to detect actual distribution
-                tensors.insert(
-                    tensor_name.clone(),
-                    crate::topology::Tensor::Shared(crate::topology::SharedInfo::new(
-                        tensor_info.shape.clone(),
-                        tensor_info.dtype,
-                        vec![file_index],
-                    )),
-                );
-            }
-        }
-
-        return crate::topology::Topology::new(tensors, filenames, rank_files.len())
-            .map_err(RedistributorError::Topology);
     }
 
     // Try model.safetensors.index.json (chunked safetensors case)
