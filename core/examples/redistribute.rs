@@ -141,8 +141,6 @@ async fn redistribute_model_from_local<P: AsRef<Path>>(
         "Target topology will have {} ranks",
         target_topology.world_size()
     );
-    println!("Source {source_topology:#?}");
-    println!("Target {target_topology:#?}");
 
     // Create and run the async redistributor
     let mut redistributor = Redistributor::from_local(input_dir, output_dir, target_topology)?;
