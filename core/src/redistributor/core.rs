@@ -90,9 +90,9 @@ impl Redistributor {
 
         let (tx, mut rx) = channel::<Task>(10_000);
 
-        // Estimate of the data needed to be copied.
+        // Estimate of the data needed to be written.
         let mut total = 0u64;
-        for (header_size, metadata) in &self.source.layout.metadatas {
+        for (header_size, metadata) in &self.target.layout.metadatas {
             // Find the maximum data end offset in this file
             let max_data_end = metadata
                 .tensors()
@@ -133,7 +133,6 @@ impl Redistributor {
 
         drop(tx);
         handle.await??;
-        progress.set_length(progress.position());
         progress.set_message("Done, kernel flush...");
 
         self.target
