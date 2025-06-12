@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-reqwest = { workspace = true }
 tokio = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
@@ -12,16 +11,13 @@ thiserror = { workspace = true }
 futures-util = { workspace = true }
 indicatif = { workspace = true }
 serde = { workspace = true }
-hf-hub = { workspace = true }
-url = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 memmap2 = { workspace = true }
-clap = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
+clap = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 anyhow = { workspace = true }

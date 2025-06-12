@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3", "abi3-py38"] }
 safetensors_distributed = { path = "../core" }
-reqwest = { workspace = true }
 tokio = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
@@ -14,6 +13,5 @@ thiserror = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
