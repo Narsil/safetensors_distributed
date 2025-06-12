@@ -773,6 +773,64 @@ mod tests {
             "Should have substantial intersection"
         );
     }
+
+    #[test]
+    fn test_find_contiguous_blocks_dimension_1_split_bug() {
+        // This test reproduces the exact bug: incorrect contiguous block calculation
+        // for tensors split along dimension 1 (columns)
+        
+        use crate::topology::Chunk;
+        
+        // Tensor: 2x8 with strides [8, 1]
+        let full_shape = [2, 8];
+        let strides = [8, 1];
+        
+        // Source chunk: [0, 4] with shape [2, 4] (columns 4-7 of full tensor)
+        let source_chunk = Chunk::new(vec![0, 4], vec![2, 4], 1);
+        
+        // Target chunk: [0, 0] with shape [2, 8] (full tensor)
+        let target_chunk = Chunk::new(vec![0, 0], vec![2, 8], 0);
+        
+        // Intersection: starts at [0, 4], size [2, 4]
+        let intersect_start = [0, 4];
+        let intersect_size = [2, 4];
+        
+        println!("Test case:");
+        println!("  Full shape: {:?}, strides: {:?}", full_shape, strides);
+        println!("  Source chunk: offsets={:?}, shape={:?}", source_chunk.offsets(), source_chunk.shape());
+        println!("  Target chunk: offsets={:?}, shape={:?}", target_chunk.offsets(), target_chunk.shape());
+        println!("  Intersection: start={:?}, size={:?}", intersect_start, intersect_size);
+        
+        let blocks = super::find_contiguous_blocks(
+            &intersect_start,
+            &intersect_size,
+            &source_chunk,
+            &target_chunk,
+            &strides,
+        );
+        
+        println!("  Computed blocks: {:?}", blocks);
+        
+        // The bug: it creates 1 block of length 8 instead of 2 blocks of length 4
+        // Expected: 2 separate blocks (one per row)
+        // - Block 1: Row 0, cols 4-7 → source_offset=0, target_offset=4, length=4  
+        // - Block 2: Row 1, cols 4-7 → source_offset=4, target_offset=12, length=4
+        
+        // Actual (buggy): 1 block → source_offset=0, target_offset=4, length=8
+        // This causes row 1 data to overwrite part of row 0!
+        
+        assert_eq!(blocks.len(), 2, "Should have 2 blocks, one per row");
+        
+        // Block 0: Row 0, columns 4-7
+        assert_eq!(blocks[0].source_offset, 0);
+        assert_eq!(blocks[0].target_offset, 4);
+        assert_eq!(blocks[0].length, 4);
+        
+        // Block 1: Row 1, columns 4-7  
+        assert_eq!(blocks[1].source_offset, 4);
+        assert_eq!(blocks[1].target_offset, 12); // Row 1 starts at offset 8, plus 4 columns = 12
+        assert_eq!(blocks[1].length, 4);
+    }
 }
 
 /// Specialized function to directly compute read byte ranges from chunk intersection
@@ -1034,6 +1092,21 @@ fn find_innermost_contiguous_dim(
 ) -> usize {
     let ndim = intersect_start.len();
 
+    // Conservative fix: if intersection spans multiple elements in multiple dimensions,
+    // be cautious about contiguity to avoid the bug where non-contiguous memory
+    // regions are treated as contiguous blocks
+    let multi_dim_intersection = intersect_size.iter()
+        .filter(|&&size| size > 1)
+        .count() > 1;
+        
+    if multi_dim_intersection {
+        // Only treat the innermost dimension as potentially contiguous
+        // This prevents incorrect merging of memory regions that have gaps
+        // (like when splitting along dimension 1 in a 2D tensor)
+        return ndim - 1;
+    }
+
+    // Original logic for simple cases (single dimension or single element intersections)
     for dim in (0..ndim).rev() {
         // Check if this dimension is fully spanned in both chunks
         let source_spans_full = (intersect_start[dim] == source_chunk.offsets()[dim])
@@ -1053,11 +1126,21 @@ fn find_innermost_contiguous_dim(
 fn calculate_chunk_offset(
     coords: &[usize],
     chunk: &crate::topology::Chunk,
-    strides: &[usize],
+    _full_tensor_strides: &[usize],
 ) -> usize {
     let mut offset = 0;
+    
+    // Calculate strides for this specific chunk based on its shape
+    let ndim = chunk.shape().len();
+    let mut chunk_strides = vec![1; ndim];
+    for i in (0..ndim - 1).rev() {
+        chunk_strides[i] = chunk_strides[i + 1] * chunk.shape()[i + 1];
+    }
+    
     for (dim, &coord) in coords.iter().enumerate() {
-        offset += (coord - chunk.offsets()[dim]) * strides[dim];
+        let chunk_coord = coord - chunk.offsets()[dim];
+        let contribution = chunk_coord * chunk_strides[dim];
+        offset += contribution;
     }
     offset
 }
@@ -1077,7 +1160,7 @@ fn generate_blocks_recursive(
         // Calculate contiguous block size from this dimension onwards
         let block_length: usize = intersect_size[dim_idx..].iter().product();
 
-        // Calculate current coordinates
+        // Use the current coordinates (passed down from recursion)
         let coords = intersect_start;
 
         let source_offset = calculate_chunk_offset(&coords, source_chunk, strides);
@@ -1096,7 +1179,7 @@ fn generate_blocks_recursive(
         let mut coords = intersect_start.to_vec();
         coords[dim_idx] = intersect_start[dim_idx] + i;
 
-        // Recursively process next dimension
+        // Recursively process next dimension with updated coordinates
         generate_blocks_recursive(
             dim_idx + 1,
             contiguous_from_dim,

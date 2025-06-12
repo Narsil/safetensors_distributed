@@ -422,14 +422,12 @@ impl Redistributor {
                 source_ranges.extend(byte_ranges);
 
                 // Add the source mmap and record how many ranges belong to this file
-                // task_source.add_from_location(&self.source.location, source_file_index);
                 let SourceLocation::Local { mmaps } = &self.source.location else {
                     unreachable!();
                 };
                 task_source.push(Arc::clone(&mmaps[source_file_index]));
                 ranges_per_file.push(ranges_for_this_file);
             }
-            // println!("Loop {:?}", start.elapsed());
         }
 
         Ok(())
@@ -921,5 +919,360 @@ mod tests {
 
         let result = intersection(&source_intervals, &target_intervals);
         assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_redistribution_round_trip_bug_case() {
+        // This test case replicates the exact tensor patterns that exposed the bug:
+        // - 'down' tensor: 8x2 with values 0-15 (torch.arange(16).view(8,2))
+        // - 'up' tensor: 2x8 with values 0,2,4,...,30 (torch.arange(16)*2).view(2,8))
+
+        // Create temp directories
+        let source_dir = TempDir::new().unwrap();
+        let distributed_dir = TempDir::new().unwrap();
+        let final_dir = TempDir::new().unwrap();
+
+        // Step 1: Create original model.safetensors with the exact bug case tensors
+        // 'down' tensor: 8x2 = 16 elements, values 0.0 to 15.0
+        let down_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+
+        // 'up' tensor: 2x8 = 16 elements, values 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+        let up_data: Vec<f32> = (0..16).map(|i| (i * 2) as f32).collect();
+
+        let down_bytes = f32s_to_le_bytes(&down_data);
+        let up_bytes = f32s_to_le_bytes(&up_data);
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "down".to_string(),
+            TensorView::new(Dtype::F32, vec![8, 2], &down_bytes).unwrap(),
+        );
+        tensors.insert(
+            "up".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 8], &up_bytes).unwrap(),
+        );
+
+        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_path = source_dir.path().join("model.safetensors");
+        tokio::fs::write(&original_path, &original_bytes)
+            .await
+            .unwrap();
+
+        // Calculate hash of original file
+        let original_hash = calculate_file_hash(&original_path).await;
+
+        // Step 2: Create target topology for 2 ranks
+        // Split 'down' tensor (8x2) along first dimension: first 4 rows to rank0, last 4 rows to rank1
+        // Split 'up' tensor (2x8) along second dimension: first 4 cols to rank0, last 4 cols to rank1
+        let mut target_tensors = BTreeMap::new();
+
+        target_tensors.insert(
+            "down".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![8, 2],
+                Dtype::F32,
+                vec![
+                    Chunk::new(vec![0, 0], vec![4, 2], 0), // First 4 rows to rank 0
+                    Chunk::new(vec![4, 0], vec![4, 2], 1), // Last 4 rows to rank 1
+                ],
+            )),
+        );
+
+        target_tensors.insert(
+            "up".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![2, 8],
+                Dtype::F32,
+                vec![
+                    Chunk::new(vec![0, 0], vec![2, 4], 0), // First 4 columns to rank 0
+                    Chunk::new(vec![0, 4], vec![2, 4], 1), // Last 4 columns to rank 1
+                ],
+            )),
+        );
+
+        let distributed_topology = Topology::new(
+            target_tensors,
+            vec![
+                "rank0.safetensors".to_string(),
+                "rank1.safetensors".to_string(),
+            ],
+            2,
+        )
+        .unwrap();
+
+        // Step 3: Redistribute from single file to 2 ranks
+        let mut redistributor1 = Redistributor::from_local(
+            source_dir.path(),
+            distributed_dir.path(),
+            distributed_topology,
+        )
+        .unwrap();
+
+        redistributor1.redistribute().await.unwrap();
+
+        // Step 4: Create target topology for reconstruction back to 1 rank
+        let mut final_tensors = BTreeMap::new();
+        final_tensors.insert(
+            "down".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![8, 2],
+                Dtype::F32,
+                vec![Chunk::new(vec![0, 0], vec![8, 2], 0)],
+            )),
+        );
+        final_tensors.insert(
+            "up".to_string(),
+            Tensor::Shared(SharedInfo::new(vec![2, 8], Dtype::F32, vec![0])),
+        );
+
+        let final_topology =
+            Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
+
+        // Step 5: Redistribute from 2 ranks back to single file
+        let mut redistributor2 =
+            Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
+                .unwrap();
+
+        redistributor2.redistribute().await.unwrap();
+
+        // Verify final file exists
+        let final_path = final_dir.path().join("model.safetensors");
+        assert!(final_path.exists());
+
+        // Step 6: Calculate hash of final file and compare
+        let final_hash = calculate_file_hash(&final_path).await;
+
+        // This assertion should FAIL and expose the bug
+        assert_eq!(
+            original_hash, final_hash,
+            "BUG DETECTED: Round-trip redistribution corrupted file integrity for 8x2/2x8 tensors"
+        );
+
+        // Step 7: Additional verification - load and compare tensor data element by element
+        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
+
+        // Verify 'down' tensor
+        let final_down = final_safetensors.tensor("down").unwrap();
+        assert_eq!(final_down.shape(), vec![8, 2]);
+        assert_eq!(final_down.dtype(), Dtype::F32);
+        let final_down_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_down.data().as_ptr() as *const f32,
+                final_down.data().len() / 4,
+            )
+        };
+        assert_eq!(
+            final_down_data,
+            down_data.as_slice(),
+            "BUG DETECTED: 'down' tensor values corrupted after round-trip redistribution"
+        );
+
+        // Verify 'up' tensor - this should expose the bug
+        let final_up = final_safetensors.tensor("up").unwrap();
+        assert_eq!(final_up.shape(), vec![2, 8]);
+        assert_eq!(final_up.dtype(), Dtype::F32);
+        let final_up_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_up.data().as_ptr() as *const f32,
+                final_up.data().len() / 4,
+            )
+        };
+
+        // This assertion should FAIL and show the exact bug
+        assert_eq!(
+            final_up_data,
+            up_data.as_slice(),
+            "BUG DETECTED: 'up' tensor values corrupted after round-trip redistribution.\nOriginal: {:?}\nReconstructed: {:?}",
+            up_data,
+            final_up_data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redistribution_round_trip_example_logic() {
+        // This test replicates the exact logic used by the redistribute example
+        // which uses determine_split_dimension() to decide how to split tensors
+
+        // Create temp directories
+        let source_dir = TempDir::new().unwrap();
+        let distributed_dir = TempDir::new().unwrap();
+        let final_dir = TempDir::new().unwrap();
+
+        // Step 1: Create original model.safetensors with the exact bug case tensors
+        // 'down' tensor: 8x2 = 16 elements, values 0.0 to 15.0
+        let down_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+
+        // 'up' tensor: 2x8 = 16 elements, values 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+        let up_data: Vec<f32> = (0..16).map(|i| (i * 2) as f32).collect();
+
+        let down_bytes = f32s_to_le_bytes(&down_data);
+        let up_bytes = f32s_to_le_bytes(&up_data);
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "down".to_string(),
+            TensorView::new(Dtype::F32, vec![8, 2], &down_bytes).unwrap(),
+        );
+        tensors.insert(
+            "up".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 8], &up_bytes).unwrap(),
+        );
+
+        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_path = source_dir.path().join("model.safetensors");
+        tokio::fs::write(&original_path, &original_bytes)
+            .await
+            .unwrap();
+
+        // Calculate hash of original file
+        let original_hash = calculate_file_hash(&original_path).await;
+
+        // Step 2: Create target topology for 2 ranks using the SAME LOGIC as the redistribute example
+        // "down" tensor: determine_split_dimension() returns Some(0) -> split along dimension 0
+        // "up" tensor: determine_split_dimension() returns Some(1) -> split along dimension 1
+
+        let mut target_tensors = BTreeMap::new();
+        let target_world_size = 2;
+
+        // 'down' tensor (8x2) split along dimension 0: 8/2 = 4 rows per rank
+        let down_chunk_size_per_rank = 8 / target_world_size;
+        let down_chunks = vec![
+            Chunk::new(vec![0, 0], vec![down_chunk_size_per_rank, 2], 0), // Rows 0-3 to rank 0
+            Chunk::new(
+                vec![down_chunk_size_per_rank, 0],
+                vec![down_chunk_size_per_rank, 2],
+                1,
+            ), // Rows 4-7 to rank 1
+        ];
+        target_tensors.insert(
+            "down".to_string(),
+            Tensor::Distributed(DistributedInfo::new(vec![8, 2], Dtype::F32, down_chunks)),
+        );
+
+        // 'up' tensor (2x8) split along dimension 1: 8/2 = 4 columns per rank
+        let up_chunk_size_per_rank = 8 / target_world_size;
+        let up_chunks = vec![
+            Chunk::new(vec![0, 0], vec![2, up_chunk_size_per_rank], 0), // Cols 0-3 to rank 0
+            Chunk::new(
+                vec![0, up_chunk_size_per_rank],
+                vec![2, up_chunk_size_per_rank],
+                1,
+            ), // Cols 4-7 to rank 1
+        ];
+        target_tensors.insert(
+            "up".to_string(),
+            Tensor::Distributed(DistributedInfo::new(vec![2, 8], Dtype::F32, up_chunks)),
+        );
+
+        let distributed_topology = Topology::new(
+            target_tensors,
+            vec![
+                "rank0.safetensors".to_string(),
+                "rank1.safetensors".to_string(),
+            ],
+            2,
+        )
+        .unwrap();
+
+        // Step 3: Redistribute from single file to 2 ranks
+        let mut redistributor1 = Redistributor::from_local(
+            source_dir.path(),
+            distributed_dir.path(),
+            distributed_topology,
+        )
+        .unwrap();
+
+        redistributor1.redistribute().await.unwrap();
+
+        // Step 4: Create target topology for reconstruction back to 1 rank
+        // This uses the EXACT same logic as the redistribute example for target_world_size = 1
+        // Even with world_size=1, it still creates Distributed tensors with single chunks based on split dimensions
+        let mut final_tensors = BTreeMap::new();
+
+        // "down" tensor: determine_split_dimension("down") returns Some(0) -> still creates distributed with single chunk
+        final_tensors.insert(
+            "down".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![8, 2],
+                Dtype::F32,
+                vec![Chunk::new(vec![0, 0], vec![8, 2], 0)], // Single chunk covering full tensor
+            )),
+        );
+
+        // "up" tensor: determine_split_dimension("up") returns Some(1) -> still creates distributed with single chunk
+        final_tensors.insert(
+            "up".to_string(),
+            Tensor::Distributed(DistributedInfo::new(
+                vec![2, 8],
+                Dtype::F32,
+                vec![Chunk::new(vec![0, 0], vec![2, 8], 0)], // Single chunk covering full tensor
+            )),
+        );
+
+        let final_topology =
+            Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
+
+        // Step 5: Redistribute from 2 ranks back to single file
+        let mut redistributor2 =
+            Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
+                .unwrap();
+
+        redistributor2.redistribute().await.unwrap();
+
+        // Verify final file exists
+        let final_path = final_dir.path().join("model.safetensors");
+        assert!(final_path.exists());
+
+        // Step 6: Calculate hash of final file and compare
+        let final_hash = calculate_file_hash(&final_path).await;
+
+        // This assertion should FAIL and expose the bug
+        assert_eq!(
+            original_hash, final_hash,
+            "BUG DETECTED: Round-trip redistribution corrupted file integrity for redistribute example logic"
+        );
+
+        // Step 7: Additional verification - load and compare tensor data element by element
+        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
+
+        // Verify 'down' tensor
+        let final_down = final_safetensors.tensor("down").unwrap();
+        assert_eq!(final_down.shape(), vec![8, 2]);
+        assert_eq!(final_down.dtype(), Dtype::F32);
+        let final_down_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_down.data().as_ptr() as *const f32,
+                final_down.data().len() / 4,
+            )
+        };
+        assert_eq!(
+            final_down_data,
+            down_data.as_slice(),
+            "BUG DETECTED: 'down' tensor values corrupted after round-trip redistribution.\nOriginal: {:?}\nReconstructed: {:?}",
+            down_data,
+            final_down_data
+        );
+
+        // Verify 'up' tensor - this should expose the bug
+        let final_up = final_safetensors.tensor("up").unwrap();
+        assert_eq!(final_up.shape(), vec![2, 8]);
+        assert_eq!(final_up.dtype(), Dtype::F32);
+        let final_up_data: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                final_up.data().as_ptr() as *const f32,
+                final_up.data().len() / 4,
+            )
+        };
+
+        // This assertion should FAIL and show the exact bug
+        assert_eq!(
+            final_up_data,
+            up_data.as_slice(),
+            "BUG DETECTED: 'up' tensor values corrupted after round-trip redistribution.\nOriginal: {:?}\nReconstructed: {:?}",
+            up_data,
+            final_up_data
+        );
     }
 }
