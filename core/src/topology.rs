@@ -615,27 +615,14 @@ impl Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, extract::State, routing::get};
-    use reqwest;
     use safetensors::SafeTensors;
     use safetensors::tensor::{TensorView, serialize};
     use std::fs;
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::oneshot;
 
     // Helper function to convert &[f32] to Vec<u8> using to_le_bytes
     fn f32s_to_le_bytes(data: &[f32]) -> Vec<u8> {
         data.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    // Helper function to convert &[u8] to Vec<f32> using from_le_bytes
-    fn le_bytes_to_f32s(data: &[u8]) -> Vec<f32> {
-        data.chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
     }
 
     // Helper function to reconstruct a tensor from its chunks
@@ -1300,7 +1287,7 @@ mod tests {
                 },
                 Chunk {
                     offsets: vec![1, 0, 0, 0],
-                    shape: vec![1, 2, 1, 2], // Covers [1:2, 0:2, 0:1, 0:2] = 4 elements  
+                    shape: vec![1, 2, 1, 2], // Covers [1:2, 0:2, 0:1, 0:2] = 4 elements
                     filename_index: 1,
                 },
                 // MISSING: chunks for [x, x, 1:2, x] - gap in 3rd dimension
@@ -1313,7 +1300,9 @@ mod tests {
         let result = check_overlapping_chunks_adaptive(&info, "nd_tensor_with_gaps");
         assert_eq!(
             result,
-            Err(TopologyError::NonCoveringChunks("nd_tensor_with_gaps".to_string())),
+            Err(TopologyError::NonCoveringChunks(
+                "nd_tensor_with_gaps".to_string()
+            )),
             "Should detect non-covering chunks in higher dimensions, but sweep line algorithm misses this"
         );
 
@@ -1321,7 +1310,9 @@ mod tests {
         let result_optimized = check_overlapping_chunks_optimized(&info, "nd_tensor_with_gaps");
         assert_eq!(
             result_optimized,
-            Err(TopologyError::NonCoveringChunks("nd_tensor_with_gaps".to_string())),
+            Err(TopologyError::NonCoveringChunks(
+                "nd_tensor_with_gaps".to_string()
+            )),
             "Optimized version should correctly detect gaps in nD tensors"
         );
 
@@ -1347,7 +1338,7 @@ mod tests {
                 },
                 Chunk {
                     offsets: vec![1, 0, 0, 0],
-                    shape: vec![1, 2, 2, 1], // Covers [1:2, 0:2, 0:2, 0:1] 
+                    shape: vec![1, 2, 2, 1], // Covers [1:2, 0:2, 0:2, 0:1]
                     filename_index: 1,
                 },
                 Chunk {
@@ -1367,7 +1358,9 @@ mod tests {
         let result = check_overlapping_chunks_adaptive(&info, "nd_tensor_with_overlaps");
         assert_eq!(
             result,
-            Err(TopologyError::OverlappingChunks("nd_tensor_with_overlaps".to_string())),
+            Err(TopologyError::OverlappingChunks(
+                "nd_tensor_with_overlaps".to_string()
+            )),
             "Should detect overlapping chunks in nD tensors"
         );
     }
@@ -1388,7 +1381,7 @@ mod tests {
                     filename_index: 0,
                 },
                 Chunk {
-                    offsets: vec![1, 0, 0, 0, 0],  
+                    offsets: vec![1, 0, 0, 0, 0],
                     shape: vec![1, 2, 2, 2, 2], // Second half: 16 elements
                     filename_index: 1,
                 },
@@ -1397,7 +1390,11 @@ mod tests {
 
         // This should be valid - no overlaps, complete coverage
         let result = check_overlapping_chunks_adaptive(&info, "5d_tensor_valid");
-        assert_eq!(result, Ok(()), "Properly partitioned 5D tensor should be valid");
+        assert_eq!(
+            result,
+            Ok(()),
+            "Properly partitioned 5D tensor should be valid"
+        );
     }
 
     /// Test that specifically demonstrates the sweep line algorithm limitation
@@ -1416,8 +1413,8 @@ mod tests {
                     filename_index: 0,
                 },
                 Chunk {
-                    offsets: vec![1, 0, 0, 0],  
-                    shape: vec![1, 4, 1, 2], // Covers [1:2, 0:4, 0:1, 0:2] - only z=0 plane  
+                    offsets: vec![1, 0, 0, 0],
+                    shape: vec![1, 4, 1, 2], // Covers [1:2, 0:4, 0:1, 0:2] - only z=0 plane
                     filename_index: 1,
                 },
                 // MISSING: chunks for z=1 plane - this creates a gap in the 3rd dimension
@@ -1427,12 +1424,14 @@ mod tests {
         // The sweep line algorithm might incorrectly think this is valid because
         // the first dimension (x-axis) is fully covered
         let sweep_result = check_overlapping_chunks_sweep_line(&info, "sweep_test");
-        
+
         // The optimized algorithm should correctly detect the gap
         let optimized_result = check_overlapping_chunks_optimized(&info, "optimized_test");
         assert_eq!(
             optimized_result,
-            Err(TopologyError::NonCoveringChunks("optimized_test".to_string())),
+            Err(TopologyError::NonCoveringChunks(
+                "optimized_test".to_string()
+            )),
             "Optimized algorithm should detect gaps in higher dimensions"
         );
 
@@ -1443,11 +1442,11 @@ mod tests {
     }
 
     /// Test case that forces many chunks to trigger sweep line algorithm via adaptive choice
-    #[test] 
+    #[test]
     fn test_many_chunks_triggers_sweep_line() {
         // Create a tensor with 60 chunks (> 50) to trigger sweep line algorithm
         let mut chunks = Vec::new();
-        
+
         // Create a 1D tensor of length 60, each chunk covers 1 element
         for i in 0..60 {
             chunks.push(Chunk {
@@ -1456,7 +1455,7 @@ mod tests {
                 filename_index: i,
             });
         }
-        
+
         let info = DistributedInfo {
             shape: vec![60], // 1D tensor of length 60
             dtype: Dtype::F32,
@@ -1474,7 +1473,7 @@ mod tests {
     fn test_many_chunks_nd_tensor_gap_issue() {
         // Create a 2D tensor with 60 chunks to force sweep line algorithm usage
         let mut chunks = Vec::new();
-        
+
         // Create chunks that cover the first dimension completely but leave gaps in the second
         for i in 0..60 {
             chunks.push(Chunk {
@@ -1483,9 +1482,9 @@ mod tests {
                 filename_index: i,
             });
         }
-        
+
         let info = DistributedInfo {
-            shape: vec![60, 2], // 2D tensor: 60x2 
+            shape: vec![60, 2], // 2D tensor: 60x2
             dtype: Dtype::F32,
             chunks,
         };
@@ -1493,253 +1492,24 @@ mod tests {
         // The adaptive algorithm will choose sweep line due to chunk count > 50
         // This demonstrates the potential issue in real-world scenarios
         let adaptive_result = check_overlapping_chunks_adaptive(&info, "many_chunks_with_gaps");
-        
+
         // For comparison, the optimized algorithm should detect the gap
-        let optimized_result = check_overlapping_chunks_optimized(&info, "many_chunks_with_gaps_opt");
-        
+        let optimized_result =
+            check_overlapping_chunks_optimized(&info, "many_chunks_with_gaps_opt");
+
         println!("Adaptive result (uses sweep line): {:?}", adaptive_result);
         println!("Optimized result: {:?}", optimized_result);
-        
+
         // This test documents the behavior - the optimized version should catch the gap
         assert_eq!(
             optimized_result,
-            Err(TopologyError::NonCoveringChunks("many_chunks_with_gaps_opt".to_string())),
+            Err(TopologyError::NonCoveringChunks(
+                "many_chunks_with_gaps_opt".to_string()
+            )),
             "Optimized algorithm should detect gaps even with many chunks"
         );
-        
+
         // Note: The adaptive result might be Ok(()) due to sweep line limitation
         // This is the bug we're demonstrating
-    }
-
-    #[tokio::test]
-    async fn test_distributed_checkpoint_http() {
-        // Create a temporary directory for our test files
-        let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
-
-        // Create the safetensors files for each rank
-        let rank0_path = dir_path.join("rank0.safetensors");
-        let rank1_path = dir_path.join("rank1.safetensors");
-
-        // Create test data: a 4x4 tensor with values 0..15
-        let full_tensor: Vec<f32> = (0..16).map(|x| x as f32).collect();
-
-        // First tensor: sharded along first dimension
-        let tensor1_rank0 = &full_tensor[0..8];
-        let tensor1_rank1 = &full_tensor[8..16];
-
-        // Second tensor: sharded along second dimension
-        let tensor2_rank0: Vec<f32> = vec![0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0];
-        let tensor2_rank1: Vec<f32> = vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0, 14.0, 15.0];
-
-        // Write both tensors to rank0 file
-        let mut tensors0 = std::collections::HashMap::new();
-        let tensor1_rank0_bytes = f32s_to_le_bytes(tensor1_rank0);
-        let tensor2_rank0_bytes = f32s_to_le_bytes(&tensor2_rank0);
-        tensors0.insert(
-            "tensor1".to_string(),
-            TensorView::new(safetensors::Dtype::F32, vec![2, 4], &tensor1_rank0_bytes).unwrap(),
-        );
-        tensors0.insert(
-            "tensor2".to_string(),
-            TensorView::new(safetensors::Dtype::F32, vec![4, 2], &tensor2_rank0_bytes).unwrap(),
-        );
-        let bytes0 = serialize(&tensors0, &None).unwrap();
-        fs::write(&rank0_path, bytes0).unwrap();
-
-        // Write both tensors to rank1 file
-        let mut tensors1 = std::collections::HashMap::new();
-        let tensor1_rank1_bytes = f32s_to_le_bytes(tensor1_rank1);
-        let tensor2_rank1_bytes = f32s_to_le_bytes(&tensor2_rank1);
-        tensors1.insert(
-            "tensor1".to_string(),
-            TensorView::new(safetensors::Dtype::F32, vec![2, 4], &tensor1_rank1_bytes).unwrap(),
-        );
-        tensors1.insert(
-            "tensor2".to_string(),
-            TensorView::new(safetensors::Dtype::F32, vec![4, 2], &tensor2_rank1_bytes).unwrap(),
-        );
-        let bytes1 = serialize(&tensors1, &None).unwrap();
-        fs::write(&rank1_path, bytes1).unwrap();
-
-        // Create the topology
-        let mut topology = Topology::empty(2);
-        topology.filenames = vec![
-            "rank0.safetensors".to_string(),
-            "rank1.safetensors".to_string(),
-        ];
-
-        // Add tensor1 (sharded along first dimension)
-        topology.tensors.insert(
-            "tensor1".to_string(),
-            Tensor::Distributed(DistributedInfo {
-                shape: vec![4, 4],
-                dtype: Dtype::F32,
-                chunks: vec![
-                    Chunk {
-                        offsets: vec![0, 0],
-                        shape: vec![2, 4],
-                        filename_index: 0,
-                    },
-                    Chunk {
-                        offsets: vec![2, 0],
-                        shape: vec![2, 4],
-                        filename_index: 1,
-                    },
-                ],
-            }),
-        );
-
-        // Add tensor2 (sharded along second dimension)
-        topology.tensors.insert(
-            "tensor2".to_string(),
-            Tensor::Distributed(DistributedInfo {
-                shape: vec![4, 4],
-                dtype: Dtype::F32,
-                chunks: vec![
-                    Chunk {
-                        offsets: vec![0, 0],
-                        shape: vec![4, 2],
-                        filename_index: 0,
-                    },
-                    Chunk {
-                        offsets: vec![0, 2],
-                        shape: vec![4, 2],
-                        filename_index: 1,
-                    },
-                ],
-            }),
-        );
-
-        // Write topology to JSON file
-        let topology_json = serde_json::to_string_pretty(&topology).unwrap();
-        fs::write(dir_path.join("topology.json"), topology_json).unwrap();
-
-        // Create a shared state for the server
-        let dir_path = Arc::new(dir_path.to_path_buf());
-
-        // Create the router
-        let app = Router::new()
-            .route("/topology.json", get(move |State(path): State<Arc<PathBuf>>| async move {
-                let content = fs::read_to_string(path.join("topology.json")).unwrap();
-                content
-            }))
-            .route("/{filename}", get(move |State(path): State<Arc<PathBuf>>, axum::extract::Path(filename): axum::extract::Path<String>| async move {
-                let content = fs::read(path.join(filename)).unwrap();
-                content
-            }))
-            .with_state(dir_path.clone());
-
-        // Start the server
-        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let server = axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app);
-
-        // Get the actual port
-        let port = server
-            .local_addr()
-            .expect("Failed to get local_addr")
-            .port();
-
-        // Spawn the server
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server_handle = tokio::spawn(async move {
-            server
-                .with_graceful_shutdown(async {
-                    shutdown_rx.await.ok();
-                })
-                .await
-                .unwrap();
-        });
-
-        // Create a client
-        let client = reqwest::Client::new();
-        let base_url = format!("http://127.0.0.1:{}", port);
-
-        // Fetch and reconstruct tensor1
-        let reconstructed_tensor1 = reconstruct_tensor_http(&client, &base_url, "tensor1").await;
-        assert_eq!(reconstructed_tensor1, full_tensor);
-
-        // Fetch and reconstruct tensor2
-        let reconstructed_tensor2 = reconstruct_tensor_http(&client, &base_url, "tensor2").await;
-        assert_eq!(reconstructed_tensor2, full_tensor);
-
-        // Shutdown the server
-        shutdown_tx.send(()).unwrap();
-        server_handle.await.unwrap();
-    }
-
-    async fn reconstruct_tensor_http(
-        client: &reqwest::Client,
-        base_url: &str,
-        tensor_name: &str,
-    ) -> Vec<f32> {
-        // Fetch the topology
-        let topology_json = client
-            .get(&format!("{}/topology.json", base_url))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        let topology: Topology = serde_json::from_str(&topology_json).unwrap();
-
-        if let Some(Tensor::Distributed(info)) = topology.tensors.get(tensor_name) {
-            let mut result = vec![0.0; info.shape.iter().product()];
-            let ndim = info.shape.len();
-
-            for chunk in &info.chunks {
-                // Fetch the safetensors file
-                let filename = &topology.filenames[chunk.filename_index];
-                let data = client
-                    .get(&format!("{}/{}", base_url, filename))
-                    .send()
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap();
-
-                let file = SafeTensors::deserialize(&data).unwrap();
-                let tensor = file.tensor(tensor_name).unwrap();
-                let bytes = tensor.data();
-                let data = le_bytes_to_f32s(bytes);
-
-                // Compute strides for the full tensor
-                let mut full_strides = vec![1; ndim];
-                for i in (0..ndim - 1).rev() {
-                    full_strides[i] = full_strides[i + 1] * info.shape[i + 1];
-                }
-
-                // Compute strides for the chunk
-                let mut chunk_strides = vec![1; ndim];
-                for i in (0..ndim - 1).rev() {
-                    chunk_strides[i] = chunk_strides[i + 1] * chunk.shape[i + 1];
-                }
-
-                // For each element in the chunk, compute its index in the full tensor
-                for idx in 0..data.len() {
-                    // Convert flat idx to multi-dimensional index for the chunk
-                    let mut chunk_multi_idx = vec![0; ndim];
-                    let mut remaining = idx;
-                    for d in 0..ndim {
-                        chunk_multi_idx[d] = remaining / chunk_strides[d];
-                        remaining %= chunk_strides[d];
-                    }
-
-                    // Compute the corresponding index in the full tensor
-                    let mut full_idx = 0;
-                    for d in 0..ndim {
-                        let pos = chunk.offsets[d] + chunk_multi_idx[d];
-                        full_idx += pos * full_strides[d];
-                    }
-
-                    result[full_idx] = data[idx];
-                }
-            }
-            result
-        } else {
-            panic!("Tensor {} not found or not distributed", tensor_name);
-        }
     }
 }

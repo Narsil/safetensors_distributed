@@ -11,7 +11,6 @@ use memmap2::Mmap;
 use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::mpsc::{Sender, channel};
 
 pub struct Redistributor {
@@ -78,14 +77,10 @@ impl Redistributor {
     }
 
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
-        let start = Instant::now();
-
-        let init_start = Instant::now();
         self.target.location.init(&self.target.layout).await?;
 
         let (tx, mut rx) = channel::<Task>(10_000);
 
-        let calc_start = Instant::now();
         // Estimate of the data needed to be copied.
         let mut total = 0u64;
         for (header_size, metadata) in &self.source.layout.metadatas {
@@ -111,51 +106,22 @@ impl Redistributor {
         let p = progress.clone();
         // let strategy = self.strategy;
         let handle = tokio::spawn(async move {
-            // match strategy {
-            //     RedistributionStrategy::ReadUnorderedWriteSerial => {
-            // Execute write tasks as they come in
             while let Some(task) = rx.recv().await {
                 // if let Task::Write(write_task) = task {
                 let length = (task.target_end - task.target_start) as usize;
                 if let Err(e) = task.run().await {
                     error!("Write task failed: {}", e);
+                    return Err(e);
                 }
                 p.inc(length as u64);
-                // } else {
-                //     error!("ReadUnorderedWriteSerial strategy received unexpected ReadSerial task");
-                // }
             }
-            // }
-
-            // RedistributionStrategy::ReadSerialWriteUnordered => {
-            //     // Execute read tasks as they come in
-            //     while let Some(task) = rx.recv().await {
-            //         if let Task::ReadSerial(read_task) = task {
-            //             let total_writes_length: u64 = read_task
-            //                 .writes
-            //                 .iter()
-            //                 .map(|w| w.target_end - w.target_start)
-            //                 .sum();
-
-            //             if let Err(e) = read_task.run().await {
-            //                 error!("Read task failed: {}", e);
-            //             }
-            //             p.inc(total_writes_length);
-            //         } else {
-            //             error!(
-            //                 "ReadSerialWriteUnordered strategy received unexpected Write task"
-            //             );
-            //         }
-            //     }
-            // }
-            // }
+            Ok(())
         });
 
-        let tasks_start = Instant::now();
         self.create_tasks(&tx).await?;
 
         drop(tx);
-        handle.await?;
+        handle.await??;
 
         progress.finish();
         println!("Done write, waiting for the kernel to sync on device...");
@@ -247,7 +213,7 @@ impl Redistributor {
     /// Iterates target files → target tensors by data_offset (current logic)
     async fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
         // Process each target file in order
-        for (target_file_index, filename) in
+        for (target_file_index, _filename) in
             self.target.layout.topology.filenames().iter().enumerate()
         {
             // Get the metadata for this target file
@@ -259,13 +225,8 @@ impl Redistributor {
                 tensors.iter().map(|(k, v)| (k, *v)).collect();
             tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
 
-            let tensor_count = tensor_entries.len();
-
             // Process each tensor in write order
-            for (i, (tensor_name, tensor_info)) in tensor_entries.iter().enumerate() {
-                let tensor_start = Instant::now();
-                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {}
-
+            for (tensor_name, tensor_info) in tensor_entries.iter() {
                 self.create_write_task_for_tensor(
                     tx,
                     target_file_index,
@@ -274,8 +235,6 @@ impl Redistributor {
                     tensor_info,
                 )
                 .await?;
-
-                if i < 5 || i % 20 == 0 || i == tensor_count - 1 {}
             }
         }
 
@@ -384,18 +343,14 @@ impl Redistributor {
 
         // Create and send the task if we have any reads to do
         if !source_ranges.is_empty() {
-            let source_count = task_source.len();
-
             if let Some(write_task) = self.target.location.create_write_task(
                 target_file_index,
                 target_start,
                 target_end,
-                // task_source.into_task_sources(),
                 task_source,
                 source_ranges,
                 ranges_per_file,
             ) {
-                // tx.send(Task::Write(write_task)).await.unwrap();
                 tx.send(write_task).await.unwrap();
             }
         } else {
@@ -690,36 +645,6 @@ mod tests {
     async fn calculate_file_hash<P: AsRef<std::path::Path>>(path: P) -> String {
         let path = path.as_ref();
         let contents = tokio::fs::read(path).await.unwrap();
-
-        if contents.len() >= 8 {
-            // Read the header size (first 8 bytes)
-            let header_size = u64::from_le_bytes([
-                contents[0],
-                contents[1],
-                contents[2],
-                contents[3],
-                contents[4],
-                contents[5],
-                contents[6],
-                contents[7],
-            ]) as usize;
-
-            if contents.len() >= 8 + header_size {
-                // Extract and display the JSON header
-                let header_bytes = &contents[8..8 + header_size];
-                if let Ok(header_str) = std::str::from_utf8(header_bytes) {}
-
-                // Show some info about the data section
-                let data_start = 8 + header_size;
-                let data_size = contents.len() - data_start;
-
-                // Show first 32 bytes of data as hex
-                if data_size > 0 {
-                    let hex_bytes = std::cmp::min(32, data_size);
-                }
-            }
-        }
-
         // Show entire file content as UTF-8 (lossy)
         let mut hasher = Sha256::new();
         hasher.update(&contents);
@@ -818,7 +743,15 @@ mod tests {
         let mut final_tensors = BTreeMap::new();
         final_tensors.insert(
             "tensor1".to_string(),
-            Tensor::Shared(SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])),
+            // Tensor::Shared(SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])),
+            Tensor::Distributed(
+                // SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])
+                DistributedInfo::new(
+                    vec![8, 4],
+                    Dtype::F32,
+                    vec![Chunk::new(vec![0, 0], vec![8, 4], 0)],
+                ),
+            ),
         );
         final_tensors.insert(
             "tensor2".to_string(),
