@@ -133,6 +133,7 @@ impl Redistributor {
 
         drop(tx);
         handle.await??;
+        progress.set_length(progress.position());
         progress.set_message("Done, kernel flush...");
 
         self.target
