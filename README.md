@@ -47,4 +47,7 @@ The package supports checkpoints that include:
 
 ## License
 
-[Add your license information here]
+This project is licensed under both the MIT License and Apache License 2.0 at your option.
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)

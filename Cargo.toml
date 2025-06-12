@@ -8,11 +8,12 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 
 [workspace.dependencies]
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3", "abi3-py38"] }
-tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
 safetensors = { path = "../safetensors/safetensors" }
 serde_json = "1.0.140"
 thiserror = "2.0.12"

@@ -31,7 +31,7 @@
               python3Packages.python
               python3Packages.venvShellHook
               cloc
-            ] ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [ cudaPackages.cudatoolkit ]);
+            ] ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [ cudaPackages.cudatoolkit poop ]);
             venvDir = "./.venv";
             postVenvCreation = ''
               unset SOURCE_DATE_EPOCH

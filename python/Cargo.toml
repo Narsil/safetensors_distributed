@@ -1,7 +1,8 @@
 [package]
-name = "safetensors_distributed_pyo3"
+name = "safetensors-distributed-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3", "abi3-py38"] }
@@ -11,6 +12,9 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

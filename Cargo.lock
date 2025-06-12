@@ -713,6 +713,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "safetensors-distributed-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "futures-util",
+ "pyo3",
+ "safetensors",
+ "safetensors_distributed",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-test",
+]
+
+[[package]]
 name = "safetensors_distributed"
 version = "0.1.0"
 dependencies = [
@@ -728,21 +746,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-test",
-]
-
-[[package]]
-name = "safetensors_distributed_pyo3"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "pyo3",
- "safetensors",
- "safetensors_distributed",
- "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
