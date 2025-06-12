@@ -4,26 +4,14 @@ use crate::topology::Topology;
 use futures::future::join_all;
 use log::trace;
 use memmap2::{Mmap, MmapMut};
-use reqwest::{Client, header::HeaderMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
-use url::Url;
 
-pub enum SourceLocation {
-    Local {
-        mmaps: Vec<Arc<Mmap>>,
-    },
-    Remote {
-        client: Client,
-        base_url: Url,
-        auth_headers: HeaderMap,
-        file_paths: Vec<String>,
-        http_semaphore: Arc<Semaphore>,
-    },
+pub struct SourceLocation {
+    pub(crate) mmaps: Vec<Arc<Mmap>>,
 }
 
 pub struct WriteLocation {
@@ -70,17 +58,6 @@ impl WriteLocation {
         }
         self.write_topology(topology).await?;
         Ok(())
-    }
-
-    /// Get target mmap for the specified file index
-    pub fn get_mmap(&self, target_file_index: usize) -> Result<Arc<MmapMut>> {
-        if let Some(ref target_mmaps) = self.mmaps {
-            Ok(Arc::clone(&target_mmaps[target_file_index]))
-        } else {
-            Err(RedistributorError::InvalidDataSource {
-                message: "Target mmaps not initialized".to_string(),
-            })
-        }
     }
 
     /// Create a write task for the specified file index and parameters

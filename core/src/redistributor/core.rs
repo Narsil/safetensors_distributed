@@ -13,6 +13,13 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, channel};
 
+/// The structure responsible for managing a redistribution
+/// from one topology to another on disk.
+/// The strategy is to read the topology (or assume rank-1 if missing)
+/// and then all the header to know the tensors.
+/// Then the redistributor will start fetching all the various parts of data it requires from the
+/// original files before writing them on-disk.
+/// The writes are ordered to help be faster on NVMe.
 pub struct Redistributor {
     source: Source,
     target: Target,
@@ -62,7 +69,7 @@ impl Redistributor {
         Ok(Self {
             source: Source {
                 layout: source_layout,
-                location: SourceLocation::Local {
+                location: SourceLocation {
                     mmaps: source_mmaps,
                 },
             },
@@ -76,6 +83,8 @@ impl Redistributor {
         })
     }
 
+    /// Starts running the remapping of the files from the source topology to the target topology.
+    /// It returns the list of files created (relative to the output_dir).
     pub async fn redistribute(&mut self) -> Result<Vec<String>> {
         self.target.location.init(&self.target.layout).await?;
 
@@ -422,9 +431,7 @@ impl Redistributor {
                 source_ranges.extend(byte_ranges);
 
                 // Add the source mmap and record how many ranges belong to this file
-                let SourceLocation::Local { mmaps } = &self.source.location else {
-                    unreachable!();
-                };
+                let mmaps = &self.source.location.mmaps;
                 task_source.push(Arc::clone(&mmaps[source_file_index]));
                 ranges_per_file.push(ranges_for_this_file);
             }
@@ -494,9 +501,7 @@ impl Redistributor {
             source_ranges.extend(byte_ranges);
 
             // Add the source mmap and record how many ranges belong to this file
-            let SourceLocation::Local { mmaps } = &self.source.location else {
-                unreachable!();
-            };
+            let mmaps = &self.source.location.mmaps;
             task_source.push(Arc::clone(&mmaps[source_file_index]));
             ranges_per_file.push(ranges_for_this_file);
         }
@@ -540,9 +545,7 @@ impl Redistributor {
         source_ranges.push((source_start, source_end, 0));
 
         // Add the source mmap and record how many ranges belong to this file
-        let SourceLocation::Local { mmaps } = &self.source.location else {
-            unreachable!();
-        };
+        let mmaps = &self.source.location.mmaps;
         task_source.push(Arc::clone(&mmaps[source_file_index]));
         ranges_per_file.push(1);
 
@@ -603,9 +606,7 @@ impl Redistributor {
                 source_ranges.extend(byte_ranges);
 
                 // Add the source mmap and record how many ranges belong to this file
-                let SourceLocation::Local { mmaps } = &self.source.location else {
-                    unreachable!();
-                };
+                let mmaps = &self.source.location.mmaps;
                 task_source.push(Arc::clone(&mmaps[source_file_index]));
                 ranges_per_file.push(ranges_for_this_file);
             }
@@ -618,7 +619,6 @@ impl Redistributor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redistributor::intersection;
     use crate::topology::{Chunk, DistributedInfo, SharedInfo};
     use safetensors::{Dtype, serialize, tensor::TensorView};
     use sha2::{Digest, Sha256};
@@ -806,119 +806,6 @@ mod tests {
             )
         };
         assert_eq!(final_tensor2_data, tensor2_data.as_slice());
-    }
-
-    #[test]
-    fn test_intersection_function() {
-        // Test case: [8, 8] full array (64 elements total)
-        // Source chunk: [4:, :] = rows 4-7, all columns = elements 32-63 in 1D
-        // Target chunk: [:, :2] = all rows, columns 0-1
-
-        // Source intervals: [4:, :] covers elements 32-63
-        let source_intervals = vec![(32, 64)];
-
-        // Target intervals: [:, :2] covers first 2 columns of each row
-        // Row 0, cols 0-1: elements 0-1   = (0, 2)
-        // Row 1, cols 0-1: elements 8-9   = (8, 10)
-        // Row 2, cols 0-1: elements 16-17 = (16, 18)
-        // Row 3, cols 0-1: elements 24-25 = (24, 26)
-        // Row 4, cols 0-1: elements 32-33 = (32, 34)  <- intersects with source
-        // Row 5, cols 0-1: elements 40-41 = (40, 42)  <- intersects with source
-        // Row 6, cols 0-1: elements 48-49 = (48, 50)  <- intersects with source
-        // Row 7, cols 0-1: elements 56-57 = (56, 58)  <- intersects with source
-        let target_intervals = vec![
-            (0, 2),
-            (8, 10),
-            (16, 18),
-            (24, 26),
-            (32, 34),
-            (40, 42),
-            (48, 50),
-            (56, 58),
-        ];
-
-        let result = intersection(&source_intervals, &target_intervals);
-
-        // Expected result: (source_offset, target_offset, length)
-        // - (32, 34): source_offset=0 (32-32), target_offset=8 (4 intervals * 2 bytes each), length=2
-        // - (40, 42): source_offset=8 (40-32), target_offset=10 (5 intervals * 2 bytes each), length=2
-        // - (48, 50): source_offset=16 (48-32), target_offset=12 (6 intervals * 2 bytes each), length=2
-        // - (56, 58): source_offset=24 (56-32), target_offset=14 (7 intervals * 2 bytes each), length=2
-        let expected = vec![
-            (0, 8, 2),   // (32,34) -> source offset 0, target offset 8, length 2
-            (8, 10, 2),  // (40,42) -> source offset 8, target offset 10, length 2
-            (16, 12, 2), // (48,50) -> source offset 16, target offset 12, length 2
-            (24, 14, 2), // (56,58) -> source offset 24, target offset 14, length 2
-        ];
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_intersection_no_overlap() {
-        // Test case where there's no overlap
-        let source_intervals = vec![(10, 20)];
-        let target_intervals = vec![(0, 5), (25, 30)];
-
-        let result = intersection(&source_intervals, &target_intervals);
-        assert_eq!(result, vec![]);
-    }
-
-    #[test]
-    fn test_intersection_partial_overlap() {
-        // Test case with partial overlaps
-        let source_intervals = vec![(5, 15)];
-        let target_intervals = vec![(0, 8), (12, 20)];
-
-        // Expected intersections:
-        // (5, 8) with source_offset=0, target_offset=5 (within first target interval), length=3
-        // (12, 15) with source_offset=7, target_offset=8 (8 bytes from first interval + 0 from second), length=3
-        let expected = vec![
-            (0, 5, 3), // intersection (5,8) - offset 5 within first target interval
-            (7, 8, 3), // intersection (12,15) - offset 8 (cumulative: 8 from first interval + 0)
-        ];
-
-        let result = intersection(&source_intervals, &target_intervals);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_intersection_multiple_source_intervals() {
-        // Test case with multiple source intervals
-        let source_intervals = vec![(0, 5), (10, 15)];
-        let target_intervals = vec![(3, 8), (12, 18)];
-
-        // Expected intersections:
-        // (3, 5) from first source with source_offset=3, target_offset=0 (start of first target interval), length=2
-        // (12, 15) from second source with source_offset=2, target_offset=5 (5 bytes from first interval + 0 from second), length=3
-        let expected = vec![
-            (3, 0, 2), // intersection (3,5) from first source interval
-            (7, 5, 3), // intersection (12,15) from second source interval - offset 5 (cumulative: 5 from first + 0)
-        ];
-
-        let result = intersection(&source_intervals, &target_intervals);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_intersection_target_spans_multiple_sources() {
-        // Test case where a single target interval spans across multiple source intervals
-        let source_intervals = vec![(10, 20), (30, 40)];
-        let target_intervals = vec![(15, 35)];
-
-        // Target interval (15, 35) intersects with:
-        // - First source (10, 20) at (15, 20) - length 5, maps to target offsets 0-4
-        // - Second source (30, 40) at (30, 35) - length 5, maps to target offsets 15-19 (position-based)
-        // OR if sequential filling: target offsets 5-9
-        //
-        // Based on the other tests, target_offset should be position-based, not sequential
-        let expected = vec![
-            (5, 0, 5),   // intersection (15,20): position 15 in target → offset 0
-            (10, 15, 5), // intersection (30,35): position 30 in target → offset 15 (30-15)
-        ];
-
-        let result = intersection(&source_intervals, &target_intervals);
-        assert_eq!(result, expected);
     }
 
     #[tokio::test]

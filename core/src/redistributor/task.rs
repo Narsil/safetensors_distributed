@@ -3,23 +3,8 @@ use log::{error, trace};
 use memmap2::{Mmap, MmapMut};
 use std::sync::Arc;
 
-/// Write operation for ReadSerialTask - one target write from read data
-#[derive(Debug, Clone)]
-pub struct WriteOperation {
-    /// Target file index
-    pub target_file_index: usize,
-    /// Target memory-mapped file
-    pub target_mmap: Arc<MmapMut>,
-    /// Start position in target file
-    pub target_start: u64,
-    /// End position in target file
-    pub target_end: u64,
-    /// Offset within the read data where this write's data starts
-    pub read_offset: usize,
-}
-
 // Memory-mapped task type for high performance file operations
-pub struct Task {
+pub(crate) struct Task {
     // Target write info - single contiguous region
     pub target_mmap: Arc<MmapMut>,
     pub target_start: u64,

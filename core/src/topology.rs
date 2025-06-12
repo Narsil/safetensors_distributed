@@ -1,14 +1,20 @@
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+/// A tensor represents a fictive "full" tensor, which might be
+/// replicated (Shared) or distributed (Distributed) across ranks
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Tensor {
+    /// See [`DistributedInfo`]
     Distributed(DistributedInfo),
+    /// See [`SharedInfo`]
     Shared(SharedInfo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Shared tensors are shared across all ranks so do not conatains chunks.
 pub struct SharedInfo {
     shape: Vec<usize>,
     dtype: Dtype,
@@ -16,6 +22,7 @@ pub struct SharedInfo {
 }
 
 impl SharedInfo {
+    /// See [`SharedInfo`]
     pub fn new(shape: Vec<usize>, dtype: Dtype, filename_indices: Vec<usize>) -> Self {
         Self {
             shape,
@@ -39,6 +46,8 @@ impl SharedInfo {
     }
 }
 
+/// Distributed tensors are split across all ranks.
+/// The various chunks must be overlapping and without gaps to be valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedInfo {
     shape: Vec<usize>,
@@ -47,7 +56,7 @@ pub struct DistributedInfo {
 }
 
 impl DistributedInfo {
-    /// Creates a new distributed tensor info with the given shape, dtype, and chunks
+    /// See [`DistributedInfo`]
     pub fn new(shape: Vec<usize>, dtype: Dtype, chunks: Vec<Chunk>) -> Self {
         Self {
             shape,
@@ -72,6 +81,22 @@ impl DistributedInfo {
     }
 }
 
+/// Describes an actual tensor on disk.
+/// The shape is the real shape on disk, the offsets express
+/// How is that chunk relative to the "full" tensor.
+///
+///
+/// if A.shape == [8, 8]
+/// and chunk == A[:4, :]
+///
+/// then offsets == [0, 0]
+/// and shape == [4, 8]
+///
+/// if A.shape == [8, 8]
+/// and chunk == A[4:, :]
+///
+/// then offsets == [4, 0]
+/// and shape == [4, 8]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chunk {
     offsets: Vec<usize>,
@@ -129,6 +154,8 @@ impl SimpleTopo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SimpleTopo")]
+/// Describes and "full" tensor representation and how it relates
+/// to a "sharded" on disk representation (usually a checkpoint).
 pub struct Topology {
     tensors: BTreeMap<String, Tensor>,
     filenames: Vec<String>,
@@ -514,6 +541,9 @@ impl TryFrom<SimpleTopo> for Topology {
 }
 
 impl Topology {
+    /// Creates a Topology description, describing how tensors relate to each other.
+    /// The filenames are kept separate to avoid repeating them over and over within the topology
+    /// There can be more files than world_size.
     pub fn new(
         tensors: BTreeMap<String, Tensor>,
         filenames: Vec<String>,

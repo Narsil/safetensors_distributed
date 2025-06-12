@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use safetensors_distributed::redistributor::{Redistributor, load_or_create_topology};
-use safetensors_distributed::topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
+use safetensors_distributed::{
+    Chunk, DistributedInfo, Redistributor, SharedInfo, Tensor, Topology, load_or_create_topology,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 

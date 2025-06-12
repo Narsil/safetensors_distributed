@@ -93,6 +93,8 @@ pub fn safetensors_metadata<P: AsRef<std::path::Path>>(file_path: P) -> Result<(
     Ok((header_size, metadata))
 }
 
+/// Given a directory, reads the topology.json file as a [`Topology`] or creates a "full" one from
+/// the present safetensors file if any. All tensors will be considered [`crate::topology::Tensor::Shared`] then.
 pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topology> {
     let dir = dir.as_ref();
     let topology_path = dir.join("topology.json");
@@ -171,163 +173,329 @@ pub fn load_or_create_topology<P: AsRef<std::path::Path>>(dir: P) -> Result<Topo
 }
 
 // Intersection function used by core
-pub fn intersection(
-    source_intervals: &[(usize, usize)],
-    target_intervals: &[(usize, usize)],
-) -> Vec<(usize, usize, usize)> {
-    // Pre-allocate with minimum capacity
-    let min_capacity = source_intervals.len().min(target_intervals.len());
-    let mut result = Vec::with_capacity(min_capacity);
+/// Specialized function to directly compute read byte ranges from chunk intersection
+/// This replaces get_intervals + intersection + byte range conversion in one step
+pub fn compute_read_ranges_direct(
+    source_chunk: &crate::topology::Chunk,
+    target_chunk: &crate::topology::Chunk,
+    source_header_size: usize,
+    source_data_offset: usize,
+    dtype_size: usize,
+    strides: &[usize],
+    full_shape: &[usize],
+) -> Vec<(u64, u64, u64)> {
+    let ndim = full_shape.len();
 
-    let mut soffset = 0;
-    let mut toffset = 0;
-    let mut sindex = 0;
-    let mut tindex = 0;
+    // Step 1: Quick intersection check in all dimensions
+    let mut intersection_start = Vec::with_capacity(ndim);
+    let mut intersection_size = Vec::with_capacity(ndim);
 
-    while sindex < source_intervals.len() && tindex < target_intervals.len() {
-        let (source_start, source_end) = source_intervals[sindex];
-        let (target_start, target_end) = target_intervals[tindex];
-        let intersection_start = source_start.max(target_start);
-        let intersection_end = source_end.min(target_end);
+    for dim in 0..ndim {
+        let source_start = source_chunk.offsets()[dim];
+        let source_end = source_start + source_chunk.shape()[dim];
+        let target_start = target_chunk.offsets()[dim];
+        let target_end = target_start + target_chunk.shape()[dim];
 
-        if intersection_start < intersection_end {
-            // There is an overlap
-            let source_offset = soffset + (intersection_start - source_start);
-            let target_offset = toffset + (intersection_start - target_start);
-            let length = intersection_end - intersection_start;
+        let intersect_start = source_start.max(target_start);
+        let intersect_end = source_end.min(target_end);
 
-            result.push((source_offset, target_offset, length));
+        // No intersection if any dimension doesn't overlap
+        if intersect_start >= intersect_end {
+            return Vec::new();
         }
 
-        if source_end < target_end {
-            sindex += 1;
-            soffset += source_end - source_start;
-        } else {
-            tindex += 1;
-            toffset += target_end - target_start;
-        }
+        intersection_start.push(intersect_start);
+        intersection_size.push(intersect_end - intersect_start);
     }
 
-    result
+    // Step 2: Directly compute byte ranges from intersection
+    compute_byte_ranges_from_intersection(
+        &intersection_start,
+        &intersection_size,
+        source_chunk,
+        target_chunk,
+        source_header_size,
+        source_data_offset,
+        dtype_size,
+        strides,
+    )
 }
 
-/// Optimized direct chunk intersection without generating intervals
-/// This replaces the expensive get_intervals + intersection workflow
-/// Returns (source_offset, target_offset, length) tuples for overlapping regions
-pub fn chunk_intersection_direct(
+/// Directly compute byte ranges from n-dimensional intersection
+fn compute_byte_ranges_from_intersection(
+    intersect_start: &[usize],
+    intersect_size: &[usize],
+    source_chunk: &crate::topology::Chunk,
+    target_chunk: &crate::topology::Chunk,
+    source_header_size: usize,
+    source_data_offset: usize,
+    dtype_size: usize,
+    strides: &[usize],
+) -> Vec<(u64, u64, u64)> {
+    let mut ranges = Vec::new();
+
+    // Calculate total intersection volume
+    let total_positions: usize = intersect_size.iter().product();
+    if total_positions == 0 {
+        return ranges;
+    }
+
+    // Look for contiguous blocks to minimize number of ranges
+    let contiguous_blocks = find_contiguous_blocks(
+        intersect_start,
+        intersect_size,
+        source_chunk,
+        target_chunk,
+        strides,
+    );
+
+    for block in contiguous_blocks {
+        let source_start_bytes = block.source_offset * dtype_size;
+        let source_end_bytes = (block.source_offset + block.length) * dtype_size;
+        let target_offset_bytes = block.target_offset * dtype_size;
+
+        let file_source_start =
+            (source_header_size + source_data_offset + source_start_bytes) as u64;
+        let file_source_end = (source_header_size + source_data_offset + source_end_bytes) as u64;
+
+        ranges.push((
+            file_source_start,
+            file_source_end,
+            target_offset_bytes as u64,
+        ));
+    }
+
+    ranges
+}
+
+/// Helper struct for contiguous memory blocks
+#[derive(Debug)]
+struct ContiguousBlock {
+    source_offset: usize,
+    target_offset: usize,
+    length: usize,
+}
+
+/// Find contiguous blocks in the intersection to minimize the number of memory ranges
+fn find_contiguous_blocks(
+    intersect_start: &[usize],
+    intersect_size: &[usize],
     source_chunk: &crate::topology::Chunk,
     target_chunk: &crate::topology::Chunk,
     strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<(usize, usize, usize)> {
-    // Step 1: Generate intervals efficiently without materializing them
-    let source_intervals = generate_intervals_lazy(source_chunk, strides, full_shape);
-    let target_intervals = generate_intervals_lazy(target_chunk, strides, full_shape);
+) -> Vec<ContiguousBlock> {
+    let ndim = intersect_start.len();
+    let mut blocks = Vec::new();
 
-    // Step 2: Apply the same intersection logic as the legacy function
-    intersection_direct(&source_intervals, &target_intervals)
+    // Find the innermost dimension that has contiguous memory layout
+    let innermost_contiguous_dim =
+        find_innermost_contiguous_dim(intersect_start, intersect_size, source_chunk, target_chunk);
+
+    if innermost_contiguous_dim == ndim {
+        // Entire intersection is contiguous
+        let total_length: usize = intersect_size.iter().product();
+        let source_offset = calculate_chunk_offset(intersect_start, source_chunk, strides);
+        let target_offset = calculate_chunk_offset(intersect_start, target_chunk, strides);
+
+        blocks.push(ContiguousBlock {
+            source_offset,
+            target_offset,
+            length: total_length,
+        });
+    } else {
+        // Generate blocks for non-contiguous dimensions
+        generate_blocks_recursive(
+            0,
+            innermost_contiguous_dim,
+            intersect_start,
+            intersect_size,
+            source_chunk,
+            target_chunk,
+            strides,
+            &mut blocks,
+        );
+    }
+
+    blocks
 }
 
-/// Generate intervals lazily without fully materializing them
-/// Returns a sorted list of (start, end) intervals
-fn generate_intervals_lazy(
+/// Find how many trailing dimensions are contiguous
+fn find_innermost_contiguous_dim(
+    intersect_start: &[usize],
+    intersect_size: &[usize],
+    source_chunk: &crate::topology::Chunk,
+    target_chunk: &crate::topology::Chunk,
+) -> usize {
+    let ndim = intersect_start.len();
+
+    // Conservative fix: if intersection spans multiple elements in multiple dimensions,
+    // be cautious about contiguity to avoid the bug where non-contiguous memory
+    // regions are treated as contiguous blocks
+    let multi_dim_intersection = intersect_size.iter().filter(|&&size| size > 1).count() > 1;
+
+    if multi_dim_intersection {
+        // Only treat the innermost dimension as potentially contiguous
+        // This prevents incorrect merging of memory regions that have gaps
+        // (like when splitting along dimension 1 in a 2D tensor)
+        return ndim - 1;
+    }
+
+    // Original logic for simple cases (single dimension or single element intersections)
+    for dim in (0..ndim).rev() {
+        // Check if this dimension is fully spanned in both chunks
+        let source_spans_full = (intersect_start[dim] == source_chunk.offsets()[dim])
+            && (intersect_size[dim] == source_chunk.shape()[dim]);
+        let target_spans_full = (intersect_start[dim] == target_chunk.offsets()[dim])
+            && (intersect_size[dim] == target_chunk.shape()[dim]);
+
+        if !source_spans_full || !target_spans_full {
+            return dim + 1;
+        }
+    }
+
+    0 // All dimensions are contiguous
+}
+
+/// Calculate offset within a chunk for given coordinates
+fn calculate_chunk_offset(
+    coords: &[usize],
     chunk: &crate::topology::Chunk,
+    _full_tensor_strides: &[usize],
+) -> usize {
+    let mut offset = 0;
+
+    // Calculate strides for this specific chunk based on its shape
+    let ndim = chunk.shape().len();
+    let mut chunk_strides = vec![1; ndim];
+    for i in (0..ndim - 1).rev() {
+        chunk_strides[i] = chunk_strides[i + 1] * chunk.shape()[i + 1];
+    }
+
+    for (dim, &coord) in coords.iter().enumerate() {
+        let chunk_coord = coord - chunk.offsets()[dim];
+        let contribution = chunk_coord * chunk_strides[dim];
+        offset += contribution;
+    }
+    offset
+}
+
+/// Recursively generate contiguous blocks for non-contiguous dimensions
+fn generate_blocks_recursive(
+    dim_idx: usize,
+    contiguous_from_dim: usize,
+    intersect_start: &[usize],
+    intersect_size: &[usize],
+    source_chunk: &crate::topology::Chunk,
+    target_chunk: &crate::topology::Chunk,
+    strides: &[usize],
+    blocks: &mut Vec<ContiguousBlock>,
+) {
+    if dim_idx == contiguous_from_dim {
+        // Calculate contiguous block size from this dimension onwards
+        let block_length: usize = intersect_size[dim_idx..].iter().product();
+
+        // Use the current coordinates (passed down from recursion)
+        let coords = intersect_start;
+
+        let source_offset = calculate_chunk_offset(&coords, source_chunk, strides);
+        let target_offset = calculate_chunk_offset(&coords, target_chunk, strides);
+
+        blocks.push(ContiguousBlock {
+            source_offset,
+            target_offset,
+            length: block_length,
+        });
+        return;
+    }
+
+    // Iterate through all positions in this dimension
+    for i in 0..intersect_size[dim_idx] {
+        let mut coords = intersect_start.to_vec();
+        coords[dim_idx] = intersect_start[dim_idx] + i;
+
+        // Recursively process next dimension with updated coordinates
+        generate_blocks_recursive(
+            dim_idx + 1,
+            contiguous_from_dim,
+            &coords,
+            intersect_size,
+            source_chunk,
+            target_chunk,
+            strides,
+            blocks,
+        );
+    }
+}
+
+/// Specialized function for shared-to-distributed: compute ranges for entire target chunk
+pub fn compute_shared_to_distributed_ranges(
+    target_chunk: &crate::topology::Chunk,
+    source_header_size: usize,
+    source_data_offset: usize,
+    dtype_size: usize,
     strides: &[usize],
     full_shape: &[usize],
-) -> Vec<(usize, usize)> {
-    // For now, use the legacy get_intervals function but in the future
-    // this could be optimized to generate intervals more efficiently
-    crate::topology::get_intervals(chunk, strides, full_shape)
+) -> Vec<(u64, u64, u64)> {
+    // For shared tensor, we need all the ranges that correspond to the target chunk
+    let target_intervals = crate::topology::get_intervals(target_chunk, strides, full_shape);
+    let mut ranges = Vec::new();
+    let mut target_offset_elements = 0;
+
+    for (start_elem, end_elem) in target_intervals {
+        let start_bytes = start_elem * dtype_size;
+        let end_bytes = end_elem * dtype_size;
+        let target_offset_bytes = target_offset_elements * dtype_size;
+
+        let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
+        let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
+
+        ranges.push((source_start, source_end, target_offset_bytes as u64));
+        target_offset_elements += end_elem - start_elem;
+    }
+
+    ranges
 }
 
-/// Direct intersection that follows the exact same logic as the legacy intersection function
-fn intersection_direct(
-    source_intervals: &[(usize, usize)],
-    target_intervals: &[(usize, usize)],
-) -> Vec<(usize, usize, usize)> {
-    // This is identical to the intersection function but renamed for clarity
-    intersection(source_intervals, target_intervals)
+/// Specialized function for distributed-to-shared: compute write ranges for entire source chunk  
+
+/// Specialized function for distributed-to-shared reads: compute read ranges for entire source chunk
+pub fn compute_distributed_to_shared_ranges(
+    source_chunk: &crate::topology::Chunk,
+    source_header_size: usize,
+    source_data_offset: usize,
+    dtype_size: usize,
+    strides: &[usize],
+    full_shape: &[usize],
+) -> Vec<(u64, u64, u64)> {
+    // For distributed-to-shared, the source chunk maps to its absolute positions in the shared tensor
+    let source_intervals = crate::topology::get_intervals(source_chunk, strides, full_shape);
+    let mut ranges = Vec::new();
+    let mut source_offset_elements = 0;
+
+    for (start_elem, end_elem) in source_intervals {
+        let source_offset_bytes = source_offset_elements * dtype_size;
+        let target_start_bytes = start_elem * dtype_size; // Absolute position in shared tensor
+        let length_bytes = (end_elem - start_elem) * dtype_size;
+
+        let file_source_start =
+            (source_header_size + source_data_offset + source_offset_bytes) as u64;
+        let file_source_end = file_source_start + length_bytes as u64;
+
+        ranges.push((
+            file_source_start,
+            file_source_end,
+            target_start_bytes as u64,
+        ));
+        source_offset_elements += end_elem - start_elem;
+    }
+
+    ranges
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{Chunk, get_intervals};
-
-    #[test]
-    fn test_chunk_intersection_direct_vs_legacy() {
-        // Test case: Compare new direct method with old get_intervals + intersection method
-
-        // Create test chunks and parameters
-        let source_chunk = Chunk::new(vec![2, 1], vec![3, 2], 0); // offset [2,1], shape [3,2]
-        let target_chunk = Chunk::new(vec![1, 0], vec![4, 3], 1); // offset [1,0], shape [4,3]
-        let full_shape = vec![6, 4]; // 6x4 tensor
-
-        // Calculate strides
-        let mut strides = vec![1; full_shape.len()];
-        for i in (0..full_shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * full_shape[i + 1];
-        }
-
-        // Method 1: Legacy approach using get_intervals + intersection
-        let source_intervals = get_intervals(&source_chunk, &strides, &full_shape);
-        let target_intervals = get_intervals(&target_chunk, &strides, &full_shape);
-        let legacy_result = intersection(&source_intervals, &target_intervals);
-
-        // Method 2: New optimized direct approach
-        let direct_result =
-            chunk_intersection_direct(&source_chunk, &target_chunk, &strides, &full_shape);
-
-        // Results should be identical
-        assert_eq!(
-            legacy_result, direct_result,
-            "Direct chunk intersection should produce same results as legacy method"
-        );
-    }
-
-    #[test]
-    fn test_chunk_intersection_direct_no_overlap() {
-        // Test case where chunks don't overlap
-        let source_chunk = Chunk::new(vec![0, 0], vec![2, 2], 0);
-        let target_chunk = Chunk::new(vec![3, 3], vec![2, 2], 1);
-        let full_shape = vec![6, 6];
-        let strides = vec![6, 1];
-
-        let result = chunk_intersection_direct(&source_chunk, &target_chunk, &strides, &full_shape);
-        assert!(
-            result.is_empty(),
-            "Non-overlapping chunks should return empty result"
-        );
-    }
-
-    #[test]
-    fn test_chunk_intersection_direct_full_overlap() {
-        // Test case where chunks completely overlap
-        let chunk = Chunk::new(vec![1, 1], vec![2, 2], 0);
-        let full_shape = vec![4, 4];
-        let strides = vec![4, 1];
-
-        let result = chunk_intersection_direct(&chunk, &chunk, &strides, &full_shape);
-
-        // The chunk should intersect with itself
-        assert!(!result.is_empty(), "Same chunks should have intersection");
-
-        // Calculate expected total length (should equal chunk size: 2*2 = 4)
-        let expected_total_length: usize = chunk.shape().iter().product();
-        let actual_total_length: usize = result.iter().map(|(_, _, len)| len).sum();
-        assert_eq!(
-            actual_total_length, expected_total_length,
-            "Total intersection length should equal chunk size"
-        );
-
-        // All source and target offsets should start at 0 since it's the same chunk
-        for &(source_offset, target_offset, _) in &result {
-            assert_eq!(
-                source_offset, target_offset,
-                "Source and target offsets should be equal for identical chunks"
-            );
-        }
-    }
+    use crate::topology::Chunk;
 
     #[test]
     fn test_compute_read_ranges_direct_basic() {
@@ -388,67 +556,6 @@ mod tests {
         assert!(
             result.is_empty(),
             "Non-overlapping chunks should return empty ranges"
-        );
-    }
-
-    #[test]
-    fn test_compute_write_ranges_direct_basic() {
-        // Test basic functionality of compute_write_ranges_direct
-        let source_chunk = Chunk::new(vec![1, 1], vec![2, 2], 0);
-        let target_chunk = Chunk::new(vec![0, 1], vec![3, 2], 1);
-        let full_shape = vec![4, 4];
-        let strides = vec![4, 1];
-
-        let target_header_size = 8;
-        let target_data_offset = 16;
-        let dtype_size = 4;
-
-        let result = compute_write_ranges_direct(
-            &source_chunk,
-            &target_chunk,
-            target_header_size,
-            target_data_offset,
-            dtype_size,
-            &strides,
-            &full_shape,
-        );
-
-        assert!(!result.is_empty(), "Should have intersection");
-
-        for write_range in result {
-            assert!(
-                write_range.target_start < write_range.target_end,
-                "Target start should be less than target end"
-            );
-            assert!(
-                write_range.target_start >= (target_header_size + target_data_offset) as u64,
-                "Target start should be after header and data offset"
-            );
-            assert!(write_range.length > 0, "Length should be positive");
-        }
-    }
-
-    #[test]
-    fn test_compute_write_ranges_direct_no_overlap() {
-        // Test with non-overlapping chunks
-        let source_chunk = Chunk::new(vec![0, 0], vec![1, 1], 0);
-        let target_chunk = Chunk::new(vec![2, 2], vec![1, 1], 1);
-        let full_shape = vec![4, 4];
-        let strides = vec![4, 1];
-
-        let result = compute_write_ranges_direct(
-            &source_chunk,
-            &target_chunk,
-            8,
-            16,
-            4,
-            &strides,
-            &full_shape,
-        );
-
-        assert!(
-            result.is_empty(),
-            "Non-overlapping chunks should return empty write ranges"
         );
     }
 
@@ -522,72 +629,6 @@ mod tests {
                 start >= (source_header_size + source_data_offset) as u64,
                 "Start should be after header and data offset"
             );
-        }
-    }
-
-    #[test]
-    fn test_compute_shared_to_distributed_write_ranges() {
-        // Test shared-to-distributed write range computation
-        let target_chunk = Chunk::new(vec![0, 1], vec![2, 2], 0);
-        let full_shape = vec![3, 3];
-        let strides = vec![3, 1];
-
-        let target_header_size = 8;
-        let target_data_offset = 16;
-        let dtype_size = 4;
-
-        let result = compute_shared_to_distributed_write_ranges(
-            &target_chunk,
-            target_header_size,
-            target_data_offset,
-            dtype_size,
-            &strides,
-            &full_shape,
-        );
-
-        assert!(!result.is_empty(), "Should generate write ranges");
-
-        for write_range in result {
-            assert!(
-                write_range.target_start < write_range.target_end,
-                "Target start should be less than target end"
-            );
-            assert!(write_range.length > 0, "Length should be positive");
-            assert!(
-                write_range.target_start >= (target_header_size + target_data_offset) as u64,
-                "Target start should be after header and data offset"
-            );
-        }
-    }
-
-    #[test]
-    fn test_compute_distributed_to_shared_write_ranges() {
-        // Test distributed-to-shared write range computation
-        let source_chunk = Chunk::new(vec![1, 0], vec![2, 3], 0);
-        let full_shape = vec![4, 3];
-        let strides = vec![3, 1];
-
-        let target_header_size = 8;
-        let target_data_offset = 16;
-        let dtype_size = 4;
-
-        let result = compute_distributed_to_shared_write_ranges(
-            &source_chunk,
-            target_header_size,
-            target_data_offset,
-            dtype_size,
-            &strides,
-            &full_shape,
-        );
-
-        assert!(!result.is_empty(), "Should generate write ranges");
-
-        for write_range in result {
-            assert!(
-                write_range.target_start < write_range.target_end,
-                "Target start should be less than target end"
-            );
-            assert!(write_range.length > 0, "Length should be positive");
         }
     }
 
@@ -741,66 +782,43 @@ mod tests {
     }
 
     #[test]
-    fn test_performance_comparison_large_chunks() {
-        // Performance comparison test (mainly for correctness, timing is secondary)
-        let source_chunk = Chunk::new(vec![0, 0], vec![50, 50], 0); // Large chunk
-        let target_chunk = Chunk::new(vec![25, 25], vec![50, 50], 1); // Overlapping large chunk
-        let full_shape = vec![100, 100];
-        let strides = vec![100, 1];
-
-        // Legacy method
-        let source_intervals = get_intervals(&source_chunk, &strides, &full_shape);
-        let target_intervals = get_intervals(&target_chunk, &strides, &full_shape);
-        let legacy_result = intersection(&source_intervals, &target_intervals);
-
-        // New optimized method
-        let direct_result =
-            chunk_intersection_direct(&source_chunk, &target_chunk, &strides, &full_shape);
-
-        // Results should be identical
-        assert_eq!(
-            legacy_result, direct_result,
-            "Large chunk intersection should produce identical results"
-        );
-
-        // Both should have substantial intersection
-        assert!(
-            !legacy_result.is_empty(),
-            "Should have substantial intersection"
-        );
-        assert!(
-            !direct_result.is_empty(),
-            "Should have substantial intersection"
-        );
-    }
-
-    #[test]
     fn test_find_contiguous_blocks_dimension_1_split_bug() {
         // This test reproduces the exact bug: incorrect contiguous block calculation
         // for tensors split along dimension 1 (columns)
-        
+
         use crate::topology::Chunk;
-        
+
         // Tensor: 2x8 with strides [8, 1]
         let full_shape = [2, 8];
         let strides = [8, 1];
-        
+
         // Source chunk: [0, 4] with shape [2, 4] (columns 4-7 of full tensor)
         let source_chunk = Chunk::new(vec![0, 4], vec![2, 4], 1);
-        
+
         // Target chunk: [0, 0] with shape [2, 8] (full tensor)
         let target_chunk = Chunk::new(vec![0, 0], vec![2, 8], 0);
-        
+
         // Intersection: starts at [0, 4], size [2, 4]
         let intersect_start = [0, 4];
         let intersect_size = [2, 4];
-        
+
         println!("Test case:");
         println!("  Full shape: {:?}, strides: {:?}", full_shape, strides);
-        println!("  Source chunk: offsets={:?}, shape={:?}", source_chunk.offsets(), source_chunk.shape());
-        println!("  Target chunk: offsets={:?}, shape={:?}", target_chunk.offsets(), target_chunk.shape());
-        println!("  Intersection: start={:?}, size={:?}", intersect_start, intersect_size);
-        
+        println!(
+            "  Source chunk: offsets={:?}, shape={:?}",
+            source_chunk.offsets(),
+            source_chunk.shape()
+        );
+        println!(
+            "  Target chunk: offsets={:?}, shape={:?}",
+            target_chunk.offsets(),
+            target_chunk.shape()
+        );
+        println!(
+            "  Intersection: start={:?}, size={:?}",
+            intersect_start, intersect_size
+        );
+
         let blocks = super::find_contiguous_blocks(
             &intersect_start,
             &intersect_size,
@@ -808,521 +826,27 @@ mod tests {
             &target_chunk,
             &strides,
         );
-        
+
         println!("  Computed blocks: {:?}", blocks);
-        
+
         // The bug: it creates 1 block of length 8 instead of 2 blocks of length 4
         // Expected: 2 separate blocks (one per row)
-        // - Block 1: Row 0, cols 4-7 → source_offset=0, target_offset=4, length=4  
+        // - Block 1: Row 0, cols 4-7 → source_offset=0, target_offset=4, length=4
         // - Block 2: Row 1, cols 4-7 → source_offset=4, target_offset=12, length=4
-        
+
         // Actual (buggy): 1 block → source_offset=0, target_offset=4, length=8
         // This causes row 1 data to overwrite part of row 0!
-        
+
         assert_eq!(blocks.len(), 2, "Should have 2 blocks, one per row");
-        
+
         // Block 0: Row 0, columns 4-7
         assert_eq!(blocks[0].source_offset, 0);
         assert_eq!(blocks[0].target_offset, 4);
         assert_eq!(blocks[0].length, 4);
-        
-        // Block 1: Row 1, columns 4-7  
+
+        // Block 1: Row 1, columns 4-7
         assert_eq!(blocks[1].source_offset, 4);
         assert_eq!(blocks[1].target_offset, 12); // Row 1 starts at offset 8, plus 4 columns = 12
         assert_eq!(blocks[1].length, 4);
     }
-}
-
-/// Specialized function to directly compute read byte ranges from chunk intersection
-/// This replaces get_intervals + intersection + byte range conversion in one step
-pub fn compute_read_ranges_direct(
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    source_header_size: usize,
-    source_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<(u64, u64, u64)> {
-    let ndim = full_shape.len();
-
-    // Step 1: Quick intersection check in all dimensions
-    let mut intersection_start = Vec::with_capacity(ndim);
-    let mut intersection_size = Vec::with_capacity(ndim);
-
-    for dim in 0..ndim {
-        let source_start = source_chunk.offsets()[dim];
-        let source_end = source_start + source_chunk.shape()[dim];
-        let target_start = target_chunk.offsets()[dim];
-        let target_end = target_start + target_chunk.shape()[dim];
-
-        let intersect_start = source_start.max(target_start);
-        let intersect_end = source_end.min(target_end);
-
-        // No intersection if any dimension doesn't overlap
-        if intersect_start >= intersect_end {
-            return Vec::new();
-        }
-
-        intersection_start.push(intersect_start);
-        intersection_size.push(intersect_end - intersect_start);
-    }
-
-    // Step 2: Directly compute byte ranges from intersection
-    compute_byte_ranges_from_intersection(
-        &intersection_start,
-        &intersection_size,
-        source_chunk,
-        target_chunk,
-        source_header_size,
-        source_data_offset,
-        dtype_size,
-        strides,
-    )
-}
-
-/// Specialized function for write operations - computes write ranges directly
-pub fn compute_write_ranges_direct(
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    target_header_size: usize,
-    target_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<WriteRange> {
-    let ndim = full_shape.len();
-
-    // Step 1: Quick intersection check in all dimensions
-    let mut intersection_start = Vec::with_capacity(ndim);
-    let mut intersection_size = Vec::with_capacity(ndim);
-
-    for dim in 0..ndim {
-        let source_start = source_chunk.offsets()[dim];
-        let source_end = source_start + source_chunk.shape()[dim];
-        let target_start = target_chunk.offsets()[dim];
-        let target_end = target_start + target_chunk.shape()[dim];
-
-        let intersect_start = source_start.max(target_start);
-        let intersect_end = source_end.min(target_end);
-
-        // No intersection if any dimension doesn't overlap
-        if intersect_start >= intersect_end {
-            return Vec::new();
-        }
-
-        intersection_start.push(intersect_start);
-        intersection_size.push(intersect_end - intersect_start);
-    }
-
-    // Step 2: Directly compute write ranges from intersection
-    compute_write_ranges_from_intersection(
-        &intersection_start,
-        &intersection_size,
-        source_chunk,
-        target_chunk,
-        target_header_size,
-        target_data_offset,
-        dtype_size,
-        strides,
-    )
-}
-
-/// Helper struct for write operations
-#[derive(Debug, Clone)]
-pub struct WriteRange {
-    pub target_start: u64,
-    pub target_end: u64,
-    pub source_offset: usize,
-    pub length: usize,
-}
-
-/// Directly compute byte ranges from n-dimensional intersection
-fn compute_byte_ranges_from_intersection(
-    intersect_start: &[usize],
-    intersect_size: &[usize],
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    source_header_size: usize,
-    source_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-) -> Vec<(u64, u64, u64)> {
-    let mut ranges = Vec::new();
-
-    // Calculate total intersection volume
-    let total_positions: usize = intersect_size.iter().product();
-    if total_positions == 0 {
-        return ranges;
-    }
-
-    // Look for contiguous blocks to minimize number of ranges
-    let contiguous_blocks = find_contiguous_blocks(
-        intersect_start,
-        intersect_size,
-        source_chunk,
-        target_chunk,
-        strides,
-    );
-
-    for block in contiguous_blocks {
-        let source_start_bytes = block.source_offset * dtype_size;
-        let source_end_bytes = (block.source_offset + block.length) * dtype_size;
-        let target_offset_bytes = block.target_offset * dtype_size;
-
-        let file_source_start =
-            (source_header_size + source_data_offset + source_start_bytes) as u64;
-        let file_source_end = (source_header_size + source_data_offset + source_end_bytes) as u64;
-
-        ranges.push((
-            file_source_start,
-            file_source_end,
-            target_offset_bytes as u64,
-        ));
-    }
-
-    ranges
-}
-
-/// Directly compute write ranges from n-dimensional intersection
-fn compute_write_ranges_from_intersection(
-    intersect_start: &[usize],
-    intersect_size: &[usize],
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    target_header_size: usize,
-    target_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-) -> Vec<WriteRange> {
-    let mut ranges = Vec::new();
-
-    // Calculate total intersection volume
-    let total_positions: usize = intersect_size.iter().product();
-    if total_positions == 0 {
-        return ranges;
-    }
-
-    // Look for contiguous blocks to minimize number of ranges
-    let contiguous_blocks = find_contiguous_blocks(
-        intersect_start,
-        intersect_size,
-        source_chunk,
-        target_chunk,
-        strides,
-    );
-
-    for block in contiguous_blocks {
-        let target_start_bytes = block.target_offset * dtype_size;
-        let target_end_bytes = (block.target_offset + block.length) * dtype_size;
-        let source_offset_bytes = block.source_offset * dtype_size;
-
-        let file_target_start =
-            (target_header_size + target_data_offset + target_start_bytes) as u64;
-        let file_target_end = (target_header_size + target_data_offset + target_end_bytes) as u64;
-
-        ranges.push(WriteRange {
-            target_start: file_target_start,
-            target_end: file_target_end,
-            source_offset: source_offset_bytes,
-            length: (target_end_bytes - target_start_bytes),
-        });
-    }
-
-    ranges
-}
-
-/// Helper struct for contiguous memory blocks
-#[derive(Debug)]
-struct ContiguousBlock {
-    source_offset: usize,
-    target_offset: usize,
-    length: usize,
-}
-
-/// Find contiguous blocks in the intersection to minimize the number of memory ranges
-fn find_contiguous_blocks(
-    intersect_start: &[usize],
-    intersect_size: &[usize],
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    strides: &[usize],
-) -> Vec<ContiguousBlock> {
-    let ndim = intersect_start.len();
-    let mut blocks = Vec::new();
-
-    // Find the innermost dimension that has contiguous memory layout
-    let innermost_contiguous_dim =
-        find_innermost_contiguous_dim(intersect_start, intersect_size, source_chunk, target_chunk);
-
-    if innermost_contiguous_dim == ndim {
-        // Entire intersection is contiguous
-        let total_length: usize = intersect_size.iter().product();
-        let source_offset = calculate_chunk_offset(intersect_start, source_chunk, strides);
-        let target_offset = calculate_chunk_offset(intersect_start, target_chunk, strides);
-
-        blocks.push(ContiguousBlock {
-            source_offset,
-            target_offset,
-            length: total_length,
-        });
-    } else {
-        // Generate blocks for non-contiguous dimensions
-        generate_blocks_recursive(
-            0,
-            innermost_contiguous_dim,
-            intersect_start,
-            intersect_size,
-            source_chunk,
-            target_chunk,
-            strides,
-            &mut blocks,
-        );
-    }
-
-    blocks
-}
-
-/// Find how many trailing dimensions are contiguous
-fn find_innermost_contiguous_dim(
-    intersect_start: &[usize],
-    intersect_size: &[usize],
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-) -> usize {
-    let ndim = intersect_start.len();
-
-    // Conservative fix: if intersection spans multiple elements in multiple dimensions,
-    // be cautious about contiguity to avoid the bug where non-contiguous memory
-    // regions are treated as contiguous blocks
-    let multi_dim_intersection = intersect_size.iter()
-        .filter(|&&size| size > 1)
-        .count() > 1;
-        
-    if multi_dim_intersection {
-        // Only treat the innermost dimension as potentially contiguous
-        // This prevents incorrect merging of memory regions that have gaps
-        // (like when splitting along dimension 1 in a 2D tensor)
-        return ndim - 1;
-    }
-
-    // Original logic for simple cases (single dimension or single element intersections)
-    for dim in (0..ndim).rev() {
-        // Check if this dimension is fully spanned in both chunks
-        let source_spans_full = (intersect_start[dim] == source_chunk.offsets()[dim])
-            && (intersect_size[dim] == source_chunk.shape()[dim]);
-        let target_spans_full = (intersect_start[dim] == target_chunk.offsets()[dim])
-            && (intersect_size[dim] == target_chunk.shape()[dim]);
-
-        if !source_spans_full || !target_spans_full {
-            return dim + 1;
-        }
-    }
-
-    0 // All dimensions are contiguous
-}
-
-/// Calculate offset within a chunk for given coordinates
-fn calculate_chunk_offset(
-    coords: &[usize],
-    chunk: &crate::topology::Chunk,
-    _full_tensor_strides: &[usize],
-) -> usize {
-    let mut offset = 0;
-    
-    // Calculate strides for this specific chunk based on its shape
-    let ndim = chunk.shape().len();
-    let mut chunk_strides = vec![1; ndim];
-    for i in (0..ndim - 1).rev() {
-        chunk_strides[i] = chunk_strides[i + 1] * chunk.shape()[i + 1];
-    }
-    
-    for (dim, &coord) in coords.iter().enumerate() {
-        let chunk_coord = coord - chunk.offsets()[dim];
-        let contribution = chunk_coord * chunk_strides[dim];
-        offset += contribution;
-    }
-    offset
-}
-
-/// Recursively generate contiguous blocks for non-contiguous dimensions
-fn generate_blocks_recursive(
-    dim_idx: usize,
-    contiguous_from_dim: usize,
-    intersect_start: &[usize],
-    intersect_size: &[usize],
-    source_chunk: &crate::topology::Chunk,
-    target_chunk: &crate::topology::Chunk,
-    strides: &[usize],
-    blocks: &mut Vec<ContiguousBlock>,
-) {
-    if dim_idx == contiguous_from_dim {
-        // Calculate contiguous block size from this dimension onwards
-        let block_length: usize = intersect_size[dim_idx..].iter().product();
-
-        // Use the current coordinates (passed down from recursion)
-        let coords = intersect_start;
-
-        let source_offset = calculate_chunk_offset(&coords, source_chunk, strides);
-        let target_offset = calculate_chunk_offset(&coords, target_chunk, strides);
-
-        blocks.push(ContiguousBlock {
-            source_offset,
-            target_offset,
-            length: block_length,
-        });
-        return;
-    }
-
-    // Iterate through all positions in this dimension
-    for i in 0..intersect_size[dim_idx] {
-        let mut coords = intersect_start.to_vec();
-        coords[dim_idx] = intersect_start[dim_idx] + i;
-
-        // Recursively process next dimension with updated coordinates
-        generate_blocks_recursive(
-            dim_idx + 1,
-            contiguous_from_dim,
-            &coords,
-            intersect_size,
-            source_chunk,
-            target_chunk,
-            strides,
-            blocks,
-        );
-    }
-}
-
-/// Specialized function for shared-to-distributed: compute ranges for entire target chunk
-pub fn compute_shared_to_distributed_ranges(
-    target_chunk: &crate::topology::Chunk,
-    source_header_size: usize,
-    source_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<(u64, u64, u64)> {
-    // For shared tensor, we need all the ranges that correspond to the target chunk
-    let target_intervals = crate::topology::get_intervals(target_chunk, strides, full_shape);
-    let mut ranges = Vec::new();
-    let mut target_offset_elements = 0;
-
-    for (start_elem, end_elem) in target_intervals {
-        let start_bytes = start_elem * dtype_size;
-        let end_bytes = end_elem * dtype_size;
-        let target_offset_bytes = target_offset_elements * dtype_size;
-
-        let source_start = (source_header_size + source_data_offset + start_bytes) as u64;
-        let source_end = (source_header_size + source_data_offset + end_bytes) as u64;
-
-        ranges.push((source_start, source_end, target_offset_bytes as u64));
-        target_offset_elements += end_elem - start_elem;
-    }
-
-    ranges
-}
-
-/// Specialized function for distributed-to-shared: compute write ranges for entire source chunk  
-pub fn compute_distributed_to_shared_write_ranges(
-    source_chunk: &crate::topology::Chunk,
-    target_header_size: usize,
-    target_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<WriteRange> {
-    // For shared tensor, the source chunk maps directly to absolute positions
-    let source_intervals = crate::topology::get_intervals(source_chunk, strides, full_shape);
-    let mut ranges = Vec::new();
-    let mut source_offset_elements = 0;
-
-    for (start_elem, end_elem) in source_intervals {
-        let source_offset_bytes = source_offset_elements * dtype_size;
-        let target_start_bytes = start_elem * dtype_size;
-        let length_bytes = (end_elem - start_elem) * dtype_size;
-
-        let target_start = (target_header_size + target_data_offset + target_start_bytes) as u64;
-        let target_end = target_start + length_bytes as u64;
-
-        ranges.push(WriteRange {
-            target_start,
-            target_end,
-            source_offset: source_offset_bytes,
-            length: length_bytes,
-        });
-
-        source_offset_elements += end_elem - start_elem;
-    }
-
-    ranges
-}
-
-/// Specialized function for distributed-to-shared reads: compute read ranges for entire source chunk
-pub fn compute_distributed_to_shared_ranges(
-    source_chunk: &crate::topology::Chunk,
-    source_header_size: usize,
-    source_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<(u64, u64, u64)> {
-    // For distributed-to-shared, the source chunk maps to its absolute positions in the shared tensor
-    let source_intervals = crate::topology::get_intervals(source_chunk, strides, full_shape);
-    let mut ranges = Vec::new();
-    let mut source_offset_elements = 0;
-
-    for (start_elem, end_elem) in source_intervals {
-        let source_offset_bytes = source_offset_elements * dtype_size;
-        let target_start_bytes = start_elem * dtype_size; // Absolute position in shared tensor
-        let length_bytes = (end_elem - start_elem) * dtype_size;
-
-        let file_source_start =
-            (source_header_size + source_data_offset + source_offset_bytes) as u64;
-        let file_source_end = file_source_start + length_bytes as u64;
-
-        ranges.push((
-            file_source_start,
-            file_source_end,
-            target_start_bytes as u64,
-        ));
-        source_offset_elements += end_elem - start_elem;
-    }
-
-    ranges
-}
-
-/// Specialized function for shared-to-distributed writes: compute write ranges for entire target chunk
-pub fn compute_shared_to_distributed_write_ranges(
-    target_chunk: &crate::topology::Chunk,
-    target_header_size: usize,
-    target_data_offset: usize,
-    dtype_size: usize,
-    strides: &[usize],
-    full_shape: &[usize],
-) -> Vec<WriteRange> {
-    // For shared-to-distributed, the target chunk receives data from its absolute positions in the shared tensor
-    let target_intervals = crate::topology::get_intervals(target_chunk, strides, full_shape);
-    let mut ranges = Vec::new();
-    let mut target_offset_elements = 0;
-
-    for (start_elem, end_elem) in target_intervals {
-        let source_offset_bytes = start_elem * dtype_size; // Absolute position in shared tensor
-        let target_start_bytes = target_offset_elements * dtype_size;
-        let length_bytes = (end_elem - start_elem) * dtype_size;
-
-        let file_target_start =
-            (target_header_size + target_data_offset + target_start_bytes) as u64;
-        let file_target_end = file_target_start + length_bytes as u64;
-
-        ranges.push(WriteRange {
-            target_start: file_target_start,
-            target_end: file_target_end,
-            source_offset: source_offset_bytes,
-            length: length_bytes,
-        });
-
-        target_offset_elements += end_elem - start_elem;
-    }
-
-    ranges
 }

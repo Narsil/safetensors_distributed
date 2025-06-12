@@ -1,6 +1,7 @@
-// pub mod loader;
-// pub mod plan;
-pub mod redistributor;
-// pub mod tensor;
-pub mod topology;
-// pub mod topology_loader;
+#![deny(missing_docs)]
+#![doc = include_str!("../../README.md")]
+mod redistributor;
+mod topology;
+
+pub use redistributor::{Redistributor, load_or_create_topology};
+pub use topology::{Chunk, DistributedInfo, SharedInfo, Tensor, Topology};
