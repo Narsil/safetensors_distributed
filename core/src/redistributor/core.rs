@@ -1,5 +1,5 @@
 use super::location::{Source, SourceLocation, Target, WriteLocation};
-use super::task::{Task, TaskSource};
+use super::task::Task;
 use super::{
     Layout, RedistributorError, Result, compute_distributed_to_shared_ranges,
     compute_shared_to_distributed_ranges,
@@ -503,21 +503,22 @@ impl AsyncTensorRedistributor {
         let target_end = (target_header_size + target_tensor_info.data_offsets.1) as u64;
 
         // Collect source reads needed to fulfill this target write
-        let mut task_source = match &self.source.location {
-            SourceLocation::Local { .. } => TaskSource::new_local(),
-            SourceLocation::Remote {
-                client,
-                base_url,
-                auth_headers,
-                http_semaphore,
-                ..
-            } => TaskSource::new_remote(
-                client.clone(),
-                base_url.clone(),
-                auth_headers.clone(),
-                http_semaphore.clone(),
-            ),
-        };
+        // let mut task_source = match &self.source.location {
+        //     SourceLocation::Local { .. } => TaskSource::new_local(),
+        //     SourceLocation::Remote {
+        //         client,
+        //         base_url,
+        //         auth_headers,
+        //         http_semaphore,
+        //         ..
+        //     } => TaskSource::new_remote(
+        //         client.clone(),
+        //         base_url.clone(),
+        //         auth_headers.clone(),
+        //         http_semaphore.clone(),
+        //     ),
+        // };
+        let mut task_source = Vec::new();
         let mut source_ranges = Vec::new();
         let mut ranges_per_file = Vec::new();
 
@@ -588,7 +589,8 @@ impl AsyncTensorRedistributor {
                 target_file_index,
                 target_start,
                 target_end,
-                task_source.into_task_sources(),
+                // task_source.into_task_sources(),
+                task_source,
                 source_ranges,
                 ranges_per_file,
             ) {
@@ -731,7 +733,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::DistributedInfo,
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
-        task_source: &mut TaskSource,
+        task_source: &mut Vec<Arc<Mmap>>,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -792,7 +794,11 @@ impl AsyncTensorRedistributor {
                     "      Added {} ranges from source file {}",
                     ranges_for_this_file, source_file_index
                 );
-                task_source.add_from_location(&self.source.location, source_file_index);
+                // task_source.add_from_location(&self.source.location, source_file_index);
+                let SourceLocation::Local { mmaps } = &self.source.location else {
+                    unreachable!();
+                };
+                task_source.push(Arc::clone(&mmaps[source_file_index]));
                 ranges_per_file.push(ranges_for_this_file);
             }
             // println!("Loop {:?}", start.elapsed());
@@ -807,7 +813,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::SharedInfo,
         target_info: &crate::topology::DistributedInfo,
         target_file_index: usize,
-        task_source: &mut TaskSource,
+        task_source: &mut Vec<Arc<Mmap>>,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -866,7 +872,10 @@ impl AsyncTensorRedistributor {
                 "      Added {} ranges from source file {}",
                 ranges_for_this_file, source_file_index
             );
-            task_source.add_from_location(&self.source.location, source_file_index);
+            let SourceLocation::Local { mmaps } = &self.source.location else {
+                unreachable!();
+            };
+            task_source.push(Arc::clone(&mmaps[source_file_index]));
             ranges_per_file.push(ranges_for_this_file);
         }
 
@@ -879,7 +888,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::SharedInfo,
         _target_info: &crate::topology::SharedInfo,
         _target_file_index: usize,
-        task_source: &mut TaskSource,
+        task_source: &mut Vec<Arc<Mmap>>,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -910,7 +919,10 @@ impl AsyncTensorRedistributor {
 
         // Add the source mmap and record how many ranges belong to this file
         trace!("      Added 1 range from source file {}", source_file_index);
-        task_source.add_from_location(&self.source.location, source_file_index);
+        let SourceLocation::Local { mmaps } = &self.source.location else {
+            unreachable!();
+        };
+        task_source.push(Arc::clone(&mmaps[source_file_index]));
         ranges_per_file.push(1);
 
         Ok(())
@@ -922,7 +934,7 @@ impl AsyncTensorRedistributor {
         source_info: &crate::topology::DistributedInfo,
         _target_info: &crate::topology::SharedInfo,
         _target_file_index: usize,
-        task_source: &mut TaskSource,
+        task_source: &mut Vec<Arc<Mmap>>,
         source_ranges: &mut Vec<(u64, u64, u64)>,
         ranges_per_file: &mut Vec<usize>,
     ) -> Result<()> {
@@ -974,7 +986,10 @@ impl AsyncTensorRedistributor {
                     "      Added {} ranges from source file {}",
                     ranges_for_this_file, source_file_index
                 );
-                task_source.add_from_location(&self.source.location, source_file_index);
+                let SourceLocation::Local { mmaps } = &self.source.location else {
+                    unreachable!();
+                };
+                task_source.push(Arc::clone(&mmaps[source_file_index]));
                 ranges_per_file.push(ranges_for_this_file);
             }
         }
@@ -1477,104 +1492,6 @@ mod tests {
         assert_eq!(final_tensor2_data, tensor2_data.as_slice());
 
         trace!("✅ Round-trip redistribution test passed!");
-    }
-
-    // Helper function to set up common test data and topologies
-    async fn setup_roundtrip_test_data() -> (TempDir, String, Topology, Topology, Vec<f32>, Vec<f32>)
-    {
-        use std::collections::BTreeMap;
-        use tempfile::TempDir;
-
-        // Create temp directory for source data
-        let source_dir = TempDir::new().unwrap();
-
-        // Create original model.safetensors with 2 tensors
-        let tensor1_data = create_test_data_8x4(); // 8x4 tensor = 32 elements
-        let tensor2_data = create_test_data_4x8(); // 4x8 tensor = 32 elements
-
-        let tensor1_bytes = f32s_to_le_bytes(&tensor1_data);
-        let tensor2_bytes = f32s_to_le_bytes(&tensor2_data);
-
-        let mut tensors = BTreeMap::new();
-        tensors.insert(
-            "tensor1".to_string(),
-            TensorView::new(Dtype::F32, vec![8, 4], &tensor1_bytes).unwrap(),
-        );
-        tensors.insert(
-            "tensor2".to_string(),
-            TensorView::new(Dtype::F32, vec![4, 8], &tensor2_bytes).unwrap(),
-        );
-
-        let original_bytes = serialize(&tensors, &None).unwrap();
-        let original_path = source_dir.path().join("model.safetensors");
-        tokio::fs::write(&original_path, &original_bytes)
-            .await
-            .unwrap();
-
-        // Calculate hash of original file for comparison
-        let original_hash = calculate_file_hash(&original_path).await;
-
-        // Define target topology for 2 ranks distribution
-        let mut target_tensors = BTreeMap::new();
-
-        // Split tensor1 (8x4) along first dimension (8/2 = 4 each)
-        target_tensors.insert(
-            "tensor1".to_string(),
-            Tensor::Distributed(DistributedInfo::new(
-                vec![8, 4],
-                Dtype::F32,
-                vec![
-                    Chunk::new(vec![0, 0], vec![4, 4], 0), // First 4 rows to rank 0
-                    Chunk::new(vec![4, 0], vec![4, 4], 1), // Last 4 rows to rank 1
-                ],
-            )),
-        );
-
-        // Split tensor2 (4x8) along second dimension (8/2 = 4 each)
-        target_tensors.insert(
-            "tensor2".to_string(),
-            Tensor::Distributed(DistributedInfo::new(
-                vec![4, 8],
-                Dtype::F32,
-                vec![
-                    Chunk::new(vec![0, 0], vec![4, 4], 0), // First 4 columns to rank 0
-                    Chunk::new(vec![0, 4], vec![4, 4], 1), // Last 4 columns to rank 1
-                ],
-            )),
-        );
-
-        let distributed_topology = Topology::new(
-            target_tensors,
-            vec![
-                "rank0.safetensors".to_string(),
-                "rank1.safetensors".to_string(),
-            ],
-            2,
-        )
-        .unwrap();
-
-        // Define final topology for reconstruction back to 1 rank
-        let mut final_tensors = BTreeMap::new();
-        final_tensors.insert(
-            "tensor1".to_string(),
-            Tensor::Shared(SharedInfo::new(vec![8, 4], Dtype::F32, vec![0])),
-        );
-        final_tensors.insert(
-            "tensor2".to_string(),
-            Tensor::Shared(SharedInfo::new(vec![4, 8], Dtype::F32, vec![0])),
-        );
-
-        let final_topology =
-            Topology::new(final_tensors, vec!["model.safetensors".to_string()], 1).unwrap();
-
-        (
-            source_dir,
-            original_hash,
-            distributed_topology,
-            final_topology,
-            tensor1_data,
-            tensor2_data,
-        )
     }
 
     #[test]

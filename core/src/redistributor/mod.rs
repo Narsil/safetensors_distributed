@@ -15,21 +15,6 @@ use tokio::task::JoinError;
 // Re-export main types
 pub use core::AsyncTensorRedistributor;
 
-// /// Strategy for ordering reads and writes during redistribution
-// #[derive(Clone, Copy, Debug)]
-// pub enum RedistributionStrategy {
-//     /// Read files sequentially, write tasks can execute unordered
-//     ReadSerialWriteUnordered,
-//     /// Read tasks can execute unordered, but write tasks execute serially
-//     ReadUnorderedWriteSerial,
-// }
-
-// impl Default for RedistributionStrategy {
-//     fn default() -> Self {
-//         Self::ReadUnorderedWriteSerial
-//     }
-// }
-
 /// Structure for deserializing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
 pub struct SafetensorsIndex {
@@ -374,7 +359,7 @@ mod tests {
         );
 
         // All ranges should have valid byte offsets
-        for (start, end, target_offset) in result {
+        for (start, end, _target_offset) in result {
             assert!(start < end, "Start should be less than end");
             assert!(
                 start >= (source_header_size + source_data_offset) as u64,
@@ -495,7 +480,7 @@ mod tests {
 
         // Check that ranges are ordered and valid
         let mut last_end = 0u64;
-        for (start, end, target_offset) in result {
+        for (start, end, _target_offset) in result {
             assert!(start >= last_end, "Ranges should be ordered");
             assert!(start < end, "Start should be less than end");
             assert!(
@@ -532,7 +517,7 @@ mod tests {
         );
 
         // Check range validity
-        for (start, end, target_offset) in result {
+        for (start, end, _target_offset) in result {
             assert!(start < end, "Start should be less than end");
             assert!(
                 start >= (source_header_size + source_data_offset) as u64,
@@ -657,7 +642,7 @@ mod tests {
             1,
             "Should have exactly one range for single element"
         );
-        let (start, end, target_offset) = result[0];
+        let (start, end, _target_offset) = result[0];
         assert_eq!(end - start, 4, "Should have 4 bytes for f32");
     }
 
@@ -699,7 +684,7 @@ mod tests {
         let strides = vec![3, 1];
 
         // Test with different dtype sizes
-        for (dtype_size, expected_element_bytes) in [(1, 1), (2, 2), (4, 4), (8, 8)] {
+        for (dtype_size, _expected_element_bytes) in [(1, 1), (2, 2), (4, 4), (8, 8)] {
             let result = compute_read_ranges_direct(
                 &source_chunk,
                 &target_chunk,
@@ -749,7 +734,7 @@ mod tests {
         // Should handle 3D intersection correctly
         if !result.is_empty() {
             // Verify all ranges are valid
-            for (start, end, target_offset) in result {
+            for (start, end, _target_offset) in result {
                 assert!(start < end, "3D: Start should be less than end");
                 assert!(start >= 24, "3D: Start should be after header+data offset");
             }

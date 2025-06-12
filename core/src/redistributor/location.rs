@@ -1,4 +1,4 @@
-use super::task::{Task, TaskSources};
+use super::task::Task;
 use super::{Layout, RedistributorError, Result};
 use crate::topology::Topology;
 use futures::future::join_all;
@@ -89,7 +89,7 @@ impl WriteLocation {
         target_file_index: usize,
         target_start: u64,
         target_end: u64,
-        source: TaskSources,
+        source: Vec<Arc<Mmap>>,
         source_ranges: Vec<(u64, u64, u64)>,
         ranges_per_file: Vec<usize>,
     ) -> Option<Task> {
