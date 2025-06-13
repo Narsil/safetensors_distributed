@@ -6,7 +6,6 @@ use super::{
 };
 use crate::topology::{Tensor, Topology};
 use indicatif::{ProgressBar, ProgressStyle};
-use log::error;
 use memmap2::Mmap;
 use num_cpus;
 use safetensors::tensor::{Metadata, TensorInfo};
