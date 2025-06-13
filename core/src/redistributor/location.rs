@@ -2,7 +2,7 @@ use super::task::Task;
 use super::{Layout, RedistributorError, Result};
 use crate::topology::Topology;
 use log::trace;
-use memmap2::{Mmap, MmapMut};
+use memmap2::{Mmap, MmapMut, Advice};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -141,6 +141,9 @@ impl WriteLocation {
                 })?
             };
 
+            // Advise sequential access for write operations
+            mmap.advise(Advice::Sequential)?;
+
             target_mmaps.push(Arc::new(mmap));
         }
 
@@ -154,7 +157,44 @@ pub struct Source {
     pub location: SourceLocation,
 }
 
+impl Source {
+    pub fn new(layout: Layout, location: SourceLocation) -> Self {
+        Self { layout, location }
+    }
+}
+
 pub struct Target {
     pub layout: Layout,
     pub location: WriteLocation,
+}
+
+impl Target {
+    pub fn new(layout: Layout, location: WriteLocation) -> Self {
+        Self { layout, location }
+    }
+}
+
+/// Initialize source memory maps with random access pattern
+pub fn init_source_mmaps(files: &[File]) -> Result<Vec<Arc<Mmap>>> {
+    use memmap2::MmapOptions;
+
+    let mut source_mmaps = Vec::new();
+
+    for file in files {
+        let mmap = unsafe {
+            MmapOptions::new().map(file).map_err(|e| {
+                RedistributorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create memory map: {}", e),
+                ))
+            })?
+        };
+
+        // Advise random access for read operations
+        mmap.advise(Advice::Random)?;
+
+        source_mmaps.push(Arc::new(mmap));
+    }
+
+    Ok(source_mmaps)
 }
