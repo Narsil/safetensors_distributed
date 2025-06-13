@@ -158,29 +158,32 @@ impl Redistributor {
 
     /// Pre-calculate all headers, offsets, and file structures based on target topology
     fn pre_calculate_metadatas(topology: &Topology) -> Result<Vec<(usize, Metadata)>> {
-        let mut rank_tensor_info: Vec<Vec<(String, TensorInfo)>> =
-            (0..topology.world_size()).map(|_| Vec::new()).collect();
-        let mut rank_offsets = vec![0usize; topology.world_size()];
+        let mut rank_tensor_info: Vec<Vec<(String, TensorInfo)>> = (0..topology.filenames().len())
+            .map(|_| Vec::new())
+            .collect();
+        let mut file_offsets = vec![0usize; topology.filenames().len()];
         // Process each tensor according to the target topology
         for (tensor_name, tensor) in topology.tensors() {
             match tensor {
                 Tensor::Distributed(dist_info) => {
                     // Process distributed tensor - each rank gets a chunk
-                    for (rank, chunk) in dist_info.chunks().iter().enumerate() {
+                    for chunk in dist_info.chunks() {
                         let chunk_shape = chunk.shape().to_vec();
                         let chunk_size =
                             chunk_shape.iter().product::<usize>() * dist_info.dtype().size();
 
-                        let data_offsets = (rank_offsets[rank], rank_offsets[rank] + chunk_size);
+                        let idx = chunk.filename_index();
+
+                        let data_offsets = (file_offsets[idx], file_offsets[idx] + chunk_size);
                         let tensor_info = TensorInfo {
                             dtype: dist_info.dtype(),
                             shape: chunk_shape,
                             data_offsets,
                         };
 
-                        rank_tensor_info[rank].push((tensor_name.clone(), tensor_info));
+                        rank_tensor_info[idx].push((tensor_name.clone(), tensor_info));
 
-                        rank_offsets[rank] += chunk_size;
+                        file_offsets[idx] += chunk_size;
                     }
                 }
                 Tensor::Shared(shared_info) => {
@@ -188,26 +191,26 @@ impl Redistributor {
                     let chunk_size =
                         shared_info.shape().iter().product::<usize>() * shared_info.dtype().size();
 
-                    for rank in 0..topology.world_size() {
+                    for &idx in shared_info.filename_indices() {
                         let tensor_info = TensorInfo {
                             dtype: shared_info.dtype(),
                             shape: shared_info.shape().to_vec(),
-                            data_offsets: (rank_offsets[rank], rank_offsets[rank] + chunk_size),
+                            data_offsets: (file_offsets[idx], file_offsets[idx] + chunk_size),
                         };
 
-                        rank_tensor_info[rank].push((tensor_name.clone(), tensor_info));
+                        rank_tensor_info[idx].push((tensor_name.clone(), tensor_info));
 
-                        rank_offsets[rank] += chunk_size;
+                        file_offsets[idx] += chunk_size;
                     }
                 }
             }
         }
         // Create headers and final file info
-        let metadatas: Result<Vec<_>> = (0..topology.world_size())
-            .map(|rank| {
+        let metadatas: Result<Vec<_>> = (0..topology.filenames().len())
+            .map(|idx| {
                 let metadata = Metadata::new(
                     None, // metadata_header
-                    rank_tensor_info[rank].iter().cloned().collect(),
+                    rank_tensor_info[idx].iter().cloned().collect(),
                 )?;
                 let metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
                 // Force alignment to 8 bytes.

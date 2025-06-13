@@ -602,7 +602,6 @@ impl Topology {
                         ));
                     }
 
-                    let mut set = vec![false; self.filenames.len()];
                     // Check filename indices
                     for chunk in &info.chunks {
                         if chunk.filename_index >= self.filenames.len() {
@@ -612,14 +611,6 @@ impl Topology {
                                 self.filenames.len(),
                             ));
                         }
-                        set[chunk.filename_index] = true;
-                    }
-                    let missing_indices: Vec<bool> = set.into_iter().filter(|f| !*f).collect();
-                    if !missing_indices.is_empty() {
-                        return Err(TopologyError::FilenameIndexMissing(
-                            name.clone(),
-                            missing_indices,
-                        ));
                     }
 
                     // Check for overlaps

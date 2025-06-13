@@ -30,15 +30,8 @@ fn create_target_topology(
 ) -> Result<Topology> {
     let mut target_tensors = BTreeMap::new();
 
-    // Generate target filenames
-    let target_filenames = if target_world_size == 1 {
-        vec!["model.safetensors".to_string()]
-    } else {
-        (0..target_world_size)
-            .map(|rank| format!("rank{rank}.safetensors"))
-            .collect()
-    };
-
+    let chunk_size: usize = 5 * 1024 * 1024 * 1204;
+    let mut current_sizes = vec![0; target_world_size];
     // Process each tensor from the source topology
     for (tensor_name, source_tensor) in source_topology.tensors() {
         let (shape, dtype) = match source_tensor {
@@ -68,7 +61,11 @@ fn create_target_topology(
                 let mut chunk_offsets = vec![0; chunk_shape.len()];
                 chunk_offsets[split_dim] = start;
 
-                let chunk = Chunk::new(chunk_offsets, chunk_shape, rank);
+                let local_size = chunk_shape.iter().product::<usize>() * dtype.size();
+                current_sizes[rank] += local_size;
+                let filename_index = current_sizes[rank] / chunk_size;
+                let chunk = Chunk::new(chunk_offsets, chunk_shape, filename_index);
+
                 chunks.push(chunk);
             }
 
@@ -78,12 +75,42 @@ fn create_target_topology(
             );
         } else {
             // Keep as shared tensor
+
+            let local_size = shape.iter().product::<usize>() * dtype.size();
+            current_sizes.iter_mut().for_each(|s| *s += local_size);
+            let filename_indices: Vec<_> = current_sizes
+                .iter()
+                .enumerate()
+                .map(|(r, current_size)| (current_size / chunk_size * r))
+                .collect();
             target_tensors.insert(
                 tensor_name.clone(),
-                Tensor::Shared(SharedInfo::new(shape, dtype, vec![0])),
+                Tensor::Shared(SharedInfo::new(shape, dtype, filename_indices)),
             );
         }
     }
+
+    let target_filenames: Vec<_> = current_sizes
+        .into_iter()
+        .enumerate()
+        .map(|(r, s)| {
+            let nfiles = (s + chunk_size - 1) / chunk_size;
+
+            (0..nfiles).map(move |x| format!("model_{r}_{x}.safetensors"))
+        })
+        .flatten()
+        .collect();
+
+    println!("n_files {:?}", target_filenames);
+
+    // // Generate target filenames
+    // let target_filenames = if target_world_size == 1 {
+    //     vec!["model.safetensors".to_string()]
+    // } else {
+    //     (0..target_world_size)
+    //         .map(|rank| format!("rank{rank}.safetensors"))
+    //         .collect()
+    // };
 
     Ok(Topology::new(
         target_tensors,
@@ -137,7 +164,7 @@ fn redistribute_model_from_local<P: AsRef<Path>>(
     println!("Source topology has {} ranks", source_ranks);
 
     // Create target topology
-    let target_topology = create_target_topology(&source_topology, target_world_size).unwrap();
+    let target_topology = create_target_topology(&source_topology, target_world_size)?;
     println!(
         "Target topology will have {} ranks",
         target_topology.world_size()
