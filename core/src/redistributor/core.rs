@@ -115,10 +115,8 @@ impl Redistributor {
         );
 
         let p = progress.clone();
-        // let strategy = self.strategy;
         let handle = tokio::spawn(async move {
             while let Some(task) = rx.recv().await {
-                // if let Task::Write(write_task) = task {
                 let length = (task.target_end - task.target_start) as usize;
                 if let Err(e) = task.run().await {
                     error!("Write task failed: {}", e);
@@ -221,7 +219,6 @@ impl Redistributor {
         Ok(metadatas)
     }
 
-    /// Create write-focused tasks for ReadUnorderedWriteSerial strategy
     /// Iterates target files → target tensors by data_offset (current logic)
     async fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
         // Process each target file in order
@@ -287,21 +284,6 @@ impl Redistributor {
         let target_end = (target_header_size + target_tensor_info.data_offsets.1) as u64;
 
         // Collect source reads needed to fulfill this target write
-        // let mut task_source = match &self.source.location {
-        //     SourceLocation::Local { .. } => TaskSource::new_local(),
-        //     SourceLocation::Remote {
-        //         client,
-        //         base_url,
-        //         auth_headers,
-        //         http_semaphore,
-        //         ..
-        //     } => TaskSource::new_remote(
-        //         client.clone(),
-        //         base_url.clone(),
-        //         auth_headers.clone(),
-        //         http_semaphore.clone(),
-        //     ),
-        // };
         let mut task_source = Vec::new();
         let mut source_ranges = Vec::new();
         let mut ranges_per_file = Vec::new();
