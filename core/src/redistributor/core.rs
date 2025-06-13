@@ -8,12 +8,11 @@ use crate::topology::{Tensor, Topology};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::error;
 use memmap2::Mmap;
+use num_cpus;
 use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, Receiver, channel};
-use std::thread;
-use num_cpus;
+use std::thread::{self, JoinHandle};
 
 /// The structure responsible for managing a redistribution
 /// from one topology to another on disk.
@@ -121,18 +120,10 @@ impl Redistributor {
         // Spawn worker threads
         let mut handles = Vec::with_capacity(num_cpus);
         for rank in 0..num_cpus {
-            let p = progress.clone();
+            let mut p = progress.clone();
             let redistributor = self.clone();
-            let handle = thread::spawn(move || {
-                let mut current_size = 0u64;
-                while let Some(task) = redistributor.create_tasks_for_rank(rank, chunk_size, &mut current_size) {
-                    let length = (task.target_end - task.target_start) as usize;
-                    if let Err(e) = task.run() {
-                        error!("Write task failed on worker {}: {}", rank, e);
-                        return Err(e);
-                    }
-                    p.inc(length as u64);
-                }
+            let handle: JoinHandle<Result<()>> = thread::spawn(move || {
+                redistributor.create_tasks_for_rank(rank, chunk_size, &mut p)?;
                 Ok(())
             });
             handles.push(handle);
@@ -148,9 +139,7 @@ impl Redistributor {
 
         progress.set_message("Done, kernel flush...");
 
-        self.target
-            .location
-            .save(&self.target.layout.topology)?;
+        self.target.location.save(&self.target.layout.topology)?;
 
         progress.finish_with_message("Done");
 
@@ -233,7 +222,13 @@ impl Redistributor {
     }
 
     /// Creates tasks for a specific rank based on the chunk size
-    fn create_tasks_for_rank(&self, rank: usize, chunk_size: u64, current_size: &mut u64) -> Option<Task> {
+    fn create_tasks_for_rank(
+        &self,
+        rank: usize,
+        chunk_size: u64,
+        progress: &mut ProgressBar,
+    ) -> Result<()> {
+        let mut current_size = 0u64;
         // Process each target file in order
         for (target_file_index, _filename) in
             self.target.layout.topology.filenames().iter().enumerate()
@@ -257,16 +252,17 @@ impl Redistributor {
                 ) {
                     // Check if this task belongs to this rank
                     let task_size = task.target_end - task.target_start;
-                    let task_rank = (*current_size / chunk_size) as usize;
+                    let task_rank = (current_size / chunk_size) as usize;
                     if task_rank == rank {
-                        *current_size += task_size;
-                        return Some(task);
+                        current_size += task_size;
+                        task.run()?;
+                        progress.inc(task_size as u64);
                     }
-                    *current_size += task_size;
+                    current_size += task_size;
                 }
             }
         }
-        None
+        Ok(())
     }
 
     fn create_write_task_for_tensor(
@@ -318,7 +314,8 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                ).ok()?;
+                )
+                .ok()?;
             }
             (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
                 self.collect_reads_shared_to_distributed(
@@ -329,7 +326,8 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                ).ok()?;
+                )
+                .ok()?;
             }
             (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
                 self.collect_reads_shared_to_shared(
@@ -340,7 +338,8 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                ).ok()?;
+                )
+                .ok()?;
             }
             (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
                 self.collect_reads_distributed_to_shared(
@@ -351,7 +350,8 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                ).ok()?;
+                )
+                .ok()?;
             }
         }
 
