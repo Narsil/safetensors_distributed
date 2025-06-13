@@ -18,7 +18,7 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    pub async fn run(&self) -> Result<()> {
+    pub fn run(&self) -> Result<()> {
         let target_length = (self.target_end - self.target_start) as usize;
         trace!("Writing {target_length} to {}", self.target_file_index);
 
@@ -60,7 +60,6 @@ impl Task {
                     // Read from source using abstracted method
                     let mmap = &self.source[file_idx];
                     let source_data = &mmap[source_start as usize..source_end as usize];
-                    // let source_data = self.source.read(file_idx, source_start, source_end).await?;
 
                     // Write to target at specified offset (not sequential)
                     let target_offset_usize = target_offset as usize;
@@ -72,13 +71,13 @@ impl Task {
             }
         }
 
-        // Flush just the range we wrote asynchronously to avoid accumulating dirty pages
+        // Flush just the range we wrote to avoid accumulating dirty pages
         if let Err(e) = self
             .target_mmap
-            .flush_async_range(self.target_start as usize, target_length)
+            .flush_range(self.target_start as usize, target_length)
         {
             error!(
-                "Async flush failed for range {}:{}: {}",
+                "Flush failed for range {}:{}: {}",
                 self.target_start, self.target_end, e
             );
             // Don't fail the task, just log the error and continue

@@ -1,14 +1,13 @@
 use super::task::Task;
 use super::{Layout, RedistributorError, Result};
 use crate::topology::Topology;
-use futures::future::join_all;
 use log::trace;
 use memmap2::{Mmap, MmapMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use std::fs::{self, File};
+use std::io::Write;
 
 pub struct SourceLocation {
     pub(crate) mmaps: Vec<Arc<Mmap>>,
@@ -21,19 +20,19 @@ pub struct WriteLocation {
 
 impl WriteLocation {
     /// Initialize target files and memory maps
-    pub async fn init(&mut self, layout: &Layout) -> Result<()> {
+    pub fn init(&mut self, layout: &Layout) -> Result<()> {
         trace!("INIT: Starting target location initialization...");
 
         // Create directory
         trace!("INIT: Creating directory...");
         let dir_start = Instant::now();
-        tokio::fs::create_dir_all(&self.dir).await?;
+        fs::create_dir_all(&self.dir)?;
         trace!("INIT: Directory created in {:?}", dir_start.elapsed());
 
         // Create files with headers
         trace!("INIT: Creating files with headers...");
         let files_start = Instant::now();
-        self.create_files_with_headers(layout).await?;
+        self.create_files_with_headers(layout)?;
         trace!("INIT: Files created in {:?}", files_start.elapsed());
 
         // Initialize memory maps
@@ -50,13 +49,13 @@ impl WriteLocation {
     }
 
     /// Save/flush all memory-mapped files and write topology
-    pub async fn save(&self, topology: &Topology) -> Result<()> {
+    pub fn save(&self, topology: &Topology) -> Result<()> {
         if let Some(ref target_mmaps) = self.mmaps {
             for target_mmap in target_mmaps {
                 target_mmap.flush()?;
             }
         }
-        self.write_topology(topology).await?;
+        self.write_topology(topology)?;
         Ok(())
     }
 
@@ -86,48 +85,35 @@ impl WriteLocation {
     }
 
     /// Write topology.json to the target directory
-    async fn write_topology(&self, topology: &Topology) -> Result<()> {
+    fn write_topology(&self, topology: &Topology) -> Result<()> {
         let topology_path = self.dir.join("topology.json");
         let topology_json = serde_json::to_string_pretty(topology)?;
-        tokio::fs::write(topology_path, topology_json).await?;
+        fs::write(topology_path, topology_json)?;
         Ok(())
     }
 
     /// Create all target files with their headers
-    async fn create_files_with_headers(&self, layout: &Layout) -> Result<()> {
+    fn create_files_with_headers(&self, layout: &Layout) -> Result<()> {
         assert_eq!(layout.topology.filenames().len(), layout.metadatas.len());
-        let file_creation_futures: Vec<_> = layout
-            .metadatas
-            .iter()
-            .zip(layout.topology.filenames())
-            .map(|((_, metadata), filename)| async move {
-                let data_len = metadata.validate()?;
-                let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
-                // Force alignment to 8 bytes.
-                let extra = (8 - metadata_buf.len() % 8) % 8;
-                metadata_buf.extend(vec![b' '; extra]);
+        
+        for ((_, metadata), filename) in layout.metadatas.iter().zip(layout.topology.filenames()) {
+            let data_len = metadata.validate()?;
+            let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
+            // Force alignment to 8 bytes.
+            let extra = (8 - metadata_buf.len() % 8) % 8;
+            metadata_buf.extend(vec![b' '; extra]);
 
-                let n: u64 = metadata_buf.len() as u64;
+            let n: u64 = metadata_buf.len() as u64;
 
-                let mut f = File::options()
-                    .write(true)
-                    .create(true)
-                    .open(self.dir.join(filename))
-                    .await?;
-                f.write_all(&n.to_le_bytes()).await?;
-                f.write_all(&metadata_buf).await?;
-                let total = data_len + metadata_buf.len() + 8;
-                f.set_len(total as u64).await?;
-                f.flush().await?;
-
-                Ok(())
-            })
-            .collect();
-
-        // Wait for all files to be created
-        let creation_results: Vec<Result<_>> = join_all(file_creation_futures).await;
-        for result in creation_results {
-            result?;
+            let mut f = File::options()
+                .write(true)
+                .create(true)
+                .open(self.dir.join(filename))?;
+            f.write_all(&n.to_le_bytes())?;
+            f.write_all(&metadata_buf)?;
+            let total = data_len + metadata_buf.len() + 8;
+            f.set_len(total as u64)?;
+            f.flush()?;
         }
 
         Ok(())

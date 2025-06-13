@@ -9,7 +9,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
-use tokio::task::JoinError;
 
 // Re-export main types
 pub use core::Redistributor;
@@ -69,8 +68,8 @@ pub enum RedistributorError {
     #[error("Template error: {0}")]
     Template(#[from] TemplateError),
 
-    #[error("Join error: {0}")]
-    Join(#[from] JoinError),
+    #[error("Worker thread panicked")]
+    ThreadPanic,
 }
 
 pub type Result<T> = std::result::Result<T, RedistributorError>;

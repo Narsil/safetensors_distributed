@@ -11,7 +11,8 @@ use memmap2::Mmap;
 use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, channel};
+use std::thread;
 
 /// The structure responsible for managing a redistribution
 /// from one topology to another on disk.
@@ -85,10 +86,10 @@ impl Redistributor {
 
     /// Starts running the remapping of the files from the source topology to the target topology.
     /// It returns the list of files created (relative to the output_dir).
-    pub async fn redistribute(&mut self) -> Result<Vec<String>> {
-        self.target.location.init(&self.target.layout).await?;
+    pub fn redistribute(&mut self) -> Result<Vec<String>> {
+        self.target.location.init(&self.target.layout)?;
 
-        let (tx, mut rx) = channel::<Task>(10_000);
+        let (tx, rx) = channel::<Task>();
 
         // Estimate of the data needed to be written.
         let mut total = 0u64;
@@ -115,10 +116,10 @@ impl Redistributor {
         );
 
         let p = progress.clone();
-        let handle = tokio::spawn(async move {
-            while let Some(task) = rx.recv().await {
+        let handle = thread::spawn(move || {
+            while let Ok(task) = rx.recv() {
                 let length = (task.target_end - task.target_start) as usize;
-                if let Err(e) = task.run().await {
+                if let Err(e) = task.run() {
                     error!("Write task failed: {}", e);
                     return Err(e);
                 }
@@ -127,19 +128,20 @@ impl Redistributor {
             Ok(())
         });
 
-        self.create_tasks(&tx).await?;
+        self.create_tasks(&tx)?;
 
         drop(tx);
-        handle.await??;
+        match handle.join() {
+            Ok(res) => res?,
+            Err(_) => return Err(super::RedistributorError::ThreadPanic),
+        }
         progress.set_message("Done, kernel flush...");
 
         self.target
             .location
-            .save(&self.target.layout.topology)
-            .await?;
+            .save(&self.target.layout.topology)?;
 
         progress.finish_with_message("Done");
-        // Force flush all memory-mapped target files and write topology
 
         // Collect created safetensors files
         let mut created_files = Vec::new();
@@ -220,7 +222,7 @@ impl Redistributor {
     }
 
     /// Iterates target files → target tensors by data_offset (current logic)
-    async fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
+    fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
         // Process each target file in order
         for (target_file_index, _filename) in
             self.target.layout.topology.filenames().iter().enumerate()
@@ -242,15 +244,14 @@ impl Redistributor {
                     *header_size,
                     tensor_name,
                     tensor_info,
-                )
-                .await?;
+                )?;
             }
         }
 
         Ok(())
     }
 
-    async fn create_write_task_for_tensor(
+    fn create_write_task_for_tensor(
         &self,
         tx: &Sender<Task>,
         target_file_index: usize,
@@ -345,7 +346,7 @@ impl Redistributor {
                 source_ranges,
                 ranges_per_file,
             ) {
-                tx.send(write_task).await.unwrap();
+                tx.send(write_task).unwrap();
             }
         } else {
         }
@@ -625,18 +626,15 @@ mod tests {
     }
 
     // Helper function to calculate SHA256 of a file
-    async fn calculate_file_hash<P: AsRef<std::path::Path>>(path: P) -> String {
-        let path = path.as_ref();
-        let contents = tokio::fs::read(path).await.unwrap();
-        // Show entire file content as UTF-8 (lossy)
+    fn calculate_file_hash<P: AsRef<std::path::Path>>(path: P) -> String {
+        let contents = std::fs::read(path).unwrap();
         let mut hasher = Sha256::new();
         hasher.update(&contents);
-        let hash = format!("{:x}", hasher.finalize());
-        hash
+        format!("{:x}", hasher.finalize())
     }
 
-    #[tokio::test]
-    async fn test_redistribution_round_trip() {
+    #[test]
+    fn test_redistribution_round_trip() {
         // Create temp directories
         let source_dir = TempDir::new().unwrap();
         let distributed_dir = TempDir::new().unwrap();
@@ -661,12 +659,10 @@ mod tests {
 
         let original_bytes = serialize(&tensors, &None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
-        tokio::fs::write(&original_path, &original_bytes)
-            .await
-            .unwrap();
+        std::fs::write(&original_path, &original_bytes).unwrap();
 
         // Calculate hash of original file
-        let original_hash = calculate_file_hash(&original_path).await;
+        let original_hash = calculate_file_hash(&original_path);
 
         // Step 2: Create target topology for 2 ranks with different split dimensions
         let mut target_tensors = BTreeMap::new();
@@ -715,7 +711,7 @@ mod tests {
         )
         .unwrap();
 
-        redistributor1.redistribute().await.unwrap();
+        redistributor1.redistribute().unwrap();
 
         // Verify distributed files exist
         assert!(distributed_dir.path().join("rank0.safetensors").exists());
@@ -749,14 +745,14 @@ mod tests {
             Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
                 .unwrap();
 
-        redistributor2.redistribute().await.unwrap();
+        redistributor2.redistribute().unwrap();
 
         // Verify final file exists
         let final_path = final_dir.path().join("model.safetensors");
         assert!(final_path.exists());
 
         // Step 6: Calculate hash of final file and compare
-        let final_hash = calculate_file_hash(&final_path).await;
+        let final_hash = calculate_file_hash(&final_path);
 
         // The files should be identical
         assert_eq!(
@@ -765,7 +761,7 @@ mod tests {
         );
 
         // Step 7: Additional verification - load and compare tensor data
-        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_bytes = std::fs::read(&final_path).unwrap();
         let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
 
         // Verify tensor1
@@ -793,8 +789,8 @@ mod tests {
         assert_eq!(final_tensor2_data, tensor2_data.as_slice());
     }
 
-    #[tokio::test]
-    async fn test_redistribution_round_trip_bug_case() {
+    #[test]
+    fn test_redistribution_round_trip_bug_case() {
         // This test case replicates the exact tensor patterns that exposed the bug:
         // - 'down' tensor: 8x2 with values 0-15 (torch.arange(16).view(8,2))
         // - 'up' tensor: 2x8 with values 0,2,4,...,30 (torch.arange(16)*2).view(2,8))
@@ -826,12 +822,10 @@ mod tests {
 
         let original_bytes = serialize(&tensors, &None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
-        tokio::fs::write(&original_path, &original_bytes)
-            .await
-            .unwrap();
+        std::fs::write(&original_path, &original_bytes).unwrap();
 
         // Calculate hash of original file
-        let original_hash = calculate_file_hash(&original_path).await;
+        let original_hash = calculate_file_hash(&original_path);
 
         // Step 2: Create target topology for 2 ranks
         // Split 'down' tensor (8x2) along first dimension: first 4 rows to rank0, last 4 rows to rank1
@@ -880,7 +874,7 @@ mod tests {
         )
         .unwrap();
 
-        redistributor1.redistribute().await.unwrap();
+        redistributor1.redistribute().unwrap();
 
         // Step 4: Create target topology for reconstruction back to 1 rank
         let mut final_tensors = BTreeMap::new();
@@ -905,14 +899,14 @@ mod tests {
             Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
                 .unwrap();
 
-        redistributor2.redistribute().await.unwrap();
+        redistributor2.redistribute().unwrap();
 
         // Verify final file exists
         let final_path = final_dir.path().join("model.safetensors");
         assert!(final_path.exists());
 
         // Step 6: Calculate hash of final file and compare
-        let final_hash = calculate_file_hash(&final_path).await;
+        let final_hash = calculate_file_hash(&final_path);
 
         // This assertion should FAIL and expose the bug
         assert_eq!(
@@ -921,7 +915,7 @@ mod tests {
         );
 
         // Step 7: Additional verification - load and compare tensor data element by element
-        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_bytes = std::fs::read(&final_path).unwrap();
         let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
 
         // Verify 'down' tensor
@@ -961,8 +955,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_redistribution_round_trip_example_logic() {
+    #[test]
+    fn test_redistribution_round_trip_example_logic() {
         // This test replicates the exact logic used by the redistribute example
         // which uses determine_split_dimension() to decide how to split tensors
 
@@ -993,12 +987,10 @@ mod tests {
 
         let original_bytes = serialize(&tensors, &None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
-        tokio::fs::write(&original_path, &original_bytes)
-            .await
-            .unwrap();
+        std::fs::write(&original_path, &original_bytes).unwrap();
 
         // Calculate hash of original file
-        let original_hash = calculate_file_hash(&original_path).await;
+        let original_hash = calculate_file_hash(&original_path);
 
         // Step 2: Create target topology for 2 ranks using the SAME LOGIC as the redistribute example
         // "down" tensor: determine_split_dimension() returns Some(0) -> split along dimension 0
@@ -1055,7 +1047,7 @@ mod tests {
         )
         .unwrap();
 
-        redistributor1.redistribute().await.unwrap();
+        redistributor1.redistribute().unwrap();
 
         // Step 4: Create target topology for reconstruction back to 1 rank
         // This uses the EXACT same logic as the redistribute example for target_world_size = 1
@@ -1090,14 +1082,14 @@ mod tests {
             Redistributor::from_local(distributed_dir.path(), final_dir.path(), final_topology)
                 .unwrap();
 
-        redistributor2.redistribute().await.unwrap();
+        redistributor2.redistribute().unwrap();
 
         // Verify final file exists
         let final_path = final_dir.path().join("model.safetensors");
         assert!(final_path.exists());
 
         // Step 6: Calculate hash of final file and compare
-        let final_hash = calculate_file_hash(&final_path).await;
+        let final_hash = calculate_file_hash(&final_path);
 
         // This assertion should FAIL and expose the bug
         assert_eq!(
@@ -1106,7 +1098,7 @@ mod tests {
         );
 
         // Step 7: Additional verification - load and compare tensor data element by element
-        let final_bytes = tokio::fs::read(&final_path).await.unwrap();
+        let final_bytes = std::fs::read(&final_path).unwrap();
         let final_safetensors = safetensors::SafeTensors::deserialize(&final_bytes).unwrap();
 
         // Verify 'down' tensor

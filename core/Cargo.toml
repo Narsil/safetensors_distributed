@@ -4,14 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-futures-util = { workspace = true }
 indicatif = { workspace = true }
 serde = { workspace = true }
-futures = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 memmap2 = { workspace = true }
@@ -19,7 +16,6 @@ memmap2 = { workspace = true }
 [dev-dependencies]
 clap = { workspace = true }
 tempfile = { workspace = true }
-tokio-test = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
 sha2 = "0.10"

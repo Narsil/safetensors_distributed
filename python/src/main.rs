@@ -43,8 +43,8 @@ fn create_target_topology(source_topology: &Topology) -> Result<Topology> {
     Ok(Topology::new(target_tensors, target_filenames, 1)?)
 }
 
-/// Main redistribution function for local input using async parallel approach
-async fn redistribute_model_from_local<P: AsRef<Path>>(input_dir: P, output_dir: P) -> Result<()> {
+/// Main redistribution function for local input using synchronous approach
+fn redistribute_model_from_local<P: AsRef<Path>>(input_dir: P, output_dir: P) -> Result<()> {
     let input_dir = input_dir.as_ref();
     let output_dir = output_dir.as_ref();
 
@@ -63,21 +63,20 @@ async fn redistribute_model_from_local<P: AsRef<Path>>(input_dir: P, output_dir:
         target_topology.world_size()
     );
 
-    // Create and run the async redistributor
+    // Create and run the redistributor
     let mut redistributor = Redistributor::from_local(input_dir, output_dir, target_topology)?;
 
-    let _created_files = redistributor.redistribute().await?;
+    let _created_files = redistributor.redistribute()?;
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize env_logger to see reqwest debug logs
     env_logger::init();
 
     let args = Args::parse();
 
-    redistribute_model_from_local(&args.input_dir, &args.output_dir).await?;
+    redistribute_model_from_local(&args.input_dir, &args.output_dir)?;
 
     println!("Redistribution completed successfully!");
     Ok(())

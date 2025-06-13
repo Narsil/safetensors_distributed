@@ -6,7 +6,6 @@ use pyo3::types::{PyDict, PyDictMethods};
 use reqwest::Url;
 use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Metadata, TensorInfo};
-use tokio::runtime::Runtime;
 
 use safetensors_distributed::loader::Loader;
 
@@ -20,7 +19,6 @@ use crate::plan::slice_to_indexer;
 #[allow(non_camel_case_types)]
 pub struct dist_loader {
     pub(crate) inner: Loader,
-    pub(crate) runtime: Runtime,
 }
 
 #[pymethods]
@@ -30,14 +28,10 @@ impl dist_loader {
         let url = Url::parse(&url).map_err(|e| {
             SafetensorDistributedError::new_err(format!("Invalid URL: {} ({})", e, url))
         })?;
-        let runtime = Runtime::new().map_err(|e| {
-            SafetensorDistributedError::new_err(format!("Failed to create runtime: {}", e))
-        })?;
-        let handle = runtime.handle().clone();
-        let inner = Loader::new_py(url, handle).map_err(|err| {
+        let inner = Loader::new_py(url).map_err(|err| {
             SafetensorDistributedError::new_err(format!("Failed to get create loader: {err}"))
         })?;
-        Ok(Self { inner, runtime })
+        Ok(Self { inner })
     }
 
     /// Start the context manager
@@ -86,12 +80,9 @@ impl dist_loader {
 
 impl dist_loader {
     fn raw_metadata(&mut self) -> PyResult<&(Metadata, usize)> {
-        let metadata = self
-            .runtime
-            .block_on(async { self.inner.metadata().await })
-            .map_err(|err| {
-                SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
-            })?;
+        let metadata = self.inner.metadata().map_err(|err| {
+            SafetensorDistributedError::new_err(format!("Failed to get metadata: {err}"))
+        })?;
         Ok(metadata)
     }
 }
@@ -137,6 +128,7 @@ impl PlanSlice {
         })
     }
 }
+
 impl PlanSlice {
     fn new(info: TensorInfo, name: String) -> Self {
         Self { info, name }
