@@ -11,8 +11,9 @@ use memmap2::Mmap;
 use safetensors::tensor::{Metadata, TensorInfo};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
+use num_cpus;
 
 /// The structure responsible for managing a redistribution
 /// from one topology to another on disk.
@@ -89,20 +90,27 @@ impl Redistributor {
     pub fn redistribute(&mut self) -> Result<Vec<String>> {
         self.target.location.init(&self.target.layout)?;
 
-        let (tx, rx) = channel::<Task>();
+        // Get number of CPUs and create channels
+        let num_cpus = num_cpus::get();
+        let mut channels = Vec::with_capacity(num_cpus);
+        let mut receivers = Vec::with_capacity(num_cpus);
+        
+        // Create channels for each CPU
+        for _ in 0..num_cpus {
+            let (tx, rx) = channel::<Task>();
+            channels.push(tx);
+            receivers.push(rx);
+        }
 
-        // Estimate of the data needed to be written.
+        // Estimate of the data needed to be written
         let mut total = 0u64;
         for (header_size, metadata) in &self.target.layout.metadatas {
-            // Find the maximum data end offset in this file
             let max_data_end = metadata
                 .tensors()
                 .values()
                 .map(|tensor_info| tensor_info.data_offsets.1)
                 .max()
                 .unwrap_or(0);
-
-            // Total file size = header + data section
             total += (header_size + max_data_end) as u64;
         }
 
@@ -115,26 +123,42 @@ impl Redistributor {
                 .unwrap(),
         );
 
-        let p = progress.clone();
-        let handle = thread::spawn(move || {
-            while let Ok(task) = rx.recv() {
-                let length = (task.target_end - task.target_start) as usize;
-                if let Err(e) = task.run() {
-                    error!("Write task failed: {}", e);
-                    return Err(e);
+        // Spawn worker threads
+        let mut handles = Vec::with_capacity(num_cpus);
+        for (i, rx) in receivers.into_iter().enumerate() {
+            let p = progress.clone();
+            let handle = thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let length = (task.target_end - task.target_start) as usize;
+                    if let Err(e) = task.run() {
+                        error!("Write task failed on worker {}: {}", i, e);
+                        return Err(e);
+                    }
+                    p.inc(length as u64);
                 }
-                p.inc(length as u64);
-            }
-            Ok(())
-        });
-
-        self.create_tasks(&tx)?;
-
-        drop(tx);
-        match handle.join() {
-            Ok(res) => res?,
-            Err(_) => return Err(super::RedistributorError::ThreadPanic),
+                Ok(())
+            });
+            handles.push(handle);
         }
+
+        // Calculate chunk size for task distribution
+        let chunk_size = total / num_cpus as u64;
+        let mut current_size = 0u64;
+
+        // Create and distribute tasks
+        self.create_tasks(&channels, chunk_size, &mut current_size)?;
+
+        // Drop all senders to signal completion
+        drop(channels);
+
+        // Wait for all workers to complete
+        for handle in handles {
+            match handle.join() {
+                Ok(res) => res?,
+                Err(_) => return Err(super::RedistributorError::ThreadPanic),
+            }
+        }
+
         progress.set_message("Done, kernel flush...");
 
         self.target
@@ -222,7 +246,7 @@ impl Redistributor {
     }
 
     /// Iterates target files → target tensors by data_offset (current logic)
-    fn create_tasks(&self, tx: &Sender<Task>) -> Result<()> {
+    fn create_tasks(&self, channels: &[Sender<Task>], chunk_size: u64, current_size: &mut u64) -> Result<()> {
         // Process each target file in order
         for (target_file_index, _filename) in
             self.target.layout.topology.filenames().iter().enumerate()
@@ -239,7 +263,9 @@ impl Redistributor {
             // Process each tensor in write order
             for (tensor_name, tensor_info) in tensor_entries.iter() {
                 self.create_write_task_for_tensor(
-                    tx,
+                    channels,
+                    chunk_size,
+                    current_size,
                     target_file_index,
                     *header_size,
                     tensor_name,
@@ -253,7 +279,9 @@ impl Redistributor {
 
     fn create_write_task_for_tensor(
         &self,
-        tx: &Sender<Task>,
+        channels: &[Sender<Task>],
+        chunk_size: u64,
+        current_size: &mut u64,
         target_file_index: usize,
         target_header_size: usize,
         tensor_name: &str,
@@ -346,9 +374,12 @@ impl Redistributor {
                 source_ranges,
                 ranges_per_file,
             ) {
-                tx.send(write_task).unwrap();
+                // Calculate task size and determine which channel to use
+                let task_size = target_end - target_start;
+                let channel_idx = (*current_size / chunk_size) as usize % channels.len();
+                channels[channel_idx].send(write_task).unwrap();
+                *current_size += task_size;
             }
-        } else {
         }
 
         Ok(())

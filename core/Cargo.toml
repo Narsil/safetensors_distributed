@@ -12,6 +12,7 @@ serde = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 memmap2 = { workspace = true }
+num_cpus = "1.16"
 
 [dev-dependencies]
 clap = { workspace = true }
