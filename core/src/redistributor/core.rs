@@ -238,11 +238,21 @@ impl Redistributor {
             // Get the metadata for this target file
             let (header_size, metadata) = &self.target.layout.metadatas[target_file_index];
 
-            // Collect tensors and sort by data offset for sequential writes
-            let tensors = metadata.tensors();
-            let mut tensor_entries: Vec<(&String, &TensorInfo)> =
-                tensors.iter().map(|(k, v)| (k, *v)).collect();
-            tensor_entries.sort_by_key(|(_, tensor_info)| tensor_info.data_offsets.0);
+            // Collect tensors sorted by data offset for sequential writes
+            let names = metadata.offset_keys();
+            let tensor_entries: Vec<(String, &TensorInfo)> = names
+                .into_iter()
+                .map(|name| {
+                    let info = metadata.info(&name).unwrap();
+                    (name, info)
+                })
+                .collect();
+
+            let total = tensor_entries.last().unwrap().1.data_offsets.1 as u64;
+            if (current_size + total) / chunk_size < rank as u64 {
+                current_size += total;
+                continue;
+            }
 
             // Process each tensor in write order
             for (tensor_name, tensor_info) in tensor_entries.iter() {
