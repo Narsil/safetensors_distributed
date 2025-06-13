@@ -9,10 +9,12 @@ use std::time::Instant;
 use std::fs::{self, File};
 use std::io::Write;
 
+#[derive(Clone)]
 pub struct SourceLocation {
     pub(crate) mmaps: Vec<Arc<Mmap>>,
 }
 
+#[derive(Clone)]
 pub struct WriteLocation {
     pub dir: PathBuf,
     pub mmaps: Option<Vec<Arc<MmapMut>>>,
@@ -149,6 +151,7 @@ impl WriteLocation {
     }
 }
 
+#[derive(Clone)]
 pub struct Source {
     pub layout: Layout,
     pub location: SourceLocation,
@@ -160,6 +163,7 @@ impl Source {
     }
 }
 
+#[derive(Clone)]
 pub struct Target {
     pub layout: Layout,
     pub location: WriteLocation,

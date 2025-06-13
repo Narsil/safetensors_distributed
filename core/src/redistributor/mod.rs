@@ -21,6 +21,7 @@ pub struct SafetensorsIndex {
 }
 
 /// Layout containing topology and metadata information
+#[derive(Clone)]
 pub struct Layout {
     pub topology: Topology,
     pub metadatas: Vec<(usize, Metadata)>,

@@ -74,7 +74,7 @@ impl Task {
         // Flush just the range we wrote to avoid accumulating dirty pages
         if let Err(e) = self
             .target_mmap
-            .flush_range(self.target_start as usize, target_length)
+            .flush_async_range(self.target_start as usize, target_length)
         {
             error!(
                 "Flush failed for range {}:{}: {}",

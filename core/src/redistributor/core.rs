@@ -22,6 +22,7 @@ use num_cpus;
 /// Then the redistributor will start fetching all the various parts of data it requires from the
 /// original files before writing them on-disk.
 /// The writes are ordered to help be faster on NVMe.
+#[derive(Clone)]
 pub struct Redistributor {
     source: Source,
     target: Target,
@@ -90,17 +91,8 @@ impl Redistributor {
     pub fn redistribute(&mut self) -> Result<Vec<String>> {
         self.target.location.init(&self.target.layout)?;
 
-        // Get number of CPUs and create channels
+        // Get number of CPUs
         let num_cpus = num_cpus::get();
-        let mut channels = Vec::with_capacity(num_cpus);
-        let mut receivers = Vec::with_capacity(num_cpus);
-        
-        // Create channels for each CPU
-        for _ in 0..num_cpus {
-            let (tx, rx) = channel::<Task>();
-            channels.push(tx);
-            receivers.push(rx);
-        }
 
         // Estimate of the data needed to be written
         let mut total = 0u64;
@@ -123,15 +115,20 @@ impl Redistributor {
                 .unwrap(),
         );
 
+        // Calculate chunk size for task distribution
+        let chunk_size = total / num_cpus as u64;
+
         // Spawn worker threads
         let mut handles = Vec::with_capacity(num_cpus);
-        for (i, rx) in receivers.into_iter().enumerate() {
+        for rank in 0..num_cpus {
             let p = progress.clone();
+            let redistributor = self.clone();
             let handle = thread::spawn(move || {
-                while let Ok(task) = rx.recv() {
+                let mut current_size = 0u64;
+                while let Some(task) = redistributor.create_tasks_for_rank(rank, chunk_size, &mut current_size) {
                     let length = (task.target_end - task.target_start) as usize;
                     if let Err(e) = task.run() {
-                        error!("Write task failed on worker {}: {}", i, e);
+                        error!("Write task failed on worker {}: {}", rank, e);
                         return Err(e);
                     }
                     p.inc(length as u64);
@@ -140,16 +137,6 @@ impl Redistributor {
             });
             handles.push(handle);
         }
-
-        // Calculate chunk size for task distribution
-        let chunk_size = total / num_cpus as u64;
-        let mut current_size = 0u64;
-
-        // Create and distribute tasks
-        self.create_tasks(&channels, chunk_size, &mut current_size)?;
-
-        // Drop all senders to signal completion
-        drop(channels);
 
         // Wait for all workers to complete
         for handle in handles {
@@ -245,8 +232,8 @@ impl Redistributor {
         Ok(metadatas)
     }
 
-    /// Iterates target files → target tensors by data_offset (current logic)
-    fn create_tasks(&self, channels: &[Sender<Task>], chunk_size: u64, current_size: &mut u64) -> Result<()> {
+    /// Creates tasks for a specific rank based on the chunk size
+    fn create_tasks_for_rank(&self, rank: usize, chunk_size: u64, current_size: &mut u64) -> Option<Task> {
         // Process each target file in order
         for (target_file_index, _filename) in
             self.target.layout.topology.filenames().iter().enumerate()
@@ -262,31 +249,33 @@ impl Redistributor {
 
             // Process each tensor in write order
             for (tensor_name, tensor_info) in tensor_entries.iter() {
-                self.create_write_task_for_tensor(
-                    channels,
-                    chunk_size,
-                    current_size,
+                if let Some(task) = self.create_write_task_for_tensor(
                     target_file_index,
                     *header_size,
                     tensor_name,
                     tensor_info,
-                )?;
+                ) {
+                    // Check if this task belongs to this rank
+                    let task_size = task.target_end - task.target_start;
+                    let task_rank = (*current_size / chunk_size) as usize;
+                    if task_rank == rank {
+                        *current_size += task_size;
+                        return Some(task);
+                    }
+                    *current_size += task_size;
+                }
             }
         }
-
-        Ok(())
+        None
     }
 
     fn create_write_task_for_tensor(
         &self,
-        channels: &[Sender<Task>],
-        chunk_size: u64,
-        current_size: &mut u64,
         target_file_index: usize,
         target_header_size: usize,
         tensor_name: &str,
         target_tensor_info: &TensorInfo,
-    ) -> Result<()> {
+    ) -> Option<Task> {
         // Look up the tensor in source topology
         let source_tensor = self
             .source
@@ -296,7 +285,8 @@ impl Redistributor {
             .get(tensor_name)
             .ok_or_else(|| RedistributorError::TensorNotFound {
                 name: tensor_name.to_string(),
-            })?;
+            })
+            .ok()?;
 
         let target_tensor = self
             .target
@@ -306,7 +296,8 @@ impl Redistributor {
             .get(tensor_name)
             .ok_or_else(|| RedistributorError::TensorNotFound {
                 name: tensor_name.to_string(),
-            })?;
+            })
+            .ok()?;
 
         // Calculate target write parameters
         let target_start = (target_header_size + target_tensor_info.data_offsets.0) as u64;
@@ -327,7 +318,7 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                )?;
+                ).ok()?;
             }
             (Tensor::Shared(source_info), Tensor::Distributed(target_info)) => {
                 self.collect_reads_shared_to_distributed(
@@ -338,7 +329,7 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                )?;
+                ).ok()?;
             }
             (Tensor::Shared(source_info), Tensor::Shared(target_info)) => {
                 self.collect_reads_shared_to_shared(
@@ -349,7 +340,7 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                )?;
+                ).ok()?;
             }
             (Tensor::Distributed(source_info), Tensor::Shared(target_info)) => {
                 self.collect_reads_distributed_to_shared(
@@ -360,29 +351,23 @@ impl Redistributor {
                     &mut task_source,
                     &mut source_ranges,
                     &mut ranges_per_file,
-                )?;
+                ).ok()?;
             }
         }
 
-        // Create and send the task if we have any reads to do
+        // Create and return the task if we have any reads to do
         if !source_ranges.is_empty() {
-            if let Some(write_task) = self.target.location.create_write_task(
+            self.target.location.create_write_task(
                 target_file_index,
                 target_start,
                 target_end,
                 task_source,
                 source_ranges,
                 ranges_per_file,
-            ) {
-                // Calculate task size and determine which channel to use
-                let task_size = target_end - target_start;
-                let channel_idx = (*current_size / chunk_size) as usize % channels.len();
-                channels[channel_idx].send(write_task).unwrap();
-                *current_size += task_size;
-            }
+            )
+        } else {
+            None
         }
-
-        Ok(())
     }
 
     fn collect_reads_distributed_to_distributed(

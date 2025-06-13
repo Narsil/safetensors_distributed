@@ -25,13 +25,19 @@
         {
           default = mkShell {
             nativeBuildInputs = [ pkg-config ];
-            buildInputs = [
-              rustup
-              openssl
-              python3Packages.python
-              python3Packages.venvShellHook
-              cloc
-            ] ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [ cudaPackages.cudatoolkit poop ]);
+            buildInputs =
+              [
+                rustup
+                openssl
+                python3Packages.python
+                python3Packages.venvShellHook
+                cloc
+                fio
+              ]
+              ++ (pkgs.lib.optionals pkgs.stdenv.isLinux [
+                cudaPackages.cudatoolkit
+                poop
+              ]);
             venvDir = "./.venv";
             postVenvCreation = ''
               unset SOURCE_DATE_EPOCH
