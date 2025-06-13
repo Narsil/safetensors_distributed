@@ -31,8 +31,55 @@ fn create_target_topology(
     let mut target_tensors = BTreeMap::new();
 
     let chunk_size: usize = 5 * 1024 * 1024 * 1204;
-    let mut current_sizes = vec![0; target_world_size];
+    let mut total_sizes = vec![0; target_world_size];
     // Process each tensor from the source topology
+    for (tensor_name, source_tensor) in source_topology.tensors() {
+        let (shape, dtype) = match source_tensor {
+            Tensor::Distributed(info) => (info.shape().to_vec(), info.dtype()),
+            Tensor::Shared(info) => (info.shape().to_vec(), info.dtype()),
+        };
+
+        // Determine the best dimension to split based on tensor name and shape
+        let split_dim = determine_split_dimension(tensor_name);
+        if let Some(split_dim) = split_dim {
+            assert_eq!(
+                shape[split_dim] % target_world_size,
+                0,
+                "{tensor_name}: {shape:?} is not divisible by {target_world_size} as location {split_dim}"
+            );
+            // Create distributed tensor
+            let chunk_size_per_rank = shape[split_dim] / target_world_size;
+            for rank in 0..target_world_size {
+                let start = rank * chunk_size_per_rank;
+                let end = (rank + 1) * chunk_size_per_rank;
+                let mut chunk_shape = shape.clone();
+                chunk_shape[split_dim] = end - start;
+
+                // Create offsets array for this chunk within the tensor
+                let mut chunk_offsets = vec![0; chunk_shape.len()];
+                chunk_offsets[split_dim] = start;
+
+                let local_size = chunk_shape.iter().product::<usize>() * dtype.size();
+                total_sizes[rank] += local_size;
+            }
+        } else {
+            // Keep as shared tensor
+
+            let local_size = shape.iter().product::<usize>() * dtype.size();
+            total_sizes.iter_mut().for_each(|s| *s += local_size);
+        }
+    }
+
+    let nfiles: Vec<_> = total_sizes
+        .into_iter()
+        .map(|s| {
+            let nfiles = (s + chunk_size - 1) / chunk_size;
+            nfiles
+        })
+        .collect();
+
+    // Process each tensor from the source topology
+    let mut current_sizes = vec![0; target_world_size];
     for (tensor_name, source_tensor) in source_topology.tensors() {
         let (shape, dtype) = match source_tensor {
             Tensor::Distributed(info) => (info.shape().to_vec(), info.dtype()),
@@ -51,6 +98,7 @@ fn create_target_topology(
             let chunk_size_per_rank = shape[split_dim] / target_world_size;
             let mut chunks = Vec::new();
 
+            let mut previous_files = 0;
             for rank in 0..target_world_size {
                 let start = rank * chunk_size_per_rank;
                 let end = (rank + 1) * chunk_size_per_rank;
@@ -63,7 +111,8 @@ fn create_target_topology(
 
                 let local_size = chunk_shape.iter().product::<usize>() * dtype.size();
                 current_sizes[rank] += local_size;
-                let filename_index = current_sizes[rank] / chunk_size;
+                let filename_index = current_sizes[rank] / chunk_size + previous_files;
+                previous_files += nfiles[rank];
                 let chunk = Chunk::new(chunk_offsets, chunk_shape, filename_index);
 
                 chunks.push(chunk);
@@ -78,11 +127,13 @@ fn create_target_topology(
 
             let local_size = shape.iter().product::<usize>() * dtype.size();
             current_sizes.iter_mut().for_each(|s| *s += local_size);
-            let filename_indices: Vec<_> = current_sizes
-                .iter()
-                .enumerate()
-                .map(|(r, current_size)| (current_size / chunk_size * r))
-                .collect();
+            let mut previous_files = 0;
+            let mut filename_indices = Vec::with_capacity(current_sizes.len());
+            for (rank, current_size) in current_sizes.iter().enumerate() {
+                let filename_index = (current_size / chunk_size) + previous_files;
+                previous_files += nfiles[rank];
+                filename_indices.push(filename_index);
+            }
             target_tensors.insert(
                 tensor_name.clone(),
                 Tensor::Shared(SharedInfo::new(shape, dtype, filename_indices)),
@@ -96,12 +147,10 @@ fn create_target_topology(
         .map(|(r, s)| {
             let nfiles = (s + chunk_size - 1) / chunk_size;
 
-            (0..nfiles).map(move |x| format!("model_{r}_{x}.safetensors"))
+            (0..nfiles).map(move |x| format!("model_rank_{r}_chunk_{x}.safetensors"))
         })
         .flatten()
         .collect();
-
-    println!("n_files {:?}", target_filenames);
 
     // // Generate target filenames
     // let target_filenames = if target_world_size == 1 {

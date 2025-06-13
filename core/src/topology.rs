@@ -192,6 +192,9 @@ pub enum TopologyError {
 
     #[error("Chunk out of bounds for tensor {0}: dimension {1} exceeds tensor shape {2}")]
     ChunkOutOfBounds(String, usize, usize),
+
+    #[error("The tensor {0} contains duplicate file indices in its chunks")]
+    DuplicateIndices(String),
 }
 
 /// Fast n-dimensional chunk overlap detection
@@ -602,6 +605,7 @@ impl Topology {
                         ));
                     }
 
+                    let mut set = HashSet::with_capacity(self.filenames.len());
                     // Check filename indices
                     for chunk in &info.chunks {
                         if chunk.filename_index >= self.filenames.len() {
@@ -611,6 +615,10 @@ impl Topology {
                                 self.filenames.len(),
                             ));
                         }
+                        set.insert(chunk.filename_index);
+                    }
+                    if set.len() != info.chunks.len() {
+                        return Err(TopologyError::DuplicateIndices(name.clone()));
                     }
 
                     // Check for overlaps
