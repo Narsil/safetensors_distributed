@@ -254,9 +254,10 @@ impl Redistributor {
                     let task_size = task.target_end - task.target_start;
                     let task_rank = (current_size / chunk_size) as usize;
                     if task_rank == rank {
-                        current_size += task_size;
                         task.run()?;
                         progress.inc(task_size as u64);
+                    } else if task_rank > rank {
+                        return Ok(());
                     }
                     current_size += task_size;
                 }
