@@ -59,13 +59,17 @@ fn create_target_topology(
                 let mut chunk_offsets = vec![0; chunk_shape.len()];
                 chunk_offsets[split_dim] = start;
 
-                let local_size = chunk_shape.iter().product::<usize>() * dtype.size();
+                let local_bitsize = chunk_shape.iter().product::<usize>() * dtype.bitsize();
+                assert_eq!(local_bitsize % 8, 0);
+                let local_size = local_bitsize / 8;
                 total_sizes[rank] += local_size;
             }
         } else {
             // Keep as shared tensor
 
-            let local_size = shape.iter().product::<usize>() * dtype.size();
+            let local_bitsize = shape.iter().product::<usize>() * dtype.bitsize();
+            assert_eq!(local_bitsize % 8, 0);
+            let local_size = local_bitsize / 8;
             total_sizes.iter_mut().for_each(|s| *s += local_size);
         }
     }
@@ -109,7 +113,9 @@ fn create_target_topology(
                 let mut chunk_offsets = vec![0; chunk_shape.len()];
                 chunk_offsets[split_dim] = start;
 
-                let local_size = chunk_shape.iter().product::<usize>() * dtype.size();
+                let local_bitsize = chunk_shape.iter().product::<usize>() * dtype.bitsize();
+                assert_eq!(local_bitsize % 8, 0);
+                let local_size = local_bitsize / 8;
                 current_sizes[rank] += local_size;
                 let filename_index = current_sizes[rank] / chunk_size + previous_files;
                 previous_files += nfiles[rank];
@@ -125,7 +131,9 @@ fn create_target_topology(
         } else {
             // Keep as shared tensor
 
-            let local_size = shape.iter().product::<usize>() * dtype.size();
+            let local_bitsize = shape.iter().product::<usize>() * dtype.bitsize();
+            assert_eq!(local_bitsize % 8, 0);
+            let local_size = local_bitsize / 8;
             current_sizes.iter_mut().for_each(|s| *s += local_size);
             let mut previous_files = 0;
             let mut filename_indices = Vec::with_capacity(current_sizes.len());

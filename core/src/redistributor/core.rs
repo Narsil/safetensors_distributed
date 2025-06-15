@@ -169,8 +169,8 @@ impl Redistributor {
                     // Process distributed tensor - each rank gets a chunk
                     for chunk in dist_info.chunks() {
                         let chunk_shape = chunk.shape().to_vec();
-                        let chunk_size =
-                            chunk_shape.iter().product::<usize>() * dist_info.dtype().size();
+
+                        let chunk_size = chunk.size(dist_info.dtype());
 
                         let idx = chunk.filename_index();
 
@@ -188,8 +188,7 @@ impl Redistributor {
                 }
                 Tensor::Shared(shared_info) => {
                     // Process shared tensor - all ranks get the full tensor
-                    let chunk_size =
-                        shared_info.shape().iter().product::<usize>() * shared_info.dtype().size();
+                    let chunk_size = shared_info.size();
 
                     for &idx in shared_info.filename_indices() {
                         let tensor_info = TensorInfo {
@@ -407,7 +406,9 @@ impl Redistributor {
 
         // Get tensor properties
         let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+        let dtype_bitsize = source_info.dtype().bitsize();
+        assert_eq!(dtype_bitsize % 8, 0);
+        let dtype_size = dtype_bitsize / 8;
 
         // Calculate strides for the full tensor
         let ndim = full_shape.len();
@@ -479,7 +480,9 @@ impl Redistributor {
 
         // Get tensor properties
         let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+        let dtype_bitsize = source_info.dtype().bitsize();
+        assert_eq!(dtype_bitsize % 8, 0);
+        let dtype_size = dtype_bitsize / 8;
 
         // Calculate strides for the full tensor
         let ndim = full_shape.len();
@@ -538,7 +541,9 @@ impl Redistributor {
         let source_file_index = source_info.filename_indices()[0];
 
         // Get tensor properties
-        let dtype_size = source_info.dtype().size();
+        let dtype_bitsize = source_info.dtype().bitsize();
+        assert_eq!(dtype_bitsize % 8, 0);
+        let dtype_size = dtype_bitsize / 8;
 
         // Get source file metadata to calculate byte offsets
         let (source_header_size, source_metadata) =
@@ -579,7 +584,9 @@ impl Redistributor {
     ) -> Result<()> {
         // Get tensor properties
         let full_shape = source_info.shape();
-        let dtype_size = source_info.dtype().size();
+        let dtype_bitsize = source_info.dtype().bitsize();
+        assert_eq!(dtype_bitsize % 8, 0);
+        let dtype_size = dtype_bitsize / 8;
 
         // Calculate strides for the full tensor
         let ndim = full_shape.len();
@@ -686,7 +693,7 @@ mod tests {
             TensorView::new(Dtype::F32, vec![4, 8], &tensor2_bytes).unwrap(),
         );
 
-        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_bytes = serialize(&tensors, None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
         std::fs::write(&original_path, &original_bytes).unwrap();
 
@@ -849,7 +856,7 @@ mod tests {
             TensorView::new(Dtype::F32, vec![2, 8], &up_bytes).unwrap(),
         );
 
-        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_bytes = serialize(&tensors, None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
         std::fs::write(&original_path, &original_bytes).unwrap();
 
@@ -1014,7 +1021,7 @@ mod tests {
             TensorView::new(Dtype::F32, vec![2, 8], &up_bytes).unwrap(),
         );
 
-        let original_bytes = serialize(&tensors, &None).unwrap();
+        let original_bytes = serialize(&tensors, None).unwrap();
         let original_path = source_dir.path().join("model.safetensors");
         std::fs::write(&original_path, &original_bytes).unwrap();
 

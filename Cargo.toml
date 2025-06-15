@@ -13,7 +13,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3", "abi3-py38"] }
-safetensors = { path = "../safetensors/safetensors" }
+# Waiting for 0.6.0
+safetensors = { git = "https://github.com/huggingface/safetensors", rev="98f07e3bf3548ec7c1275cb409cebeed66aaf4e7" }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
 tempfile = "3.10.1"

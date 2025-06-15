@@ -99,12 +99,7 @@ impl WriteLocation {
         assert_eq!(layout.topology.filenames().len(), layout.metadatas.len());
 
         for ((_, metadata), filename) in layout.metadatas.iter().zip(layout.topology.filenames()) {
-            let data_len = metadata
-                .offset_tensors()
-                .last()
-                .expect("tensor in metdata")
-                .data_offsets
-                .1;
+            let data_len = metadata.data_len();
             let mut metadata_buf = serde_json::to_string(&metadata)?.into_bytes();
             // Force alignment to 8 bytes.
             let extra = (8 - metadata_buf.len() % 8) % 8;

@@ -527,7 +527,8 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "safetensors"
-version = "0.5.3-dev.0"
+version = "0.6.0-dev.0"
+source = "git+https://github.com/huggingface/safetensors?rev=98f07e3bf3548ec7c1275cb409cebeed66aaf4e7#98f07e3bf3548ec7c1275cb409cebeed66aaf4e7"
 dependencies = [
  "serde",
  "serde_json",

@@ -40,6 +40,13 @@ impl SharedInfo {
         self.dtype
     }
 
+    /// Returns the size in bytes of the tensor
+    pub fn size(&self) -> usize {
+        let total_bits = self.shape.iter().product::<usize>() * self.dtype.bitsize();
+        assert_eq!(total_bits % 8, 0);
+        total_bits / 8
+    }
+
     /// Returns the index of the file containing this tensor
     pub fn filename_indices(&self) -> &[usize] {
         &self.filename_indices
@@ -122,6 +129,13 @@ impl Chunk {
     /// Returns the shape of this chunk
     pub fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    /// Returns the size of this chunk
+    pub fn size(&self, dtype: Dtype) -> usize {
+        let total_bits = self.shape.iter().product::<usize>() * dtype.bitsize();
+        assert_eq!(total_bits % 8, 0);
+        total_bits / 8
     }
 
     /// Returns the index of the file containing this chunk
@@ -738,7 +752,7 @@ mod tests {
             "tensor2".to_string(),
             TensorView::new(safetensors::Dtype::F32, vec![4, 2], &tensor2_rank0_bytes).unwrap(),
         );
-        let bytes0 = serialize(&tensors0, &None).unwrap();
+        let bytes0 = serialize(&tensors0, None).unwrap();
         fs::write(&rank0_path, bytes0).unwrap();
 
         // Write both tensors to rank1 file
@@ -753,7 +767,7 @@ mod tests {
             "tensor2".to_string(),
             TensorView::new(safetensors::Dtype::F32, vec![4, 2], &tensor2_rank1_bytes).unwrap(),
         );
-        let bytes1 = serialize(&tensors1, &None).unwrap();
+        let bytes1 = serialize(&tensors1, None).unwrap();
         fs::write(&rank1_path, bytes1).unwrap();
 
         // Create the topology
