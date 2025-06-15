@@ -32,6 +32,45 @@ The package supports checkpoints that include:
 - Safetensors files
 - Topology information (topology.json)
 
+### Topology.json Format
+
+The `topology.json` file describes how tensors are distributed across different ranks in a sharded checkpoint. It has the following structure:
+
+```json
+{
+    "tensors": {
+        "tensor_name": {
+            "type": "Distributed",
+            "shape": [dim1, dim2, ...],
+            "dtype": "F32",
+            "chunks": [
+                {
+                    "offsets": [offset1, offset2, ...],
+                    "shape": [chunk_dim1, chunk_dim2, ...],
+                    "filename_index": 0
+                },
+                // ... more chunks for other ranks
+            ]
+        },
+        // ... more tensors
+    },
+    "filenames": ["rank0.safetensors", "rank1.safetensors", ...],
+    "world_size": 2
+}
+```
+
+Key components:
+- `tensors`: A map of tensor names to their distribution information
+  - `type`: Either "Distributed" (split across ranks) or "Shared" (replicated on all ranks)
+  - `shape`: The full shape of the tensor
+  - `dtype`: The data type (e.g., "F32", "BF16")
+  - `chunks`: For distributed tensors, describes how the tensor is split
+    - `offsets`: Starting position in each dimension
+    - `shape`: Size of the chunk in each dimension
+    - `filename_index`: Index into the filenames array
+- `filenames`: List of safetensors files containing the tensor chunks
+- `world_size`: Number of ranks in the distributed setup
+
 ### Example Workflow
 
 1. Create a distributed checkpoint using your preferred tool (e.g., DCP)
