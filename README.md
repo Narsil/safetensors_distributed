@@ -71,6 +71,19 @@ Key components:
 - `filenames`: List of safetensors files containing the tensor chunks
 - `world_size`: Number of ranks in the distributed setup
 
+#### Understanding Chunks
+
+Each chunk represents a slice of the full tensor. The relationship between a chunk's `offsets` and `shape` and the corresponding slice of the full tensor follows this pattern:
+
+For a chunk with `offsets: [x, y]` and `shape: [a, b]`, the chunk contains the data from the full tensor slice `tensor[x:x+a, y:y+b]`.
+
+More generally, for an n-dimensional tensor, a chunk with `offsets: [o₁, o₂, ..., oₙ]` and `shape: [s₁, s₂, ..., sₙ]` corresponds to:
+```
+tensor[o₁:o₁+s₁, o₂:o₂+s₂, ..., oₙ:oₙ+sₙ]
+```
+
+This slice notation makes it clear which portion of the original tensor each chunk represents.
+
 ### Example Workflow
 
 1. Create a distributed checkpoint using your preferred tool (e.g., DCP)
